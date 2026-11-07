@@ -55,6 +55,7 @@
  */
 
 #include "qwz_compat.h"	/* macOS: replaces the OpenBSD kernel headers */
+#include "qwz_mon.h"	/* monitor-mode capture (debug.qwz.mon) */
 #define QWZ_TRACE(fmt, ...)	qwz_log("qwz: trace: " fmt "\n", ##__VA_ARGS__)
 #ifdef AIRPORT_WCL
 #include "WCL/WCL.hpp"	/* AirportWCN7850: scan helpers (scanUsesProbes, scanChannelSelected) */
@@ -94,6 +95,62 @@ hweight8(uint8_t x)
 #include "qwzreg.h"
 #include "qwzvar.h"
 #include "qwz_awdlx.h"	/* M2a (WP3): the AWDL evidence layer, log only */
+
+/*
+ * Merge of origin/awdl-m0-m1 (upstream's capture-cell AirDrop design: qwz_mon.c, docs/airdrop-revisited.md) into the M2a tree.
+ *
+ * The management TX ring. Upstream grew struct qwz_txmgmt_queue from 8 to 64 slots, because its capture vif (sc->sc_monvif) sends through
+ * the same queue type and uses all 64. The BSS vif (sc->sc_vif) keeps the 8 slots it always had: lane M0.1 (qwz_awdltest_tx, and awdlprobe 1
+ * in qwz_awdl_data_tx) books its frames by slot in sc_awdltest_txns[8] and in the 8-bit masks sc_awdltest_txmask and sc_awdl_pmask, the
+ * evidence ring (qwz_awdlx.h) keeps the BSS slots 0 to 7 below the pool's (16 + slot), and the pool's desc_ids begin at QWZ_AWDL_DESC_BASE
+ * (64). So each place below that bounds or advances the BSS ring's cur and queued adds the 8-slot rule BESIDE the unchanged nitems() test
+ * (which now says 64 for both rings). With the old 8-slot header every one of these additions is a no-op.
+ */
+#define QWZ_BSS_TXMGMT_SLOTS	8
+static inline int
+qwz_txmgmt_nslots(struct qwz_softc *sc, struct qwz_vif *arvif)
+{
+	int n = (int)nitems(arvif->txmgmt.data);
+
+	return (arvif == &sc->sc_vif && n > QWZ_BSS_TXMGMT_SLOTS) ? QWZ_BSS_TXMGMT_SLOTS : n;
+}
+static_assert(QWZ_AWDL_DESC_BASE >= (int)nitems(((struct qwz_txmgmt_queue *)0)->data),
+    "the lane M pool's desc_ids (QWZ_AWDL_DESC_BASE + slot) must lie above every management ring slot id");
+static_assert(sizeof(((struct qwz_softc *)0)->sc_awdltest_txns) / sizeof(uint64_t) >= QWZ_BSS_TXMGMT_SLOTS &&
+    sizeof(((struct qwz_softc *)0)->sc_awdltest_txmask) * 8 >= QWZ_BSS_TXMGMT_SLOTS &&
+    sizeof(((struct qwz_softc *)0)->sc_awdl_pmask) * 8 >= QWZ_BSS_TXMGMT_SLOTS,
+    "lane M0.1's per-slot bookkeeping must cover the BSS management ring");
+
+/*
+ * The 'join:' diagnostics upstream added (newstate, scans, management frames) are limited like every other log site of this file: the first 64
+ * per site, then every 16th. A scan loop (macOS scans every few seconds while unassociated) would otherwise fill the log ring (the last 64 KB of
+ * it are what QwzMacLog publishes) that carries the recovery engine's evidence. A scan loop never reaches AUTH, so qwz_newstate starts the counts
+ * again for every join attempt (qwz_join_log_restart): the attempt itself is logged in full however many scans came before it.
+ */
+static unsigned int qwz_join_log_n[6];
+#define QWZ_JOINLOG(i)	qwz_log_ratelimit(&qwz_join_log_n[(i)], 64, 16)
+static inline void
+qwz_join_log_restart(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < nitems(qwz_join_log_n); i++)
+		__atomic_store_n(&qwz_join_log_n[i], 0u, __ATOMIC_RELAXED);
+}
+
+/*
+ * qwz_mon.c (declared in qwz_mon.h too): ends a capture cell WITHOUT talking to the firmware. Host state only: mon_active, mon_fw_dirty, the capture
+ * vif (is_up, is_started), its self and sender peers, mon_tx_kind, the reap timer, the transmit queue; idempotent, never sleeps, safe with no cell,
+ * before qwz_mon_attach and with the DP rings already freed. It must be DEFINED there with C linkage (this declaration and qwz_mon.h's agree).
+ * Called by qwz_core_deinit when any of those fields is set (the firmware that carried the cell goes) and by qwz_init (a cell whose firmware is gone).
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void	qwz_mon_epoch_reset(struct qwz_softc *);
+#ifdef __cplusplus
+}
+#endif
 
 #ifdef QWZ_DEBUG
 uint32_t	qwz_debug = 0
@@ -336,6 +393,34 @@ qwz_init(struct ifnet *ifp)
 		qwz_core_deinit(sc);
 	}
 
+	/* Wi-Fi coming back ends a monitor-mode capture (qwz_mon.c). */
+	if (sc->mon_active) {
+		/*
+		 * Merge with the M0 engine: a firmware that is DEAD or crashed, or already torn down, cannot be told anything. qwz_wmi_cmd_send answers
+		 * ESHUTDOWN at once while QWZ_CRASHED, qwz_mon_stop counts only EAGAIN, ETIMEDOUT and ESHUTDOWN (QWZ_MON_FW_SILENT) as a wedged firmware, and each WMI step of a normal
+		 * stop would wait for credits that never come. So the cell's host state is reset instead (qwz_core_deinit does the same when it runs,
+		 * which is why, after the DEAD block above, mon_active is already 0 and this is skipped).
+		 */
+		if (QWZ_CRASHED(sc) || !sc->fw_initialized)
+			qwz_mon_epoch_reset(sc);
+		else
+			qwz_mon_stop(sc);
+	}
+#ifdef __APPLE__
+	/*
+	 * After a capture cell the firmware no longer delivers the station's
+	 * replies (qwz_mon.c): restart it, and take the full bring-up below.
+	 */
+	if (sc->mon_fw_dirty) {
+		sc->mon_fw_dirty = 0;
+		if (sc->fw_initialized) {
+			printf("%s: restarting the firmware after the capture cell\n",
+			    sc->sc_dev.dv_xname);
+			qwz_core_deinit(sc);
+		}
+	}
+#endif
+
 #ifdef __APPLE__
 	/*
 	 * macOS may change the interface address (private Wi-Fi address per
@@ -366,6 +451,27 @@ qwz_init(struct ifnet *ifp)
 	if (sc->fw_initialized) {
 		if (qwz_peer_find_bss(sc, &sc->sc_vif, NULL) != NULL || sc->sc_vif.is_started) {	/* M0 (C06): the infra vdev only */
 			error = qwz_deauth(sc);
+#ifdef __APPLE__
+			if (error == EAGAIN || error == ETIMEDOUT) {
+				/*
+				 * Merge with the M0 engine: with the recovery engine armed (debug.qwz.recover=1 and m0=1, the defaults) this call fails exactly as it
+				 * did before upstream's change: the error is returned, nothing is restarted from here, and NO DEAD is declared from here. Whether a
+				 * silent firmware is a DEAD episode is decided elsewhere and is SHADOW by default (m0-spec S4 and S11, tests T3.4 and T3.5):
+				 * qwz_note_wait_timeout (called only from the credit wait of qwz_wmi_cmd_send, never from the response waits for the vdev stop and
+				 * the peer delete in qwz_deauth) logs "would declare DEAD(WMI_SILENT)" at debug.qwz.silent=1 and acts only at silent=2. With
+				 * recover=0 or m0=0 the engine is off, DEAD is never declared, and the local restart below, upstream's, is the only one there is.
+				 */
+				if (qwz_dead_armed()) {
+					splx(s);
+					return error;
+				}
+				/* The firmware stopped answering: restart it. */
+				printf("%s: deauth failed (%d): restarting the firmware\n",
+				    sc->sc_dev.dv_xname, error);
+				qwz_core_deinit(sc);
+				goto full_init;
+			}
+#endif
 			if (error) {
 				splx(s);
 				return error;
@@ -716,6 +822,12 @@ qwz_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		ifp->if_flags |= IFF_UP;
 		/* FALLTHROUGH */
 	case SIOCSIFFLAGS:
+		/*
+		 * awdl-m0-m1 hold mode (debug.qwz.monhold): the interface only looks UP|RUNNING while a capture cell holds the radio, and ItlQwz's
+		 * enableGated and disableGated own that flag. A stop or init here would end the cell and start the station.
+		 */
+		if (qwz_mon_holding(&sc->sc_ic))
+			break;
 		if (ifp->if_flags & IFF_UP) {
 			if (!(ifp->if_flags & IFF_RUNNING)) {
 				/* Force reload of firmware image from disk. */
@@ -732,6 +844,8 @@ qwz_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		err = ieee80211_ioctl(ifp, cmd, data);
 	}
 
+	if (err == ENETRESET && qwz_mon_holding(&sc->sc_ic))
+		err = 0;	/* hold mode: see SIOCSIFFLAGS above */
 	if (err == ENETRESET) {
 		err = 0;
 		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) ==
@@ -1511,6 +1625,11 @@ qwz_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 	sc->ns_nstate = nstate;
 	sc->ns_arg = arg;
 
+	if (nstate == IEEE80211_S_AUTH)	/* a join attempt starts (a scan loop never gets here): its 'join:' lines get a fresh budget */
+		qwz_join_log_restart();
+	if (QWZ_JOINLOG(0))
+		qwz_log("qwz: join: newstate %d -> %d (arg %d), scan state %d, vdev0 started %d up %d\n",
+		    ic->ic_state, nstate, arg, sc->scan.state, sc->sc_vif.is_started, sc->sc_vif.is_up);
 	qwz_add_task(sc, sc->sc_nswq, &sc->newstate_task);
 
 	return 0;
@@ -12062,6 +12181,8 @@ qwz_wmi_event_scan_completed(struct qwz_softc *sc)
 		break;
 	case ATH12K_SCAN_RUNNING:
 	case ATH12K_SCAN_ABORTING:
+		if (QWZ_JOINLOG(1))
+			qwz_log("qwz: join: scan completed (state %d)\n", sc->scan.state);
 		qwz_mac_scan_finish(sc);
 		break;
 	}
@@ -12464,10 +12585,27 @@ qwz_mgmt_rx_event(struct qwz_softc *sc, struct mbuf *m)
 	status->rate_idx = ath12k_mac_bitrate_to_idx(sband, rx_ev.rate / 100);
 #endif
 
+	/* Monitor-mode capture (qwz_mon.c): the interface is down, keep the frame. */
+	if (sc->mon_active) {
+		qwz_mon_capture_mgmt_mbuf(sc, m, rxi.rxi_rssi, rx_ev.rate);
+		m_freem(m);
+		goto exit;
+	}
+
 	wh = mtod(m, struct ieee80211_frame *);
 	/* Passive: smoothed BSS RSSI and the AWDL probe; the frame goes on unchanged. */
 	qwz_rx_observe_mgmt(sc, m, rxi.rxi_rssi, rx_ev.chan_freq, rx_ev.channel,
 	    rx_ev.rate);
+	{
+		uint8_t st = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+
+		if (st != IEEE80211_FC0_SUBTYPE_BEACON &&
+		    st != IEEE80211_FC0_SUBTYPE_PROBE_RESP &&
+		    st != IEEE80211_FC0_SUBTYPE_PROBE_REQ &&
+		    st != IEEE80211_FC0_SUBTYPE_ACTION && QWZ_JOINLOG(2))
+			qwz_log("qwz: join: mgmt rx subtype 0x%02x from %s, ic state %d\n",
+			    st, ether_sprintf(wh->i_addr2), ic->ic_state);
+	}
 	ni = ieee80211_find_rxnode(ic, wh);
 #if 0
 	/* In case of PMF, FW delivers decrypted frames with Protected Bit set.
@@ -12588,6 +12726,8 @@ qwz_wmi_process_mgmt_tx_comp(struct qwz_softc *sc,
 		return;
 	}
 #endif
+	if (qwz_mon_tx_compl(sc, tx_compl_param))	/* monitor-mode transmit (qwz_mon.c) */
+		return;
 	if (tx_compl_param->desc_id >= nitems(arvif->txmgmt.data)) {
 		printf("%s: received mgmt tx compl for invalid buf_id: %d\n",
 		    sc->sc_dev.dv_xname, tx_compl_param->desc_id);
@@ -12644,7 +12784,14 @@ qwz_wmi_process_mgmt_tx_comp(struct qwz_softc *sc,
 
 	if (tx_compl_param->status != 0)
 		ifp->if_oerrors++;
+	if ((ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC) &&
+	    QWZ_JOINLOG(3))
+		qwz_log("qwz: join: mgmt tx compl desc %u status %u (ic state %d)\n",
+		    tx_compl_param->desc_id, tx_compl_param->status, ic->ic_state);
 
+	/* The BSS ring keeps its 8 slots (QWZ_BSS_TXMGMT_SLOTS, see the top of this file): clear the full bit as the 8-slot ring did. */
+	if (arvif == &sc->sc_vif && arvif->txmgmt.queued >= QWZ_BSS_TXMGMT_SLOTS - 1)
+		return;
 	if (arvif->txmgmt.queued < nitems(arvif->txmgmt.data) - 1) {
 		sc->qfullmsk &= ~(1U << QWZ_MGMT_QUEUE_ID);
 		if (sc->qfullmsk == 0 && ifq_is_oactive(&ifp->if_snd)) {
@@ -14612,9 +14759,33 @@ qwz_dp_tx_htt_rx_filter_setup(struct qwz_softc *sc, uint32_t ring_id,
 	cmd->info0 |= FIELD_PREP(
 	    HTT_RX_RING_SELECTION_CFG_CMD_INFO0_OFFSET_VALID,
 	    !!tlv_filter->offset_valid);
+	/* Monitor-mode bits (zero for the station filter, as before). */
+	cmd->info0 |= FIELD_PREP(
+	    HTT_RX_RING_SELECTION_CFG_CMD_INFO0_DROP_THRES_VAL,
+	    !!tlv_filter->drop_threshold_valid);
+	cmd->info0 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO0_EN_RXMON,
+	    !!tlv_filter->en_rxmon);
 
 	cmd->info1 = FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO1_BUF_SIZE,
 	    rx_buf_size);
+	cmd->info1 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO1_CONF_LEN_MGMT,
+	    tlv_filter->conf_len_mgmt);
+	cmd->info1 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO1_CONF_LEN_CTRL,
+	    tlv_filter->conf_len_ctrl);
+	cmd->info1 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO1_CONF_LEN_DATA,
+	    tlv_filter->conf_len_data);
+	cmd->info2 = FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO2_DROP_THRESHOLD,
+	    tlv_filter->rx_drop_threshold);
+	cmd->info2 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO2_EN_LOG_MGMT_TYPE,
+	    !!tlv_filter->enable_log_mgmt_type);
+	cmd->info2 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO2_EN_CTRL_TYPE,
+	    !!tlv_filter->enable_log_ctrl_type);
+	cmd->info2 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO2_EN_LOG_DATA_TYPE,
+	    !!tlv_filter->enable_log_data_type);
+	cmd->info3 = FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO3_EN_TLV_PKT_OFFSET,
+	    !!tlv_filter->enable_rx_tlv_offset);
+	cmd->info3 |= FIELD_PREP(HTT_RX_RING_SELECTION_CFG_CMD_INFO3_PKT_TLV_OFFSET,
+	    tlv_filter->rx_tlv_offset);
 	cmd->pkt_type_en_flags0 = tlv_filter->pkt_filter_flags0;
 	cmd->pkt_type_en_flags1 = tlv_filter->pkt_filter_flags1;
 	cmd->pkt_type_en_flags2 = tlv_filter->pkt_filter_flags2;
@@ -15618,6 +15789,8 @@ qwz_dp_process_rx_err(struct qwz_softc *sc)
 		qwz_dp_rxbufs_replenish(sc, &dp->rx_refill_buf_ring,
 		    &used_list, num_buffs_reaped);
 	ifp->if_ierrors += num_buffs_reaped;
+	if (sc->mon_active)
+		sc->mon_stats.reo_err += num_buffs_reaped;
 	return num_buffs_reaped;
 }
 
@@ -15827,6 +16000,8 @@ qwz_dp_rx_process_wbm_err(struct qwz_softc *sc)
 	if (num_buffs_reaped)
 		qwz_dp_rxbufs_replenish(sc, &dp->rx_refill_buf_ring,
 		    &used_list, num_buffs_reaped);
+	if (sc->mon_active)
+		sc->mon_stats.wbm_err += num_buffs_reaped;
 
 	return num_buffs_reaped;
 }
@@ -16398,7 +16573,7 @@ qwz_dp_rx_process_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 	}
 
 	/* Drop non-802.11 frames (e.g. WCN7850 FW internal messages). */
-	if (!sc->hal_rx_ops->rx_desc_get_mpdu_fc_valid(rx_desc))
+	if (!sc->hal_rx_ops->rx_desc_get_mpdu_fc_valid(rx_desc) && !sc->mon_active)
 		return EIO;
 
 	/*
@@ -16411,6 +16586,7 @@ qwz_dp_rx_process_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 	if (mpdu->addr1[4] == 0x84 && mpdu->addr1[5] == 0xe1)
 		return EIO;
 	if (!(mpdu->addr1[0] & 0x01) &&
+	    !sc->mon_active &&	/* awdl-m0-m1 (qwz_mon.c): a capture cell keeps every unicast frame, whoever it is addressed to */
 	    !IEEE80211_ADDR_EQ(mpdu->addr1, sc->sc_ic.ic_myaddr) &&
 	    !qwz_awdl_is_our_addr(sc, mpdu->addr1))
 		return EIO;
@@ -16605,6 +16781,13 @@ qwz_dp_rx_process_received_packets(struct qwz_softc *sc,
 			continue;
 		}
 
+		if (sc->mon_active && (qwz_mon_flags & QWZ_MON_F_REO)) {
+			/* Monitor-mode capture: keep the frame, nothing is up to take it. */
+			qwz_mon_capture_reo_mbuf(sc, msdu->m);
+			m_freem(msdu->m);
+			msdu->m = NULL;
+			continue;
+		}
 		qwz_dp_rx_deliver_msdu(sc, msdu);
 		msdu->m = NULL;
 	}
@@ -19871,6 +20054,16 @@ qwz_core_deinit(struct qwz_softc *sc)
 	mutex_lock(&ab->core_lock);
 #endif
 	sc->ops.irq_disable(sc);
+	/*
+	 * awdl-m0-m1 (qwz_mon.c): a capture cell ends with the firmware that carried it. The reset is host-only (no WMI) and comes BEFORE qwz_core_stop and
+	 * qwz_dp_pdev_free: its reap timer must not run against a powered-down chip or freed rings, and mon_active (so qwz_mon_holding) must not survive into
+	 * the next wake, where enableGated would take the hold branch and never reach qwz_init. The test is deliberate: it names every field a cell sets, so
+	 * until a cell has run (all of them zero: the softc is allocated M_ZERO, qwz_pci_macos_alloc) the call is skipped and sleep, wake and recovery run
+	 * exactly as in the M2a tree, whatever qwz_mon_epoch_reset does. Keep the test in step with that function.
+	 */
+	if (sc->mon_active || sc->mon_fw_dirty || sc->mon_self_peer || sc->mon_sender_peer ||
+	    sc->sc_monvif.is_up || sc->sc_monvif.is_started)
+		qwz_mon_epoch_reset(sc);
 
 	qwz_core_stop(sc);
 	qwz_core_pdev_destroy(sc);
@@ -23872,6 +24065,16 @@ qwz_init_task(void *arg)
 		return;
 	}
 
+	/*
+	 * awdl-m0-m1 hold mode (debug.qwz.monhold): the faked IFF_RUNNING would make this task stop the interface and start the station,
+	 * which ends the capture cell. ItlQwz's enableGated and disableGated own the hold flag.
+	 */
+	if (qwz_mon_holding(&sc->sc_ic)) {
+		rw_exit(&sc->ioctl_rwl);
+		splx(s);
+		return;
+	}
+
 	if (ifp->if_flags & IFF_RUNNING)
 		qwz_stop(ifp);
 
@@ -25296,6 +25499,8 @@ qwz_mac_mgmt_tx_wmi(struct qwz_softc *sc, struct qwz_vif *arvif,
 
 	if (txmgmt->queued >= nitems(txmgmt->data))
 		return ENOSPC;
+	if (txmgmt->queued >= qwz_txmgmt_nslots(sc, arvif))	/* the BSS ring is 8 slots (QWZ_BSS_TXMGMT_SLOTS), the capture vif's 64 */
+		return ENOSPC;
 
 	tx_data = &txmgmt->data[buf_id];
 #if 0
@@ -25365,6 +25570,15 @@ qwz_mac_mgmt_tx_wmi(struct qwz_softc *sc, struct qwz_vif *arvif,
 	}
 #endif
 	ret = qwz_wmi_mgmt_send(sc, arvif, pdev_id, buf_id, m, tx_data);
+	{
+		struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+		uint8_t st = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+
+		if (arvif == &sc->sc_vif && st != IEEE80211_FC0_SUBTYPE_PROBE_REQ &&
+		    st != IEEE80211_FC0_SUBTYPE_ACTION && QWZ_JOINLOG(4))
+			qwz_log("qwz: join: mgmt tx subtype 0x%02x to %s on vdev %u, slot %d -> %d\n",
+			    st, ether_sprintf(wh->i_addr1), arvif->vdev_id, buf_id, ret);
+	}
 	if (ret) {
 		printf("%s: failed to send mgmt frame: %d\n",
 		    sc->sc_dev.dv_xname, ret);
@@ -25373,9 +25587,13 @@ qwz_mac_mgmt_tx_wmi(struct qwz_softc *sc, struct qwz_vif *arvif,
 	tx_data->ni = ni;
 
 	txmgmt->cur = (txmgmt->cur + 1) % nitems(txmgmt->data);
+	if (txmgmt->cur >= qwz_txmgmt_nslots(sc, arvif))	/* the BSS ring wraps at 8 (QWZ_BSS_TXMGMT_SLOTS) */
+		txmgmt->cur = 0;
 	txmgmt->queued++;
 
 	if (txmgmt->queued >= nitems(txmgmt->data) - 1)
+		sc->qfullmsk |= (1U << QWZ_MGMT_QUEUE_ID);
+	if (txmgmt->queued >= qwz_txmgmt_nslots(sc, arvif) - 1)
 		sc->qfullmsk |= (1U << QWZ_MGMT_QUEUE_ID);
 
 	return 0;
@@ -25796,6 +26014,9 @@ qwz_scan(struct qwz_softc *sc)
 	scan_timeout += ATH12K_MAC_SCAN_CMD_EVT_OVERHEAD;
 
 	ret = qwz_start_scan(sc, arg);
+	if (QWZ_JOINLOG(5))
+		qwz_log("qwz: join: hw scan start -> %d (%u channels, vdev %u, ic state %d)\n",
+		    ret, arg->num_chan, arg->vdev_id, ic->ic_state);
 	if (ret) {
 		if (ret != ESHUTDOWN) {
 			printf("%s: failed to start hw scan: %d\n",
@@ -27249,6 +27470,7 @@ qwz_attach(struct qwz_softc *sc)
 
 	TAILQ_INIT(&sc->peers);
 	sc->bss_peer_id = HAL_INVALID_PEERID;
+	qwz_mon_attach(sc);
 
 	error = qwz_init(ifp);
 	if (error)
@@ -27527,6 +27749,11 @@ qwz_awdltest_vdev_create(struct qwz_softc *sc, uint32_t subtype)
 	uint8_t mac[IEEE80211_ADDR_LEN];
 	int ret, bit;
 
+	/* awdl-m0-m1: the capture cell parks the radio on its own vdev with the AWDL BSSID; the two designs exclude each other (qwz_mon_start refuses the other way round, through qwz_awdl_vdev_busy) */
+	if (sc->mon_active) {
+		qwz_log("qwz: awdltest: vdev refused: a capture cell holds the radio (debug.qwz.mon=0 first)\n");
+		return EBUSY;
+	}
 	if (sc->num_created_vdevs > TARGET_NUM_VDEVS - 2 ||
 	    sc->free_vdev_map == 0) {
 		qwz_log("qwz: awdltest: no free vdev (created %d, free map "
@@ -27633,6 +27860,16 @@ qwz_awdltest_forget(struct qwz_softc *sc)
 	 * can still hold a quarantined node: free them all.
 	 */
 	qwz_awdl_zombies_reap(sc, 1);
+}
+
+/*
+ * awdl-m0-m1 (qwz_mon_start, qwz_mon.c): is any part of lane M0.1's listen vdev there (created by awdltest=3, started, with peers, or
+ * listening)? The capture cell must not park the radio then. qwz_awdltest_started is static here, hence this accessor.
+ */
+int
+qwz_awdl_vdev_busy(struct qwz_softc *sc)
+{
+	return sc->sc_awdl_listening || sc->sc_awdltest_vdev_on || sc->sc_awdl_npeers != 0 || qwz_awdltest_started != 0;
 }
 
 static void
@@ -28069,6 +28306,7 @@ qwz_awdl_data_tx(struct qwz_softc *sc, const uint8_t *frame, size_t len)
 
 		if (mret == 0) {
 			slot = (sc->sc_vif.txmgmt.cur + (int)nitems(sc->sc_vif.txmgmt.data) - 1) % (int)nitems(sc->sc_vif.txmgmt.data);
+			slot = (sc->sc_vif.txmgmt.cur + QWZ_BSS_TXMGMT_SLOTS - 1) % QWZ_BSS_TXMGMT_SLOTS;	/* awdl-m0-m1: the BSS ring is 8 slots whatever nitems() says: the slot qwz_awdltest_tx just used, and sc_awdl_pmask has 8 bits */
 			sc->sc_awdl_pmask |= 1U << slot;
 		}
 		return mret;
@@ -28137,6 +28375,8 @@ qwz_awdltest_tx(struct qwz_softc *sc, const uint8_t *frame, size_t len)
 
 	if (txmgmt->queued >= (int)nitems(txmgmt->data) - 2 || ic->ic_bss == NULL)
 		return ENOSPC;
+	if (txmgmt->queued >= QWZ_BSS_TXMGMT_SLOTS - 2)	/* awdl-m0-m1: the BSS ring is 8 slots (QWZ_BSS_TXMGMT_SLOTS), two of them stay free for the association's own frames */
+		return ENOSPC;
 	buf_id = txmgmt->cur;
 	tx_data = &txmgmt->data[buf_id];
 	if (tx_data->m != NULL)
@@ -28186,6 +28426,8 @@ qwz_awdltest_tx(struct qwz_softc *sc, const uint8_t *frame, size_t len)
 		return ret;
 	}
 	txmgmt->cur = (txmgmt->cur + 1) % nitems(txmgmt->data);
+	if (txmgmt->cur >= QWZ_BSS_TXMGMT_SLOTS)	/* awdl-m0-m1: the BSS ring wraps at 8 */
+		txmgmt->cur = 0;
 	txmgmt->queued++;
 	return 0;
 }
@@ -28233,6 +28475,10 @@ qwz_awdl_listen_test(struct qwz_softc *sc, int test)
 	}
 	if (sc->sc_awdltest_active)
 		return -EBUSY;
+	if (sc->mon_active && test >= 3 && test <= 6) {	/* awdl-m0-m1: see qwz_awdltest_vdev_create */
+		qwz_log("qwz: awdltest %d refused: a capture cell holds the radio (debug.qwz.mon=0 first)\n", test);
+		return -EBUSY;
+	}
 	/*
 	 * 6: join as test 4 and stay (awdl0's AWDL engine gets the frames the
 	 * firmware passes); 7: leave. Scans stay allowed meanwhile

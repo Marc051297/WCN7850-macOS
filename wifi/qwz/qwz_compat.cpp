@@ -112,6 +112,12 @@ qwz_compat_set_gate(IOCommandGate *gate)
 	qwz_gate = gate;
 }
 
+IOCommandGate *
+qwz_compat_gate(void)
+{
+	return qwz_gate;
+}
+
 /*
  * M0 (C01): the life word of the softc (sc_life) is reached through a pointer
  * that ItlQwz sets at attach and clears BEFORE the softc is freed. NULL means

@@ -8,3 +8,4 @@ build-fixes/
 deps/
 firmware/dl/
 firmware/FwBinary.cpp
+*.pcap

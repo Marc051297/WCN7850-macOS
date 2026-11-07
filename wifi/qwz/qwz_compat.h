@@ -156,6 +156,7 @@ struct device {
 /* ---- sleep / wakeup / spl (see the concurrency note above) ----------- */
 
 void	qwz_compat_set_gate(IOCommandGate *);
+IOCommandGate *qwz_compat_gate(void);	/* NULL before the HAL attached */
 void	qwz_compat_init(void);	/* before attach */
 void	qwz_compat_fini(void);	/* after detach */
 /* MS-1: 1 = every DMA block the host would free (qwz_free_low) is parked instead, until 0; for a chip whose firmware may still run and whose bus-master bit could not be cleared */

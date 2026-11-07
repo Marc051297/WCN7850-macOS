@@ -19,6 +19,10 @@
 #include "qwz_awdlx.h"
 #include <kern/clock.h>
 #include "IOPCIEDeviceWrapper.hpp"
+extern "C" int qwz_awdl0_up(void);			/* qwz/qwz_awdl0.h (merge glue H2): the kext-owned awdl0 exists */
+extern "C" int qwz_awdl0_set(const char *cmd);		/* qwz/qwz_awdl0.h (H4): "down" destroys it */
+extern "C" int qwz_mon_set(int chan);			/* qwz/qwz_mon.h (H4): 0 ends a capture cell */
+extern "C" int qwz_mon_status(void);			/* qwz/qwz_mon.h (F1): channel while a cell is active, else 0; lock-free */
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportItlwm, IO80211Controller);
@@ -634,6 +638,12 @@ void AirportItlwm::stop(IOService *provider)
     }
     if (awdlPeerCall != NULL)
         thread_call_cancel_wait(awdlPeerCall);	/* awdlTxStopped stops a running one */
+    if (fHalService != NULL) {		/* merge glue (H4): the capture cell's awdl0 and cell end on this sleepable thread, before the power management and the HAL go */
+        if (qwz_awdl0_up() != 0)	/* F1: inert with no awdl0 and no cell, so stop() runs no new blocking call (qwz_mon_set takes the gate and the ioctl lock) */
+            (void)qwz_awdl0_set("down");
+        if (qwz_mon_status() != 0)	/* lock-free read of mon_active (NULL-safe) */
+            (void)qwz_mon_set(0);
+    }
     quiescePM();
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     if (roleTimer) {
@@ -1214,6 +1224,13 @@ getCARD_CAPABILITIES(OSObject *object,
     // supported" and zeroes the 5 GHz channels, so awdl0 runs on channel 6 alone
     // while every peer here is on 149.
     cd->capabilities[3] |= 0x20;
+    // Capability index 73 (byte 9, mask 0x02): Apple80211Scan in the host framework tests it when the scan
+    // parameters hold an SSID or BSSID list (the tether scan of Instant Hotspot). Clear, such a scan dies
+    // with -3903 inside IO80211 and never reaches setWCL_SCAN_REQ. Apple's own driver seeds the bit
+    // unconditionally. debug.qwz.cap73 (default 1); 0 gives the old blob byte for byte. The framework keeps
+    // its own copy: a Wi-Fi toggle, an airportd restart or a reboot is needed to see a change.
+    if (qwz_cap73)
+        cd->capabilities[9] |= 0x02;
     // M0 (C30): debug.qwz.capsae, a discovery matrix for the SAE join (nothing in M0 implements SAE; the matrix tells which
     // bits make macOS issue it). 0 leaves the blob byte-identical; read at every call and applied after the assignments above.
     // 1: the Ersiter route (caps[6] 0x01, caps[9] 0x08), 2: the MtkWireless route (caps[2] 0x01, caps[5] 0x08), 3: both.
@@ -4622,6 +4639,10 @@ int AirportItlwm::awdlCreate()
     OSObject *obj;
     bool ok;
 
+    if (qwz_awdl0_up()) {	/* merge glue (H2): two awdl0 must not exist */
+        qwz_log("airport: awdl0: refused: the kext-owned awdl0 is up (debug.qwz.awdl0=down first)\n");
+        return EEXIST;
+    }
     if (awdlTried) {
         qwz_log("airport: awdl0: already %s; reboot to try again\n", awdlBsd ? "created" : "attempted");
         qwz_log_publish();

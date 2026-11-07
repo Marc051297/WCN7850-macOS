@@ -18,6 +18,8 @@
  *   M0 (docs/m0-spec.md sections 4.5 and C32 to C34):
  *   debug.qwz.m0, deadaware, mmioguard, bme, softassert, silent, awdlforce, capsae,
  *                         inject_arg = int switches; proven = int, read-only
+ *   debug.qwz.cap73       S1: getCARD_CAPABILITIES bit 73 (capabilities[9] 0x02, SSID-list scans), default 1; 0 = the old blob; a Wi-Fi
+ *                         toggle or reboot applies it
  *   debug.qwz.recover     0 legacy crash handling, 1 armed, write 2 re-arms the engine
  *   debug.qwz.awdlprobe   AWDL data TX probe 0 to 3 (1 to 3 need a proven recovery)
  *   debug.qwz.awdlpeers   M2a WP2, AWDL peer hygiene, bit mask (QWZ_AWDLP_* in qwz_life.h), 0 = M0.1: 1 the heard-sender list starts again at
@@ -25,6 +27,11 @@
  *                         vdev takes awdl0's address
  *   debug.qwz.inject=<n>  fault injection, modes 0 to 7 (argument: debug.qwz.inject_arg)
  *   debug.qwz.state       (read) engine and fault state;  debug.qwz.health=1 logs a health line
+ *   awdl-m0-m1 (capture cell and kext-owned awdl0, merged from upstream; docs/airdrop-revisited.md): debug.qwz.mon (channel; 0 stops),
+ *                         monflags (QWZ_MON_F_* in qwz_mon.h), monhold (Wi-Fi on keeps the cell), monbssid, montx (M1 transmit ops), monmac (read-only),
+ *                         montxframe (a qwz_montx_hdr plus an 802.11 frame), monpeer ("add xx:.." or "del"), moncap (read-only capture stream),
+ *                         awdlif ("feth0", "feth0=en3", "-feth0"), awdl0 (a MAC creates the kext's awdl0, "down" destroys it), awdl0tx (read-only)
+ *                         and awdl0rx (write-only): upstream's awdltx and awdlrx under this fork's names, since debug.qwz.awdltx is the lane M preset
  *
  * Copyright (c) 2026 razvanccr. GPL-2.0-or-later (see LICENSE).
  */
@@ -51,6 +58,8 @@ void	qwz_sysctl_set_inject(qwz_sysctl_inject_fn fn, void *arg);	/* ItlQwz::injec
 enum { QWZ_M0_STATE = 0, QWZ_M0_RECOVER = 1, QWZ_M0_HEALTH = 2 };
 typedef int (*qwz_sysctl_m0_fn)(void *arg, int what, int val, char *buf, size_t len);
 void	qwz_sysctl_set_m0(qwz_sysctl_m0_fn fn, void *arg);		/* AirportItlwm::m0Sysctl; NULL: ENXIO */
+/* The capture cell's softc-facing nodes (debug.qwz.mon, montx, montxframe, monpeer, monmac, moncap): set_mon(NULL) makes them answer ENXIO (ItlQwz::detachGated); any other owner opens them. */
+void	qwz_sysctl_set_mon(void *owner);
 /* 1 while debug.qwz.logfile keeps the file sink open (so a bring-up must not close it). */
 int	qwz_sysctl_logfile_on(void);
 

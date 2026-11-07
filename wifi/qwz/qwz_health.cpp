@@ -14,6 +14,7 @@
 #include "qwzreg.h"
 #include "qwzvar.h"
 #include "qwz_awdlx.h"
+#include "qwz_mon.h"	/* merge glue (I): qwz_mon_hold */
 
 /*
  * Statistics (C26): sc->sc_stat[] is indexed by QWZ_STAT_* (qwzvar.h); these
@@ -161,6 +162,11 @@ qwz_health_log(struct qwz_softc *sc, unsigned int wdskip)
 	    (life & QWZ_LIFE_MMIO_BLOCK) != 0,
 	    __atomic_load_n(&qwz_mem_blocks, __ATOMIC_RELAXED),
 	    (unsigned long long)(__atomic_load_n(&qwz_mem_bytes, __ATOMIC_RELAXED) >> 10), wdskip);
+
+	if (sc->mon_active)	/* merge glue (I): the capture cell (qwz_mon.c), printed only while one runs; the counters are qwz_mon.c's own */
+		qwz_log("qwz: health: mon[active=%d chan=%d hold=%u dirty=%d frames=%u mgmt=%u reo=%u psf=%u tx=%u ok=%u fail=%u qd=%d]\n",
+		    sc->mon_active, sc->mon_chan, qwz_mon_hold, sc->mon_fw_dirty, sc->mon_stats.frames, sc->mon_stats.mgmt, sc->mon_stats.reo,
+		    sc->mon_stats.rx_psf, sc->mon_stats.tx_sent, sc->mon_stats.tx_ok, sc->mon_stats.tx_fail, sc->sc_monvif.txmgmt.queued);
 
 	/* rule (b): the test and the scan below are one gate hold with no sleep between them */
 	ring = &sc->dp.tx_ring[0];

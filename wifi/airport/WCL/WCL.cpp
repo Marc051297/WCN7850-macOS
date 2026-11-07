@@ -16,6 +16,8 @@
 #include <net80211/ieee80211_priv.h>
 #include <crypto/sha1.h>
 #include "qwz_log.h"
+#define QWZLOG(fmt, ...)	qwz_log("qwz: " fmt "\n", ##__VA_ARGS__)
+extern "C" int qwz_mon_holding(struct ieee80211com *);	// qwz/qwz_mon.h (M3 hold)
 
 extern IOCommandGate *_fCommandGate;
 
@@ -193,14 +195,166 @@ IOReturn AirportItlwmSkywalkInterface::setWCL_LEAVE_NETWORK(apple80211_leave_net
     return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(3));
 }
 
+// ---- Scan request diagnostics (S2, docs/research-hotspot-wifi-2026-11-07.md): log only, nothing here changes a scan. ----
+// One line per scan request with the outcome beginWCLScan reached, and one per finishWCLScan. The SSID is never printed, only its
+// length and a 32-bit FNV-1a hash (the join lines print only ssid_len as well). Lines that carry a list or a primary SSID (a directed
+// request), a Busy, a STRANDED or any other non-launch outcome use their own counter and are never rate limited; the plain launched
+// lines (no list, no SSID) are limited.
+#ifdef QWZ_DEBUG
+extern uint32_t qwz_debug;
+#define WCL_SCAN_DUMP_MASK	0x00000200	/* own bit of qwz_debug, unused in qwzvar.h (QWZ_D_MGMT 0x80 would also enable the per-frame printf traces): default off even in a debug build */
+#endif
+
+static uint64_t wclScanStartMs;	/* when the latest request was latched, for the age in the finish line */
+static uint32_t wclScanStartId;
+
+struct WCLScanLogState {
+    bool scanPending;
+    bool joinPending;
+    bool skip;
+    bool bgscan;
+    int state;
+    int idle;
+    int prevSsidLength;	/* ic_wcl_scan_ssid_length before this request overwrote it, -1 when not captured */
+};
+
+static uint64_t wclScanNowMs(void)
+{
+    uint64_t t;
+
+    clock_get_uptime(&t);
+    absolutetime_to_nanoseconds(t, &t);
+    return t / 1000000ULL;
+}
+
+static uint32_t wclScanHash(const uint8_t *data, size_t length)
+{
+    uint32_t h = 2166136261u;
+
+    for (size_t i = 0; i < length; ++i)
+        h = (h ^ data[i]) * 16777619u;
+    return h;
+}
+
+// The conditions of AirportWCL::decodeScan (WCL.hpp) on the raw bytes, for the log line only; same order, 0x1550 as the length.
+static bool wclScanDecodeFault(const void *buffer, char *out, size_t outSize)
+{
+    if (!buffer) {
+        snprintf(out, outSize, "request NULL");
+        return true;
+    }
+    const uint8_t *p = static_cast<const uint8_t *>(buffer);
+    uint32_t count = AirportWCL::read32(p + 0x54), ssidLength = AirportWCL::read32(p + 0x1c);
+    uint32_t type = AirportWCL::read32(p + 0x40);
+    if (count > 400 || ssidLength > 32 || type < 1 || type > 4 || 0x1550 < 0x58 + size_t(count) * 12) {
+        snprintf(out, outSize, "bad field:%s%s%s", count > 400 || 0x1550 < 0x58 + size_t(count) * 12 ? " channel_count" : "",
+                 ssidLength > 32 ? " ssid_len" : "", type < 1 || type > 4 ? " type" : "");
+        return true;
+    }
+    return false;
+}
+
+#ifdef QWZ_DEBUG
+static void wclScanHex(char *out, size_t outSize, const uint8_t *data, size_t length)
+{
+    size_t pos = 0;
+
+    for (size_t i = 0; i < length && pos + 3 <= outSize; ++i)
+        pos += size_t(snprintf(out + pos, outSize - pos, "%02x", data[i]));
+}
+#endif
+
+static void logWCLScanRequest(const void *request, const AirportWCL::ScanRequest *scan, const WCLScanLogState &st,
+                              const char *outcome, const char *detail)
+{
+    static unsigned int plain, notable;
+    const uint8_t *p = static_cast<const uint8_t *>(request);
+    uint32_t list = p ? AirportWCL::read32(p + 0x1318) : 0;	// 0x1550 is the length decodeScan is given; the framework buffer is 0x1598
+    bool launched = !strncmp(outcome, "launched", 8);
+    unsigned int seq;
+    if (list || !launched || (scan && scan->ssidLength))
+        seq = __atomic_add_fetch(&notable, 1u, __ATOMIC_RELAXED);
+    else if (qwz_log_ratelimit(&plain, 24, 8))
+        seq = plain;
+    else
+        return;
+    char chans[48] = "";
+    if (scan && p) {
+        size_t pos = 0;
+        for (uint32_t i = 0; i < scan->channelCount && i < 3 && pos + 16 < sizeof(chans); ++i)
+            pos += size_t(snprintf(chans + pos, sizeof(chans) - pos, " %u/0x%x", AirportWCL::read32(p + 0x58 + size_t(i) * 12 + 4),
+                                     AirportWCL::read32(p + 0x58 + size_t(i) * 12 + 8)));
+    }
+    bool zero = true;
+    if (p)
+        for (int i = 0; i < 6; ++i)
+            if (p[0x14 + i])
+                zero = false;
+    char prev[24] = "";
+    if (st.prevSsidLength >= 0)
+        snprintf(prev, sizeof(prev), " prev_ssid_len %d", st.prevSsidLength);
+    qwz_log("airport: WCL scan req%s #%u: id %u type %u ssid_len %u ssid_hash %08x bssid %s ch %u first%s list %u | "
+            "state %s idle %d scanPending %d joinPending %d bgscan %d skip %d%s | %s (%s)\n",
+            launched && !list && !(scan && scan->ssidLength) ? "" : "!", seq, p ? AirportWCL::read32(p) : 0, p ? AirportWCL::read32(p + 0x40) : 0,
+            p ? AirportWCL::read32(p + 0x1c) : 0, scan ? wclScanHash(scan->ssid, scan->ssidLength) : 0,
+            zero ? "zero" : "set", scan ? scan->channelCount : (p ? AirportWCL::read32(p + 0x54) : 0), chans, list,
+            st.state >= 0 && st.state < IEEE80211_S_MAX ? ieee80211_state_name[st.state] : "?", st.idle,
+            st.scanPending, st.joinPending, st.bgscan, st.skip, prev, outcome, detail);
+#ifdef QWZ_DEBUG
+    static unsigned int dumps;
+    // Raw bytes +0x44..+0x57 and the first 0x40 at +0x1318 for the first three requests that carry a list. They may hold SSID text:
+    // redact before sharing. Needs bit 0x200 of qwz_debug (WCL_SCAN_DUMP_MASK; boot-arg qwz_debug or debug.qwz.debug, debug builds only).
+    if (p && list && (qwz_debug & WCL_SCAN_DUMP_MASK) && __atomic_add_fetch(&dumps, 1u, __ATOMIC_RELAXED) <= 3) {
+        char hex[2 * 0x40 + 1] = "";
+        wclScanHex(hex, sizeof(hex), p + 0x44, 0x14);
+        qwz_log("airport: WCL scan raw #%u: +0x44 %s\n", seq, hex);
+        wclScanHex(hex, sizeof(hex), p + 0x1318, 0x40);
+        qwz_log("airport: WCL scan raw #%u: +0x1318 %s\n", seq, hex);
+    }
+#endif
+}
+
 IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *request)
 {
     AirportWCL::ScanRequest scan;
+    // S2: log only. The outcome is logged at each decision point, ahead of the statement that returns there.
+    bool scanDecoded = false;
+    auto scanLog = [&](const char *outcome, const char *detail, int state = -1, int idle = -1, int prevSsidLength = -1) {
+        ieee80211com *lic = fHalService->get80211Controller();
+        if (!lic)
+            return;
+        WCLScanLogState st = {scanPending, joinPending, scanSkipCompletion, bool(lic->ic_flags & IEEE80211_F_BGSCAN), state >= 0 ? state : int(lic->ic_state),
+                              idle >= 0 ? idle : int(lic->ic_wcl_scan_idle), prevSsidLength};
+        logWCLScanRequest(request, scanDecoded ? &scan : nullptr, st, outcome, detail);
+    };
+    {
+        char fault[48];
+        if (wclScanDecodeFault(request, fault, sizeof(fault)))
+            scanLog("decode-failure", fault);
+    }
     if (!AirportWCL::decodeScan(request, 0x1550, scan))
         return kIOReturnBadArgument;
+    scanDecoded = true;
     ieee80211com *ic = fHalService->get80211Controller();
+    // S2: the same gates as the statements below, in the same order; each logs its outcome and only the first one that holds is reached.
+    if (!(ic->ic_if.if_flags & IFF_RUNNING))
+        scanLog("NotReady", "interface not running");
+    else if (scanPending)
+        scanLog("Busy", "gate scanPending");
+    else if (joinPending)
+        scanLog("Busy", "gate joinPending");
+    else if (ic->ic_flags & IEEE80211_F_BGSCAN)
+        scanLog("Busy", "gate F_BGSCAN");
+    else if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+        scanLog("Busy", "gate state AUTH/ASSOC");
     if (!(ic->ic_if.if_flags & IFF_RUNNING))
         return kIOReturnNotReady;
+    if (qwz_mon_holding(ic)) {
+        // M3 hold: the radio is the AWDL cell; every scan finds nothing.
+        scanPending = true;
+        finishWCLScan(kIOReturnSuccess);
+        return kIOReturnSuccess;
+    }
     if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
         return kIOReturnBusy;
     if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
@@ -212,8 +366,13 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
                 AirportWCL::scanChannelSelected(scan.channels, true, channel))
                 usable = true;
         if (!usable)
+            scanLog("Unsupported", "no usable channel");
+        if (!usable)
             return kIOReturnUnsupported;
     }
+    const int logState = ic->ic_state, logIdle = ic->ic_wcl_scan_idle, logPrev = ic->ic_wcl_scan_ssid_length;
+    wclScanStartMs = wclScanNowMs();
+    wclScanStartId = scan.identifier;
     scanPending = true;
     scanCompleted = false;
     scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
@@ -232,6 +391,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
             scanPending = false;
             ic->ic_wcl_scan_requested = false;
             scanSource->cancelTimeout();
+            scanLog("Busy", "bgscan declined in RUN", logState, logIdle, logPrev);
             return kIOReturnBusy;
         }
     } else if (ic->ic_state != IEEE80211_S_SCAN) {
@@ -240,6 +400,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
             scanPending = false;
             ic->ic_wcl_scan_requested = false;
             scanSource->cancelTimeout();
+            scanLog("Error", "ic_newstate(SCAN) failed", logState, logIdle, logPrev);
             return kIOReturnError;
         }
     } else if (ic->ic_wcl_scan_idle) {
@@ -248,6 +409,15 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         scanSkipCompletion = false;
         ieee80211_next_scan(&ic->ic_if);
     }
+    // S2: which of the launch branches above ran (state and idle as they were before them). STRANDED: none ran.
+    if (logState == IEEE80211_S_RUN)
+        scanLog("launched", "bgscan", logState, logIdle, logPrev);
+    else if (logState != IEEE80211_S_SCAN)
+        scanLog("launched", "newstate", logState, logIdle, logPrev);
+    else if (logIdle)
+        scanLog("launched", "restart", logState, logIdle, logPrev);
+    else
+        scanLog("STRANDED", "state SCAN and scan not idle: no launch branch ran", logState, logIdle, logPrev);
     return kIOReturnSuccess;
 }
 
@@ -255,6 +425,20 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
 {
     if (!scanPending)
         return;
+    {
+        // S2: log only. Non-success (Timeout after a strand, Aborted) always logs, success is rate limited on its own counter.
+        static unsigned int done, doneNotable;
+        ieee80211com *lic = fHalService->get80211Controller();
+        bool notable = status != kIOReturnSuccess;
+        if (notable)
+            __atomic_add_fetch(&doneNotable, 1u, __ATOMIC_RELAXED);
+        if (notable || qwz_log_ratelimit(&done, 24, 8))
+            qwz_log("airport: WCL scan done%s #%u: id %u status 0x%x (%s) age %llu ms | completed %d skip %d state %s idle %d\n",
+                    notable ? "!" : "", notable ? doneNotable : done, wclScanStartId,
+                    unsigned(status), status == kIOReturnSuccess ? "Success" : status == kIOReturnTimeout ? "Timeout" :
+                    status == kIOReturnAborted ? "Aborted" : "other", (unsigned long long)(wclScanNowMs() - wclScanStartMs),
+                    scanCompleted, scanSkipCompletion, ieee80211_state_name[lic->ic_state], lic->ic_wcl_scan_idle);
+    }
     scanPending = false;
     scanCompleted = false;
     scanSource->cancelTimeout();
@@ -528,6 +712,15 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
             qwz_log("airport: WCL join #%u: decodeJoin rejected the request -> kIOReturnBadArgument (reason: see the 'join raw' line just above)\n", rejected);
         return kIOReturnBadArgument;
     }
+    if (qwz_mon_holding(fHalService->get80211Controller())) {
+        // airportd retries a refused join; an unthrottled line per retry would flush the log ring.
+        static unsigned int holdRefused;
+        if (qwz_log_ratelimit(&holdRefused, 8, 64))
+            QWZLOG("WCL join refused: the capture cell holds the radio");
+        // startWCLJoin zeroes the request on every exit; this early return must too (it can hold a passphrase or PMK).
+        explicit_bzero(&join, sizeof(join));
+        return kIOReturnNotReady; // M3 hold: no station to join with
+    }
     return startWCLJoin(join);
 }
 
@@ -535,6 +728,11 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
 {
     auto auth = AirportWCL::classifyLegacyAuth(join);
     XYLog("WCL join ssid_len=%u bssid=%s chanspec=0x%x auth lower=%u upper=0x%x -> %s, key len=%u type=%u%s, rsn_ie len=%u\n",
+          join.ssidLength, ether_sprintf(join.bssid), join.channelSpec, join.lowerAuth, join.upperAuth,
+          AirportWCL::legacyAuthName(auth), join.keyLength, join.keyCipher,
+          AirportWCL::isPassphrase(join) ? " (passphrase)" : "", join.rsnLength);
+    // Upstream (M3) replaced the XYLog above (kprintf: serial console only) with this QwzMacLog ring line; the merge keeps both.
+    QWZLOG("WCL join ssid_len=%u bssid=%s chanspec=0x%x auth lower=%u upper=0x%x -> %s, key len=%u type=%u%s, rsn_ie len=%u",
           join.ssidLength, ether_sprintf(join.bssid), join.channelSpec, join.lowerAuth, join.upperAuth,
           AirportWCL::legacyAuthName(auth), join.keyLength, join.keyCipher,
           AirportWCL::isPassphrase(join) ? " (passphrase)" : "", join.rsnLength);
@@ -575,6 +773,12 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
                     refused, !supported ? "unsupported auth/key combination -> kIOReturnUnsupported" :
                     "radio not running or another join/scan pending -> kIOReturnBusy",
                     supported, !!(ic->ic_if.if_flags & IFF_RUNNING), joinPending, scanPending);
+        // Upstream's (M3) variant of the refusal line above (it adds ic_state), rate-limited on its own so a retrying
+        // airportd cannot flush the recovery lines out of the log ring.
+        static unsigned int refusedState;
+        if (qwz_log_ratelimit(&refusedState, 24, 64))
+            QWZLOG("WCL join refused: supported=%d running=%d joinPending=%d scanPending=%d state=%d",
+                  supported, (ic->ic_if.if_flags & IFF_RUNNING) != 0, joinPending, scanPending, ic->ic_state);
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }

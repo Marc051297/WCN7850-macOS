@@ -6,6 +6,10 @@
 #include "qwz_sysctl.h"
 #include "qwz_log.h"
 #include "qwz_life.h"
+#include "qwz_mon.h"
+#include "qwz_awdl0.h"
+
+#include <IOKit/IOLib.h>
 
 #include <sys/types.h>
 #include <sys/errno.h>
@@ -33,6 +37,8 @@ int qwz_m0_on = 1, qwz_dead_aware = 1, qwz_mmio_guard = 1, qwz_bme = 1, qwz_soft
     qwz_late_settle = 2000,		/* M0.1 (F1): debug.qwz.latesettle, ms of pause before the force wake and before the MHI reset of the late reset (none before the SoC reset) */
     qwz_late_mode = 0;		/* H1: debug.qwz.latemode, 0 the reviewed M0.1 sequence, 1 a blind SoC reset (posted writes only) before the first BAR read */
 volatile int qwz_pm_pending = 0;	/* HF-1, HF-3: see qwz_life.h; not a sysctl */
+
+int qwz_cap73 = 1;	/* S1 (hotspot Wi-Fi): debug.qwz.cap73, see qwz_life.h; its own line, apart from the list above */
 
 int qwz_awdltruth = 0, qwz_awdlclk = 0;	/* M2a WP5: see qwz_life.h; 0 and 0 is M0.1 on the air */
 volatile unsigned int qwz_awdl_lat_us = 0;	/* M2a WP5 (awdlclk 8): see qwz_life.h */
@@ -426,7 +432,252 @@ qwz_sysctl_awdlclk(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_
 		qwz_log("qwz: sysctl debug.qwz.awdlclk=0x%x received (1 AW sequence posted modulo 65536, 2 realign to the best heard peer every 20 s while master, 4 tx_counter rounded, 8 phy_tx_time stamped with the measured delay, 16 PSF as a follower every 440 TU)\n", v);
 	return 0;
 }
+
+/*
+ * origin/awdl-m0-m1 (docs/airdrop-revisited.md, driven by the owlymac daemon): the capture cell with its debug.qwz.mon* knobs, and an
+ * awdl0 owned by this kext. It is a second AirDrop design beside lane M above and stays inert until its own knobs are used. Two of
+ * its sysctl names differ from upstream's because ours were here first: debug.qwz.awdltx is the lane M preset (WP4), so upstream's
+ * awdltx and awdlrx are debug.qwz.awdl0tx and debug.qwz.awdl0rx here (owlymac must read these), and upstream's qwz_awdl.h is
+ * qwz_awdl0.h (qwz_awdl.h is the lane M header) with qwz_awdl0_set, _status, _tx_pending, _tx_drain and _rx_inject.
+ */
+
+/*
+ * Closing hook of the capture cell's softc-facing nodes, in the pattern of qwz_sysctl_set_awdl and qwz_sysctl_set_m0. Upstream's
+ * qwz_mon.c keeps its softc in a file-static pointer (set by qwz_mon_attach) and takes the command gate from qwz_compat_gate(), and
+ * neither is cleared when the HAL service detaches, while these nodes stay registered until IOPCIEDeviceWrapper::stop() unregisters
+ * them. qwz_sysctl_set_mon(NULL) makes debug.qwz.mon, montx, montxframe, monpeer, monmac and moncap answer ENXIO. It belongs beside the
+ * other set(NULL) calls of AirportItlwm::stop() and of the detach and shutdown paths of ItlQwz, before the softc goes, and ItlQwz
+ * passes itself once an attach has succeeded. The nodes are open until the first NULL, which is upstream's behaviour, so a build that
+ * never calls it is unchanged. A flag, not a fence: it keeps new calls out and does not wait for one already inside qwz_mon.c.
+ * debug.qwz.monflags, monhold and monbssid are plain variables, and awdlif, awdl0, awdl0tx and awdl0rx never touch the softc, so they
+ * stay open.
+ */
+static volatile int qwz_sysctl_mon_closed;
+
+void
+qwz_sysctl_set_mon(void *owner)
+{
+	qwz_sysctl_mon_closed = (owner == NULL);
+}
+
+/* debug.qwz.mon: channel while capturing; write a channel to start, 0 to stop. */
+static int
+qwz_sysctl_mon(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	if (qwz_sysctl_mon_closed)
+		return ENXIO;	/* qwz_sysctl_set_mon(NULL): before the status read below, which dereferences qwz_mon.c's softc */
+	int v = qwz_mon_status();
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	return qwz_mon_set(v);
+}
+
+/* debug.qwz.montx: M1 transmit ops (bit 1 broadcast once, 2 auto reply, 4 unicast once). */
+static int
+qwz_sysctl_montx(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	if (qwz_sysctl_mon_closed)
+		return ENXIO;
+	int v = (int)qwz_mon_tx_mode;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	return qwz_mon_tx(v);
+}
+
+/* debug.qwz.montxframe: write a qwz_montx_hdr plus 802.11 frame to transmit it (M2). */
+static int
+qwz_sysctl_montxframe(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	uint8_t buf[sizeof(struct qwz_montx_hdr) + QWZ_MONTX_MAXFRAME];
+	int err;
+
+	if (qwz_sysctl_mon_closed)
+		return ENXIO;
+	if (req->newptr == USER_ADDR_NULL)
+		return 0;	/* nothing to read back */
+	if (req->newlen > sizeof(buf))
+		return EINVAL;
+	err = SYSCTL_IN(req, buf, req->newlen);
+	if (err)
+		return err;
+	return qwz_mon_tx_frame(buf, req->newlen);
+}
+
+/* debug.qwz.monpeer: "add <mac>" / "del" for a firmware peer on the capture vdev. */
+static char qwz_mon_peer_str[32];
+static int
+qwz_sysctl_monpeer(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	if (qwz_sysctl_mon_closed)
+		return ENXIO;
+	int err = sysctl_handle_string(oidp, qwz_mon_peer_str, sizeof(qwz_mon_peer_str), req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	return qwz_mon_peer(qwz_mon_peer_str);
+}
+
+/*
+ * debug.qwz.awdlif: "feth0", "feth0=en3" or "-feth0" (qwz_mon.h). Merge interplay action: it keeps its own 32-byte string, so a write
+ * to monpeer cannot overwrite what awdlif last held, nor the other way round. Upstream's handler names monpeer's buffer; the macro
+ * points that name at awdlif's own buffer for this one function, so the handler's lines stay exactly as upstream wrote them.
+ */
+static char qwz_awdlif_str[32];
+#define qwz_mon_peer_str qwz_awdlif_str
+static int
+qwz_sysctl_awdlif(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int err = sysctl_handle_string(oidp, qwz_mon_peer_str, sizeof(qwz_mon_peer_str), req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	return qwz_mon_awdlif(qwz_mon_peer_str);
+}
+#undef qwz_mon_peer_str
+
+/* debug.qwz.monmac: the capture vdev's MAC (the AWDL address a node here must use). */
+static int
+qwz_sysctl_monmac(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	char mac[18];
+
+	if (qwz_sysctl_mon_closed)
+		return ENXIO;
+	qwz_mon_mac_str(mac, sizeof(mac));
+	return sysctl_handle_string(oidp, mac, sizeof(mac), req);
+}
+
+/* debug.qwz.moncap: drains the capture ring as a stream of qwz_moncap_hdr records. */
+static int
+qwz_sysctl_moncap(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	if (qwz_sysctl_mon_closed)
+		return ENXIO;
+	const size_t MAX = 1024 * 1024;
+	size_t avail = qwz_mon_cap_pending(), max, n;
+	void *buf;
+	int err;
+
+	if (req->newptr != USER_ADDR_NULL)
+		return EPERM;
+	if (req->oldptr == USER_ADDR_NULL) {
+		req->oldidx = avail;
+		return 0;
+	}
+	max = req->oldlen < MAX ? req->oldlen : MAX;
+	if (max == 0)
+		return 0;
+	buf = IOMalloc(max);
+	if (buf == NULL)
+		return ENOMEM;
+	n = qwz_mon_cap_drain(buf, max);
+	err = n ? SYSCTL_OUT(req, buf, n) : 0;
+	IOFree(buf, max);
+	return err;
+}
+
+
+/* debug.qwz.awdl0: "xx:xx:xx:xx:xx:xx" creates the kext's awdl0, "down" destroys it; reads its state. */
+static int
+qwz_sysctl_awdl0(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	char buf[96];
+	int err;
+
+	if (req->newptr != USER_ADDR_NULL) {
+		size_t n = req->newlen < sizeof(buf) - 1 ? req->newlen : sizeof(buf) - 1;
+		err = SYSCTL_IN(req, buf, n);
+		if (err)
+			return err;
+		buf[n] = 0;
+		while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == 0))
+			buf[--n] = 0;
+		return qwz_awdl0_set(buf);
+	}
+	qwz_awdl0_status(buf, sizeof(buf));
+	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
+}
+
+/* debug.qwz.awdl0tx: drains the frames the stack sent on awdl0. */
+static int
+qwz_sysctl_awdl0tx(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	const size_t MAX = 512 * 1024;
+	size_t avail = qwz_awdl0_tx_pending(), max, n;
+	void *buf;
+	int err;
+
+	if (req->newptr != USER_ADDR_NULL)
+		return EPERM;
+	if (req->oldptr == USER_ADDR_NULL) {
+		req->oldidx = avail;
+		return 0;
+	}
+	max = req->oldlen < MAX ? req->oldlen : MAX;
+	if (max == 0)
+		return 0;
+	buf = IOMalloc(max);
+	if (buf == NULL)
+		return ENOMEM;
+	n = qwz_awdl0_tx_drain(buf, max);
+	err = n ? SYSCTL_OUT(req, buf, n) : 0;
+	IOFree(buf, max);
+	return err;
+}
+
+/* debug.qwz.awdl0rx: frames from the air, injected as received on awdl0. */
+static int
+qwz_sysctl_awdl0rx(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	const size_t MAX = 512 * 1024;
+	void *buf;
+	int err;
+
+	if (req->newptr == USER_ADDR_NULL)
+		return 0;
+	if (req->newlen < 4 || req->newlen > MAX)
+		return EINVAL;
+	buf = IOMalloc(req->newlen);
+	if (buf == NULL)
+		return ENOMEM;
+	err = SYSCTL_IN(req, buf, req->newlen);
+	if (err == 0)
+		err = qwz_awdl0_rx_inject(buf, req->newlen);
+	IOFree(buf, req->newlen);
+	return err;
+}
+
 SYSCTL_NODE(_debug, OID_AUTO, qwz, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "QwzMac");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, mon, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_mon, "I", "monitor-mode capture: channel to start, 0 to stop (Wi-Fi must be off)");
+SYSCTL_UINT(_debug_qwz, OID_AUTO, monflags, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_mon_flags, 0, "monitor-mode experiment flags (QWZ_MON_F_* in qwz_mon.h)");
+SYSCTL_UINT(_debug_qwz, OID_AUTO, monhold, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_mon_hold, 0, "1: Wi-Fi on keeps the capture cell instead of starting the station");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, monmac, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_monmac, "A", "the capture vdev's MAC: the AWDL address for a node on this card");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, montxframe, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_montxframe, "S", "transmit a frame from userspace (qwz_montx_hdr + 802.11 frame)");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, monpeer, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_monpeer, "A", "firmware peer on the capture vdev: 'add xx:xx:xx:xx:xx:xx' or 'del'");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdlif, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdlif, "A", "\"feth0\" or \"feth0=en3\" (delegate to the Wi-Fi interface too) marks it AWDL (IFEF_AWDL); \"-feth0\" clears");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdl0, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdl0, "A", "the kext's awdl0: write a MAC to create, \"down\" to destroy (qwz_awdl0.h)");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdl0tx, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdl0tx, "S", "drain the frames the stack sent on awdl0");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdl0rx, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdl0rx, "S", "inject frames received on awdl0");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, montx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_montx, "I", "monitor-mode transmit: 1 broadcast PSF copy once, 2 auto unicast reply, 4 unicast once");
+SYSCTL_STRING(_debug_qwz, OID_AUTO, monbssid, CTLFLAG_RW | CTLFLAG_LOCKED,
+    qwz_mon_bssid_str, sizeof(qwz_mon_bssid_str), "BSSID the monitor vdev comes up with (xx:xx:xx:xx:xx:xx; empty: own MAC)");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, moncap, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_moncap, "S", "drain captured frames (scripts/qwz-moncap.py)");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, start, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, qwz_sysctl_start, "I", "write 1 to run the bring-up");
 SYSCTL_INT(_debug_qwz, OID_AUTO, stage, CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -462,6 +713,8 @@ SYSCTL_INT(_debug_qwz, OID_AUTO, awdlforce, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_awdlforce, 0, "1: allow AWDL probes 1 to 3 and inject 7 without the recovery interlock (unsafe)");
 SYSCTL_INT(_debug_qwz, OID_AUTO, capsae, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_capsae, 0, "getCARD_CAPABILITIES SAE experiment 0 to 3; reset to 0 after each cell");
+SYSCTL_INT(_debug_qwz, OID_AUTO, cap73, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_cap73, 0, "getCARD_CAPABILITIES capability bit 73 (byte 9, 0x02: SSID-list scans reach the driver): 1 set (default), 0 the old blob; needs a Wi-Fi toggle or reboot to take effect");
 SYSCTL_INT(_debug_qwz, OID_AUTO, inject_arg, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_inject_arg, 0, "argument of the next debug.qwz.inject");
 SYSCTL_INT(_debug_qwz, OID_AUTO, proven, CTLFLAG_RD | CTLFLAG_LOCKED,
@@ -524,6 +777,7 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_awdlprobe);
 	sysctl_register_oid(&sysctl__debug_qwz_awdlforce);
 	sysctl_register_oid(&sysctl__debug_qwz_capsae);
+	sysctl_register_oid(&sysctl__debug_qwz_cap73);
 	sysctl_register_oid(&sysctl__debug_qwz_inject_arg);
 	sysctl_register_oid(&sysctl__debug_qwz_proven);
 	sysctl_register_oid(&sysctl__debug_qwz_latesettle);
@@ -541,6 +795,20 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_inject);
 	sysctl_register_oid(&sysctl__debug_qwz_state);
 	sysctl_register_oid(&sysctl__debug_qwz_health);
+	/* origin/awdl-m0-m1 (the capture cell and the kext-owned awdl0): registered after ours */
+	sysctl_register_oid(&sysctl__debug_qwz_mon);
+	sysctl_register_oid(&sysctl__debug_qwz_monflags);
+	sysctl_register_oid(&sysctl__debug_qwz_monhold);
+	sysctl_register_oid(&sysctl__debug_qwz_monbssid);
+	sysctl_register_oid(&sysctl__debug_qwz_montx);
+	sysctl_register_oid(&sysctl__debug_qwz_monmac);
+	sysctl_register_oid(&sysctl__debug_qwz_montxframe);
+	sysctl_register_oid(&sysctl__debug_qwz_monpeer);
+	sysctl_register_oid(&sysctl__debug_qwz_awdlif);
+	sysctl_register_oid(&sysctl__debug_qwz_awdl0);
+	sysctl_register_oid(&sysctl__debug_qwz_awdl0tx);
+	sysctl_register_oid(&sysctl__debug_qwz_awdl0rx);
+	sysctl_register_oid(&sysctl__debug_qwz_moncap);
 #ifdef QWZ_DEBUG
 	sysctl_register_oid(&sysctl__debug_qwz_debug);
 #endif
@@ -557,6 +825,20 @@ qwz_sysctl_unregister(void)
 #ifdef QWZ_DEBUG
 	sysctl_unregister_oid(&sysctl__debug_qwz_debug);
 #endif
+	/* origin/awdl-m0-m1 (the capture cell and the kext-owned awdl0): registered after ours, so unregistered before ours */
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncap);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monpeer);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdlif);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdl0);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdl0tx);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdl0rx);
+	sysctl_unregister_oid(&sysctl__debug_qwz_montxframe);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monmac);
+	sysctl_unregister_oid(&sysctl__debug_qwz_montx);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monbssid);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monflags);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monhold);
+	sysctl_unregister_oid(&sysctl__debug_qwz_mon);
 	/* M0 (C32), in the reverse order of the registration */
 	sysctl_unregister_oid(&sysctl__debug_qwz_health);
 	sysctl_unregister_oid(&sysctl__debug_qwz_state);
@@ -574,6 +856,7 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_latesettle);
 	sysctl_unregister_oid(&sysctl__debug_qwz_proven);
 	sysctl_unregister_oid(&sysctl__debug_qwz_inject_arg);
+	sysctl_unregister_oid(&sysctl__debug_qwz_cap73);
 	sysctl_unregister_oid(&sysctl__debug_qwz_capsae);
 	sysctl_unregister_oid(&sysctl__debug_qwz_awdlforce);
 	sysctl_unregister_oid(&sysctl__debug_qwz_awdlprobe);

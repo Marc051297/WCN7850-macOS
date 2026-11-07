@@ -1130,6 +1130,8 @@ qwz_pci_detach(struct device *self, int flags)
 	qwz_timeout_free_proc(&sc->scan.timeout);
 	timeout_del(&sc->mon_reap_timer);
 	timeout_free(&sc->mon_reap_timer);
+	timeout_del(&sc->mon_cell_timer);	/* merge glue (E): the capture cell's own timer */
+	timeout_free(&sc->mon_cell_timer);
 	ieee80211_ifdetach(ifp);
 	if_detach(ifp);
 #endif

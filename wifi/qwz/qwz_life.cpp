@@ -64,6 +64,7 @@ qwz_declare_dead(struct qwz_softc *sc, uint32_t reason, const char *detail)
 	qwz_log("qwz: life: DEAD #%u: %s (%s): fw_initialized %d ifflags 0x%x peers %d vdevs %d, waiters released, engine asked\n",
 	    sc->sc_dead_episodes, qwz_dead_names[reason < QWZ_DEAD_MAX ? reason : 0], detail ? detail : "-",
 	    sc->fw_initialized, sc->sc_ic.ic_if.if_flags, sc->num_peers, sc->num_created_vdevs);
+	qwz_log("qwz: life: DEAD #%u: mon %d\n", sc->sc_dead_episodes, sc->mon_active);	/* merge glue (I): a capture cell was running when the firmware died (its statement above is untouched) */
 	qwz_flight_dump(sc);			/* C26: the last WMI commands and events */
 	if (__atomic_load_n(&sc->sc_inject, __ATOMIC_ACQUIRE) & (QWZ_INJ_WMI_STARVE | QWZ_INJ_IGNORE_EV)) {	/* M0.1 (F2): inject 2 or 7 armed; the restart's own WMI handshake must not inherit the starvation, and its events must count */
 		__atomic_and_fetch(&sc->sc_inject, ~(QWZ_INJ_WMI_STARVE | QWZ_INJ_IGNORE_EV), __ATOMIC_ACQ_REL);

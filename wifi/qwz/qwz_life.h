@@ -27,6 +27,8 @@ extern const char *const qwz_dead_names[];
 /* the runtime knobs of section 4.5: defined in qwz_sysctl.cpp (C32) */
 extern int qwz_m0_on, qwz_dead_aware, qwz_mmio_guard, qwz_bme, qwz_softassert, qwz_recover, qwz_silent,
     qwz_awdlprobe, qwz_awdlforce, qwz_capsae, qwz_inject_arg, qwz_recovery_proven, qwz_late_settle, qwz_late_mode;
+/* S1 (hotspot Wi-Fi, docs/research-hotspot-wifi-2026-11-07.md): debug.qwz.cap73, default 1: getCARD_CAPABILITIES sets bit 73 (capabilities[9] 0x02); 0 = the old blob. Defined in qwz_sysctl.cpp */
+extern int qwz_cap73;
 /* WP4 (M2a): lane M hardening (qwz_awdl.h), all default 0 = M0.1 behaviour. qwz_awdltx_eff is the rung in force: the configured qwz_awdltx, lowered at run time (three DISCARD or INSPECT completions in a row, or a DEAD with preset frames in flight) */
 extern int qwz_awdlhyg, qwz_awdltx, qwz_awdltx_eff, qwz_awdlgate, qwz_awdltxopt;
 #ifndef QWZ_AWDL_TX_MAX

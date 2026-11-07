@@ -10,6 +10,7 @@
 #include "qwzreg.h"
 #include "qwzvar.h"
 #include "qwz_sysctl.h"
+#include "qwz_mon.h"
 #undef malloc
 #undef free
 #undef wakeup
@@ -188,6 +189,8 @@ ItlQwz::attachGated(OSObject *, void *arg0, void *arg1, void *, void *)
 	if (err) {
 		QWZLOG("attach failed: %d", err);
 		qwz_compat_set_life(NULL);				/* before the softc is freed (C01) */
+		qwz_sysctl_set_mon(NULL);				/* fix F7: qwz_mon_attach may have run; close the cell's nodes before the softc is freed */
+		qwz_mon_detach(that->sc);				/* fix F7: NULL-safe and idempotent: clears qwz_mon_sc when it is this softc, frees the buffers and the maps */
 		qwz_pci_macos_detach(that->sc);
 		/* keep get80211Controller() valid: a fresh, empty softc */
 		that->sc = qwz_pci_macos_alloc();
@@ -198,6 +201,7 @@ ItlQwz::attachGated(OSObject *, void *arg0, void *arg1, void *, void *)
 	that->attached = true;
 	qwz_sysctl_set_awdltest(awdlTestEntry, that);
 	qwz_sysctl_set_inject(injectEntry, that);	/* M0 (C32, C33) */
+	qwz_sysctl_set_mon(that);			/* merge glue (F): the capture cell's nodes are open while an attach stands */
 	return kIOReturnSuccess;
 }
 
@@ -454,6 +458,7 @@ ItlQwz::attach(IOPCIDevice *device)
 	QWZLOG("M0: %s %s recover=%d silent=%d m0=%d deadaware=%d mmioguard=%d bme=%d softassert=%d awdlprobe=%d capsae=%d m0.1=late-reset,async-inject,dma-hold latesettle=%d (see debug.qwz.*)",
 	    ITLWM_VERSION, GIT_COMMIT, qwz_recover, qwz_silent, qwz_m0_on, qwz_dead_aware, qwz_mmio_guard, qwz_bme,
 	    qwz_softassert, qwz_awdlprobe, qwz_capsae, qwz_late_settle);
+	QWZLOG("S1: cap73=%d (debug.qwz.cap73; capability bit 73, byte 9 mask 0x02)", qwz_cap73);
 	/* M0 (C12): one PCI config snapshot now (device alive, config reads only), so the first wake never starts from none */
 	saveConfig();
 	qwz_log("qwz: pm: attach-time PCI snapshot taken (valid %d) id %08x cmd %04x\n", saved.valid, saved.id, saved.cmd);
@@ -468,6 +473,9 @@ ItlQwz::detachGated(OSObject *, void *arg0, void *, void *, void *)
 	QWZLOG("detach: attached %d shutdown %d", that->attached, that->shutdown);
 	qwz_sysctl_set_awdltest(NULL, NULL);
 	qwz_sysctl_set_inject(NULL, NULL);
+	qwz_sysctl_set_mon(NULL);			/* merge glue (F): debug.qwz.mon, montx, montxframe, monpeer, monmac and moncap answer ENXIO from here on */
+	if (that->sc != NULL)
+		qwz_mon_detach(that->sc);		/* merge glue (F): host-only end of a cell, then the capture buffers, the lock and the 64 maps go before qwz_detach frees the softc */
 	if (that->sc != NULL) {
 		/* R1-05: in the attached, not shut down case qwz_pci_macos_detach clears it itself, directly before it frees the softc, so DEAD (declared by qwz_pci_detach for a stuck lock) stays visible to the dead-aware sleeps of its teardown and of the woken holder */
 		if (!that->attached || that->shutdown)
@@ -1361,7 +1369,20 @@ ItlQwz::enableGated(OSObject *, void *arg0, void *, void *, void *)
 		return kIOReturnBusy;
 	}
 	ifp->if_flags |= IFF_UP;
-	if (!(ifp->if_flags & IFF_RUNNING))
+	/*
+	 * Merged from the capture cell (qwz_mon.c, awdl-m0-m1): with debug.qwz.monhold set and a cell running, Wi-Fi "on" only marks the
+	 * interface UP|RUNNING and the station is not started. qwz_mon_holding() has to read false from the moment a teardown ended the
+	 * cell: qwz_core_deinit ends it host-only through qwz_mon_epoch_reset (qwz_fw_epoch_reset does not touch it), and qwz_mon_holding
+	 * also reads false for a firmware that is not initialized, crashed or DEAD, or a wake would stop here and never reach qwz_init. sc_awdl_quiesce is not lifted
+	 * here: C17 latches it in every teardown and only awdltest=6 lifts it, and the listen vdev that test joins needs the association
+	 * a hold refuses, so the hold and the native AWDL lane (lane M) exclude each other. With no hold the else-if below is the test
+	 * this tree always had (qwz_init runs when the interface is not yet RUNNING), in upstream's chained form.
+	 */
+	if (qwz_mon_holding(&that->sc->sc_ic)) {
+		/* M3 hold: Wi-Fi "on" over the running cell, no station. */
+		ifp->if_flags |= IFF_RUNNING;
+		QWZLOG("mon: hold: interface up without the station");
+	} else if (!(ifp->if_flags & IFF_RUNNING))
 		err = qwz_init(ifp);
 	rw_exit(&that->sc->ioctl_rwl);
 	if (err)
@@ -1394,7 +1415,19 @@ ItlQwz::disableGated(OSObject *, void *arg0, void *, void *, void *)
 			qwz_log("qwz: pm: disable: stopping with state work in flight (%d task(s), init task %d)\n", t, i);
 	}
 	ifp->if_flags &= ~IFF_UP;
-	if (ifp->if_flags & IFF_RUNNING)
+	/*
+	 * Capture cell hold (see enableGated): the interface goes down, the station is not stopped and the cell stays. Wi-Fi off in this
+	 * tree normally goes on into chipDown (radioOffGated, setPowerStateOff): sleepHardware then skips qwz_stop, as IFF_RUNNING is
+	 * clear, and qwz_core_deinit powers the firmware down, which ends the cell host-only (qwz_mon_epoch_reset, called from
+	 * qwz_core_deinit). This branch then only covers the short window before that. owlymac does not re-arm a cell: one lost to Wi-Fi off
+	 * or to sleep needs `owlymac up` again (or debug.qwz.monhold=1 and debug.qwz.mon=<channel> by hand after the next Wi-Fi on).
+	 * With -qwznowakefix no chip reset follows and the cell stays. sc_awdl_quiesce was latched above, before this branch, as for
+	 * every teardown.
+	 */
+	if (qwz_mon_holding(&that->sc->sc_ic)) {
+		ifp->if_flags &= ~IFF_RUNNING;
+		QWZLOG("mon: hold: interface down, the cell stays");
+	} else if (ifp->if_flags & IFF_RUNNING)
 		qwz_stop(ifp);
 	rw_exit(&that->sc->ioctl_rwl);
 	return kIOReturnSuccess;

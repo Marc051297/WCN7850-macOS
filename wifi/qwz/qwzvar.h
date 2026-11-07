@@ -1856,7 +1856,7 @@ struct qwz_pdev_dp {
 };
 
 struct qwz_txmgmt_queue {
-	struct qwz_tx_data data[8];
+	struct qwz_tx_data data[64];	/* M3: 8 overflowed during an AirDrop transfer (owly: radio full 769) */
 	int cur;
 	int queued;
 };
@@ -2296,7 +2296,32 @@ struct qwz_softc {
 	struct qwz_dmamem		*m3_mem;
 
 	qwz_timeout_t			 mon_reap_timer;
+	qwz_timeout_t			 mon_cell_timer;	/* qwz_mon.c: the capture cell's reap timer (mon_reap_timer is the DP code's and qwz_stop deletes it) */
 #define ATH12K_MON_TIMER_INTERVAL	10
+
+	/* qwz_mon.c: monitor-mode capture (debug.qwz.mon). */
+	struct qwz_vif			 sc_monvif;
+	int				 mon_active;
+	int				 mon_fw_dirty;	/* a cell ran: restart the firmware before the station */
+	int				 mon_chan;
+	uint32_t			 mon_freq;
+	int				 mon_bssid_set;
+	uint8_t				 mon_bssid[IEEE80211_ADDR_LEN];
+	int				 mon_self_peer;	/* AP vdev's own peer entry exists */
+	int				 mon_sender_peer;	/* raw firmware peer for mon_sender_addr */
+	uint8_t				 mon_sender_addr[IEEE80211_ADDR_LEN];
+	uint8_t				 mon_tx_kind[64];	/* per transmit slot: 0 replay, 1 user mgmt, 2 user data, 3 user ctrl */
+	struct {
+		uint32_t entries, mpdus, frames, bufs, mgmt;
+		uint32_t reo, reo_err, wbm_err;
+		uint32_t rx_psf, tx_sent, tx_fail, tx_ok, tx_discard, tx_inspect, tx_noack, tx_other;
+		int32_t last_ack_rssi;
+		/* Frames handed in from userspace (M2), by 802.11 type. */
+		uint32_t ufr_sent, ufr_full, ufr_fail;
+		uint32_t ufr_mgmt_ok, ufr_mgmt_bad, ufr_data_ok, ufr_data_bad, ufr_ctrl_ok, ufr_ctrl_bad;
+		uint32_t badcookie, nolink, duplink, linkret_fail;
+		uint64_t last_log;
+	} mon_stats;
 
 	/* Provided by attachment driver: */
 	struct qwz_ops			ops;
