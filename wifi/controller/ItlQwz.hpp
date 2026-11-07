@@ -13,6 +13,7 @@
 #include <HAL/ItlHalService.hpp>
 #include <HAL/ItlDriverInfo.hpp>
 #include <HAL/ItlDriverController.hpp>
+#include "qwz_awdl.h"	/* WP4 (M2a): lane M */
 
 struct qwz_softc;
 
@@ -60,10 +61,37 @@ public:
 	void wakeComplete(bool ok) override;
 	bool dataStalled(bool *healthy) override;
 	void requestBusReset() override;
+	/* M0 (C18): fault state and engine plumbing; AirportItlwm's sentinel and engine (C14, C15) call these */
+	void setFaultHandler(void (*cb)(void *, uint32_t), void *arg) override;
+	bool faultPending(uint32_t *reason) override;
+	void declareDead(uint32_t reason, const char *detail) override;
+	const char *deadName() override;
+	bool healthSnapshot(bool print) override;
+	bool linkAlive() override;
+	void releaseWaiters() override;
+	void awdlQuiesce(bool on) override;
+	void noteRecovered(uint32_t reason) override;
+	bool recoveryOpen(uint32_t *reason, uint32_t *episode, uint64_t *sinceMs) override;
+	void setEngineState(const char *state, uint32_t fails, bool givenUp) override;
 	IOReturn setMulticastList(IOEthernetAddress *addr, int count) override;
 #ifdef AIRPORT_WCL
 	IOReturn setScanHomeAwayTime(uint32_t ms) override;
 #endif
+	/* AirportWCN7850's awdl0: where qwz_rx_observe_mgmt sends AWDL action frames (NULL: nowhere). */
+	void setAwdlRx(void (*fn)(void *, const uint8_t *, size_t, int, uint32_t, uint32_t, uint32_t), void *arg);
+	/* One AWDL action frame out of the AWDL listen vdev (qwz_awdl_tx, under the gate); an errno. */
+	int awdlTx(const uint8_t *frame, size_t len);
+	/* awdl0's data path: where data frames with the AWDL BSSID go, a firmware peer, one data frame out. */
+	void setAwdlDataRx(void (*fn)(void *, const uint8_t *, size_t, int), void *arg);
+	int awdlPeerAdd(const uint8_t *mac);
+	/* M2a WP2: awdl0's address for the listen vdev (any thread, no gate, no wait); the generation of the AWDL peer set (read under the gate). */
+	void setAwdlAddress(const uint8_t *mac);
+	uint32_t awdlPeerGeneration();
+	int awdlDataTx(const uint8_t *frame, size_t len);
+	/* WP4 (M2a): awdl0's Data frame with AirportItlwm's handle for it (0: none), the completions handed back, and the lane's state without the gate. */
+	int awdlDataTxEx(const uint8_t *frame, size_t len, uint32_t cookie);
+	void setAwdlTxDone(qwz_awdl_txdone_fn fn, void *arg);
+	void awdlLane(struct qwz_awdl_lane *li);
 
 private:
 	static IOReturn attachGated(OSObject *owner, void *arg0, void *, void *, void *);
@@ -72,6 +100,18 @@ private:
 	static IOReturn disableGated(OSObject *owner, void *, void *, void *, void *);
 	static IOReturn sleepQuiesceGated(OSObject *owner, void *, void *, void *, void *);
 	static IOReturn stallCheckGated(OSObject *owner, void *, void *, void *, void *);
+	/* M0 (C18): the sentinel's gate probe body (attemptAction on the main gate): stamps sc_gate_ok_ns, optionally prints the health line. */
+	static IOReturn healthGated(OSObject *owner, void *, void *, void *, void *);
+	/* debug.qwz.awdltest: qwz_awdl_listen_test under the gate, from the sysctl thread. */
+	static int awdlTestEntry(void *arg, int test);
+	static IOReturn awdlTestGated(OSObject *owner, void *, void *, void *, void *);
+	/* debug.qwz.inject (M0, C33): qwz_inject under the gate, from the sysctl thread. */
+	static int injectEntry(void *arg, int mode, int a);
+	static IOReturn injectGated(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn awdlTxGated(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn awdlPeerAddGated(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn awdlDataTxGated(OSObject *owner, void *, void *, void *, void *);
+	static IOReturn awdlDataTxExGated(OSObject *owner, void *, void *, void *, void *);
 
 	/*
 	 * The softc exists from initWithController() on, so get80211Controller()
@@ -82,6 +122,9 @@ private:
 	bool attached;
 	bool shutdown;		/* shutdownHardware() ran: the chip is already off */
 	char fwVersion[64];
+	/* M0 (C18): the engine's last reported state ("UP", "RESTARTING", "RETRY", "GIVEN_UP") and failure count, set by setEngineState */
+	const char *engineStateName;
+	uint32_t engineFails;
 
 	/* System sleep/wake: PCI config saved at sleep, restored on wake. */
 	IOPCIDevice *pciDev;

@@ -743,6 +743,13 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
 IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
 {
     ieee80211com *ic = fHalService->get80211Controller();
+    {
+        // M0 (C30): who ended the association; ic_state and joinPending are read BEFORE this function changes them.
+        static unsigned int leaves;
+        if (qwz_log_ratelimit(&leaves, 200, 20))
+            qwz_log("airport: wcl: LEAVE_NETWORK (ic_state %s, join pending %d)\n",
+                    ieee80211_state_name[ic->ic_state], joinPending);
+    }
     joinPending = false;
     joinDeferred = false;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
@@ -767,16 +774,73 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
 
 IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
 {
+    {
+        // M0 (C30)
+        static unsigned int aborts;
+        ieee80211com *ic = fHalService->get80211Controller();
+        if (qwz_log_ratelimit(&aborts, 200, 20))
+            qwz_log("airport: wcl: JOIN_ABORT (ic_state %s, join pending %d)\n",
+                    ieee80211_state_name[ic->ic_state], joinPending);
+    }
     leaveWCLNetwork();
     instance->postMessage(this, AirportWCL::JoinAbortComplete, nullptr, 0, true);
     return kIOReturnSuccess;
+}
+
+/*
+ * F2 (docs/research-wifi-only-services-2026-11-06.md): tell the kernel the link quality (LQM) of en1.
+ * Nothing set it for this Wi-Fi interface: IOEthernetInterface::inputEvent only does so for Ethernet media and
+ * IONetworkInterface::attachToDataLinkLayer once at attach (-2 here: valid, not active), and apsd refuses an
+ * interface at -2 for its push connection (Find My requests, iMessage, FaceTime, iCloud push).
+ * The Wi-Fi call is IO80211InfraInterface::setLQM (vtable slot 376, __ZN21IO80211InfraInterface6setLQMEy, already
+ * imported by the vtable fill). It re-enters the main gate (held by every caller of this function), then hands the
+ * value to the interface monitor, to IOSkywalkNetworkInterface::reportLinkQuality (ifnet_set_link_quality on the
+ * ifnet that prepareBSDInterface stored) and to updateLinkStatus. The argument is the int sign-extended to 64 bits,
+ * as Apple's driver passes it (movslq).
+ * Two values only: 100 (good) while the link is up, -2 (off) when it goes down; no RSSI tier, as AirportItlwm's
+ * pre-Skywalk setLinkQualityMetric(100). 1 to 10 would set the stack's LQM-abort flag for the connections on en1.
+ * Sent from handleWCLLink only, which always runs in the main gate: normally on a thread-call worker that may sleep
+ * (the setkey task for link up, qwz.c qwz_add_sta_key; the newstate task; the thread running qwz_stop), because the
+ * interrupt action only queues those tasks (ic_set_key answers EBUSY, qwz_newstate queues). A link-up verdict can
+ * also arrive inline on the receive path, i.e. on the main workloop thread (a retransmitted EAPOL message 3 or a
+ * group-key message with the SECURE bit, ieee80211_pae_input.c); there setLQM only re-enters the held gate
+ * (runAction is recursive) and takes short kernel locks, as the postMessage calls below do, and does not sleep or
+ * wait for the gate itself (read in the disassembly, not run). Not sent (the ring line says why): before the BSD
+ * interface exists or after it is gone (getBSDInterface() is NULL), once stop() began, and while a firmware DEAD is
+ * pending (the teardown of a DEAD or no-link episode gets no new family call; the join after the restart sends 100 again).
+ */
+void AirportItlwmSkywalkInterface::reportLqm(int quality, const char *reason)
+{
+    static unsigned int lines;
+    const char *skip = NULL;
+
+    if (ml_at_interrupt_context())
+        return;		/* the primary interrupt (QwzIntr::filter only claims): no mutex, no ring line; unreachable today */
+    if (wclStopping || instance == NULL || instance->pmStopping)
+        skip = "driver stopping";
+    else if (getBSDInterface() == NULL)
+        skip = "no BSD interface";
+    else if (fHalService != NULL && fHalService->faultPending(NULL))
+        skip = "firmware DEAD";
+    if (skip == NULL)
+        setLQM(static_cast<unsigned long long>(static_cast<long long>(quality)));
+    if (qwz_log_ratelimit(&lines, 200, 20))
+        qwz_log("airport: lqm: %d (%s%s%s)\n", quality, reason, skip != NULL ? ", not sent: " : "", skip != NULL ? skip : "");
 }
 
 void AirportItlwmSkywalkInterface::handleWCLLink(bool up)
 {
     if (wclStopping)
         return;
+    {
+        // M0 (C30): the driver's link verdict, before it is applied
+        static unsigned int links;
+        if (qwz_log_ratelimit(&links, 200, 20))
+            qwz_log("airport: wcl: link %s (join pending %d, link indicated %d)\n",
+                    up ? "up" : "down", joinPending, wclLinkIndicated);
+    }
     portAuthorized = up;
+    reportLqm(up ? 100 : -2, up ? "link up" : "link down");
     if (!up && wclLinkIndicated) {
         AirportWCL::LinkStatusEvent event = {};
         memcpy(event.bssid, joinBSSID, sizeof(event.bssid));
@@ -802,6 +866,17 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         return;
     }
     ieee80211com *ic = fHalService->get80211Controller();
+    if (code == IEEE80211_EVT_DRIVER_RESET_BEGIN || code == IEEE80211_EVT_DRIVER_READY ||
+        code == IEEE80211_EVT_DRIVER_STOPPED) {
+        // M0 (C30): after the gate hop above, so each event is noted once. After an injected crash this shows whether
+        // airportd re-joins by itself (DRIVER_STOPPED wipes the PSK, a join must follow DRIVER_READY without user action).
+        static unsigned int events;
+        if (qwz_log_ratelimit(&events, 200, 20))
+            qwz_log("airport: wcl: event %s (mac_reconfig %d)\n",
+                    code == IEEE80211_EVT_DRIVER_RESET_BEGIN ? "DRIVER_RESET_BEGIN" :
+                    code == IEEE80211_EVT_DRIVER_READY ? "DRIVER_READY" : "DRIVER_STOPPED",
+                    ic->ic_wcl_mac_reconfig ? 1 : 0);
+    }
     switch (code) {
         case IEEE80211_EVT_COUNTRY_CODE_UPDATE:
             deferWCLCountryUpdate();
@@ -938,6 +1013,12 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             event.reason = ic->ic_deauth_reason;
             if (ic->ic_bss)
                 memcpy(event.bssid, ic->ic_bss->ni_bssid, 6);
+            {
+                // M0 (C30): the reason is ic_deauth_reason, set before the event
+                static unsigned int deauths;
+                if (qwz_log_ratelimit(&deauths, 200, 20))
+                    qwz_log("airport: wcl: event STA_DEAUTH reason %u bss %s\n", unsigned(event.reason), ether_sprintf(event.bssid));
+            }
             instance->postMessage(this, AirportWCL::Deauth, &event, sizeof(event), true);
             finishWCLJoin(1, event.reason, kIOReturnOffline);
             break;
@@ -962,6 +1043,13 @@ IOReturn AirportItlwmSkywalkInterface::setWCL_LINK_STATE_UPDATE(apple80211_wcl_u
 {
     if (!data)
         return kIOReturnBadArgument;
+    {
+        // M0 (C30): what airportd told the driver about the link (byte 6 is the up flag, as the 15.2 branch below reads it)
+        static unsigned int updates;
+        const uint8_t *b = reinterpret_cast<const uint8_t *>(data);
+        if (qwz_log_ratelimit(&updates, 200, 20))
+            qwz_log("airport: wcl: LINK_STATE_UPDATE %s (bytes[6..8] %02x %02x %02x)\n", b[6] ? "up" : "down", b[6], b[7], b[8]);
+    }
 #if __IO80211_TARGET == __MAC_15_2
     const auto bytes = reinterpret_cast<const uint8_t *>(data);
     if (bytes[6]) {

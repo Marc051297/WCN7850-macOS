@@ -422,6 +422,23 @@ enum ath12k_dev_flags {
 	ATH12K_FLAG_MULTI_MSI_VECTORS,
 };
 
+#include "qwz_life.h"
+#include "qwz_awdl.h"		/* WP4 (M2a): lane M */
+#define QWZ_STAT_MAX	24		/* counters in the health line, names in qwz_stat_names[] (C26) */
+#define QWZ_STAT_HTT0		0	/* 8 slots: HAL_WBM_REL_HTT_TX_COMP_STATUS_* 0..6, slot 7 = anything above (C19) */
+#define QWZ_STAT_TQM0		8	/* 8 slots: HAL_WBM_TQM_REL_REASON_* 0..6, slot 7 = above (C19) */
+#define QWZ_STAT_ENOSPC		16	/* qwz_dp_tx returned ENOSPC (C20) */
+#define QWZ_STAT_TXWALL		17	/* the slot at cur was occupied: a never-completed slot (C20) */
+#define QWZ_STAT_AWDL_TX	18	/* AWDL data frames handed to qwz_dp_tx (C20) */
+#define QWZ_STAT_AWDL_DONE	19	/* ... completed through either path (C20) */
+#define QWZ_STAT_AWDL_CAP	20	/* ... refused by the in-flight cap (C20) */
+#define QWZ_STAT_AWDL_DROP	21	/* ... dropped by probe 0, the control (C24) */
+#define QWZ_STAT_PM_OK		22	/* probe 1: management-path data frames completed with status 0 (C24) */
+#define QWZ_STAT_PM_FAIL	23	/* ... with another status (C24) */
+#define QWZ_TXF_AWDL		0x01	/* struct qwz_tx_data.flags: slot holds an AWDL frame (C20) */
+#define QWZ_AWDL_INFLIGHT_MAX	32	/* C20 */
+struct qwz_flight_ent { uint32_t t_ms; uint32_t id; };
+
 enum ath12k_scan_state {
 	ATH12K_SCAN_IDLE,
 	ATH12K_SCAN_STARTING,
@@ -891,8 +908,48 @@ struct qwz_tx_data {
 	uint8_t eid;
 	uint8_t flags;
 	uint32_t cipher;
+	uint32_t t_ms;		/* M0 (C20): submit time in ms since boot; qwz_dp_tx stamps it at the publish, the health line reads the slot age from it (0: unstamped) */
 };
 
+/*
+ * WP4 (M2a): the lane M slot pool (qwz.c, "the own slot pool"). The DMA maps are created on first use and kept until
+ * detach; a slot is free when m is NULL. No ieee80211 node is referenced.
+ */
+struct qwz_awdl_slot {
+	bus_dmamap_t	map;
+	struct mbuf	*m;		/* the frame in flight; NULL: the slot is free */
+	uint64_t	t_ns;		/* submit time */
+	uint32_t	cookie;		/* AirportItlwm's handle for the frame (its gate entry); 0: none */
+	uint32_t	epoch;		/* sc_fw_epoch at submit */
+	uint16_t	len, seq;
+	uint8_t		cls, fmt;	/* QWZ_AWDL_CLS_*; 0 plain MGMT_TX_SEND, 1 with tx_params, 2 as OFFCHAN_DATA_TX_SEND */
+	uint8_t		stuck;		/* the health sampler has reported it */
+	uint8_t		pad;
+};
+struct qwz_awdl_pool {
+	struct qwz_awdl_slot	slot[QWZ_AWDL_POOL];
+	int			ready;		/* the maps exist */
+	int			inflight, inflight_data;
+	uint64_t		scan_end_ns;	/* the infra scan finished (qwz_mac_scan_finish); kept only while awdltx >= 2 */
+	struct {
+		uint8_t		ta[6];
+		uint8_t		used, pad;
+		uint16_t	next;
+	}			seq[2];		/* the 12-bit sequence counters, one per transmitter address */
+	uint32_t		sub[QWZ_AWDL_CLS_MAX];
+	uint32_t		cmp[QWZ_AWDL_CLS_MAX][5];	/* completions by status 0 to 3, other */
+	uint32_t		ref[QWZ_AWDL_CLS_MAX][4];	/* refusals: no room, no WMI credit, lane closed for tx_params, other */
+	uint32_t		fmtn[3];
+	uint32_t		reaped, stray, degraded, injected;
+	uint32_t		disc_run;
+	uint64_t		disc_first_ns;
+	uint32_t		force_noack;	/* debug.qwz.awdltest=10: the next unicast completions are reported as NO_ACK */
+	unsigned int		log_ref, log_tx[QWZ_AWDL_CLS_MAX], log_cmp, log_cmp_bad, log_stray, log_ens, log_svc;
+	uint32_t		log_sig;	/* qwz_awdl_pool_log (fix1, logging L3): the signature of the counters, the occupancy and the switches at the last print */
+	uint64_t		log_ns;		/* and the time of that print (0: nothing printed yet): a print is due when the signature moved or 60 s passed */
+	qwz_awdl_txdone_fn	done_fn;	/* AirportItlwm's completion callback, with done_arg */
+	void			*done_arg;
+};
 struct qwz_ce_ring {
 	/* Number of entries in this ring; must be power of 2 */
 	unsigned int nentries;
@@ -1987,6 +2044,34 @@ struct qwz_softc {
 	struct device			sc_dev;
 	struct ieee80211com		sc_ic;
 	uint32_t			sc_flags;
+	/* M0 (docs/m0-spec.md): atomic words only; set_bit()/clear_bit() are plain read-modify-write (qwz.c:75-77) */
+	volatile uint32_t		sc_life;		/* QWZ_LIFE_* (C04) */
+	volatile uint32_t		sc_dead_reason;		/* enum qwz_dead_reason of the open episode */
+	uint32_t			sc_dead_episodes, sc_dead_dups;
+	uint64_t			sc_dead_ns;
+	volatile uint32_t		sc_fw_rx_events;	/* CE RX completions from the firmware, any pipe (C07) */
+	uint32_t			sc_fw_epoch;		/* ++ at every firmware start (C06) */
+	volatile uint64_t		sc_gate_ok_ns;		/* last time the sentinel got the gate (C14) */
+	uint32_t			sc_silent_count;	/* silent response timeouts in a row (C07) */
+	uint64_t			sc_silent_first_ns;
+	volatile uint32_t		sc_inject;		/* QWZ_INJ_* flags (C33) */
+	uint32_t			sc_inject_hold_ms;	/* C33 */
+	uint32_t			sc_inject_powerup_fail;
+	volatile uint64_t		sc_inject_ones_until_ns;
+	volatile uint32_t		sc_awdl_quiesce;	/* C17, C22 */
+	int				sc_awdl_inflight;	/* C20 */
+	uint8_t				sc_awdl_pmask;		/* C24: management slots holding a probe-1 data frame */
+	struct ieee80211_node		*sc_awdl_zombie[16];	/* C21 */
+	int				sc_awdl_nzombie;
+	struct qwz_awdl_pool		sc_awdl_pool;		/* WP4 (M2a): the lane M slot pool */
+	uint32_t			sc_stall_mgmt_seen, sc_stall_data_seen;	/* C23 */
+	uint32_t			sc_stat[QWZ_STAT_MAX];	/* C26 */
+	struct qwz_flight_ent		sc_flight[2][32];	/* C26: [0] WMI commands sent, [1] events received */
+	uint32_t			sc_flight_n[2];
+	uint64_t			sc_runup_ns;		/* C28 */
+	unsigned int			sc_log_htt, sc_log_tx, sc_log_evt;	/* log rate limiters */
+	void				(*sc_fault_cb)(void *arg, uint32_t reason);	/* C18: engine request */
+	void				*sc_fault_arg;
 	int				sc_node;
 
 	int (*sc_newstate)(struct ieee80211com *, enum ieee80211_state, int);
@@ -2111,6 +2196,48 @@ struct qwz_softc {
 	uint32_t			sc_awdl_mgmt_action;	/* action, category 127, OUI 00:17:f2 */
 	uint32_t			sc_awdl_mgmt_bssid;	/* management, A3 = AWDL BSSID */
 	uint32_t			sc_awdl_data_bssid;	/* data, A3 = AWDL BSSID */
+	uint32_t			sc_probe_foreign_bcn;	/* beacons, probe responses not from our AP */
+	uint32_t			sc_probe_foreign_other;	/* other management frames not from our AP */
+	/* debug.qwz.awdltest (qwz_awdl_listen_test): no other scan while it runs. */
+	int				sc_awdltest_active;
+	int				sc_awdltest_vdev_on;	/* the test's extra vdev exists */
+	uint32_t			sc_awdltest_vdev_id;
+	int				sc_awdltest_capture;	/* copy the next AWDL PSF as the TX template */
+	uint16_t			sc_awdltest_tmpl_len;
+	uint8_t				sc_awdltest_tmpl[512];
+	/* debug.qwz.awdltest=6: test 4's vdev stays joined (until 7), so the firmware keeps passing AWDL frames. */
+	int				sc_awdl_listening;
+	/* AirportWCN7850: each AWDL action frame (whole 802.11 frame) to awdl0; NULL: none. */
+	void				(*sc_awdl_rx)(void *arg, const uint8_t *frame, size_t len,
+					    int rssi, uint32_t freq, uint32_t chan, uint32_t rate);
+	void				*sc_awdl_rx_arg;
+	/*
+	 * awdl0's data path: data frames with the AWDL BSSID (whole 802.11
+	 * frame) to awdl0, and the AWDL peers (firmware peers on the listen
+	 * vdev, with a node each for the TX path), qwz_awdl_peer_add.
+	 */
+	void				(*sc_awdl_data_rx)(void *arg, const uint8_t *frame, size_t len, int rssi);
+	void				*sc_awdl_data_rx_arg;
+#define QWZ_AWDL_PEERS	8
+	struct {
+		uint8_t			addr[IEEE80211_ADDR_LEN];
+		struct ieee80211_node	*ni;
+	}				sc_awdl_peers[QWZ_AWDL_PEERS];
+	int				sc_awdl_npeers;
+	struct ieee80211_node		*sc_awdl_mcast_ni;	/* the node multicast frames are sent with */
+	uint16_t			sc_awdl_data_seq;
+	/*
+	 * M2a WP2: awdl0's address as AirportItlwm::awdlCreate made it (ItlQwz::setAwdlAddress; the listen vdev takes it with debug.qwz.awdlpeers
+	 * bit 4), and the generation of the AWDL peer set: counted up whenever a listen starts (debug.qwz.awdltest=6 joined) or a quiesced listen is
+	 * lifted; AirportItlwm::awdlRxGated reads it (ItlQwz::awdlPeerGeneration). Both live as long as the softc: DEAD and a firmware restart reset neither.
+	 */
+	uint8_t				sc_awdl_addr[IEEE80211_ADDR_LEN];
+	int				sc_awdl_addr_valid;
+	uint32_t			sc_awdl_peer_gen;
+	uint8_t				sc_awdltest_txmask;	/* sc_vif.txmgmt slots holding a test frame */
+	uint64_t			sc_awdltest_txns[8];	/* their submit times */
+	uint32_t			sc_awdltest_txok, sc_awdltest_txfail, sc_awdltest_txlast;
+	uint64_t			sc_awdltest_txlat_sum, sc_awdltest_txlat_min, sc_awdltest_txlat_max;
 	unsigned int			sc_awdl_log_mgmt;	/* log rate limiters */
 	unsigned int			sc_awdl_log_data;
 	uint64_t			sc_probe_summary_ns;	/* last once-a-minute summary */
@@ -2241,6 +2368,45 @@ struct ieee80211_node *qwz_node_alloc(struct ieee80211com *);
 void qwz_node_free(struct ieee80211com *, struct ieee80211_node *);
 int qwz_bgscan(struct ieee80211com *);
 int qwz_mac_vdev_delete_wait(struct qwz_softc *, struct qwz_vif *);
+int qwz_awdl_listen_test(struct qwz_softc *, int);
+int qwz_awdl_tx(struct qwz_softc *, const uint8_t *, size_t);
+int qwz_awdl_peer_add(struct qwz_softc *, const uint8_t *);
+int qwz_awdl_data_tx(struct qwz_softc *, const uint8_t *, size_t);
+int	qwz_awdl_data_tx_ex(struct qwz_softc *, const uint8_t *, size_t, uint32_t);	/* WP4 (M2a): lane M, qwz.c "the own slot pool" */
+int	qwz_awdl_pool_ensure(struct qwz_softc *);
+void	qwz_awdl_pool_destroy(struct qwz_softc *);
+int	qwz_awdl_pool_tx(struct qwz_softc *, const uint8_t *, size_t, uint32_t);
+void	qwz_awdl_slot_complete(struct qwz_softc *, const struct wmi_mgmt_tx_compl_event *);
+void	qwz_awdl_pool_reap(struct qwz_softc *);
+void	qwz_awdl_lane_info(struct qwz_softc *, struct qwz_awdl_lane *);
+void	qwz_awdl_pool_log(struct qwz_softc *);
+int	qwz_awdl_vdev_params(struct qwz_softc *, const char *);
+void	qwz_declare_dead(struct qwz_softc *, uint32_t reason, const char *detail);
+void	qwz_clear_dead(struct qwz_softc *, const char *where);
+void	qwz_wake_all_waiters(struct qwz_softc *);
+void	qwz_fw_epoch_reset(struct qwz_softc *);
+void	qwz_note_wait_timeout(struct qwz_softc *, const char *what, uint32_t ev0);
+void	qwz_flight_note(struct qwz_softc *, int dir, uint32_t id);
+void	qwz_flight_dump(struct qwz_softc *);
+void	qwz_health_log(struct qwz_softc *, unsigned int wdskip);
+void	qwz_evt_note(struct qwz_softc *, uint32_t id, struct mbuf *, const char *what);
+void	qwz_dossier(struct qwz_softc *);
+int	qwz_inject(struct qwz_softc *, int mode, int arg);
+int	qwz_wmi_force_fw_hang(struct qwz_softc *, uint32_t type, uint32_t delay_ms);
+struct ath12k_peer *qwz_peer_find_bss(struct qwz_softc *, struct qwz_vif *, const uint8_t *bssid);
+void	qwz_pci_wake_all(struct qwz_softc *);
+void	qwz_pci_cached_ee_state(struct qwz_softc *, uint32_t *ee, uint32_t *state);
+int	qwz_pci_link_alive(struct qwz_softc *);			/* C09: a config-space read, no log, no BAR access */
+int	qwz_inject_hold(struct qwz_softc *, const char *where);
+int	qwz_inject_ones_active(struct qwz_softc *);
+void	qwz_inject_quiesce(bool can_sleep);			/* M0.1 (HF-4): ItlQwz::detach, outside the gate */
+static inline int
+qwz_is_dead(struct qwz_softc *sc)
+{
+	return (__atomic_load_n(&sc->sc_life, __ATOMIC_ACQUIRE) & QWZ_LIFE_DEAD) != 0;
+}
+/* raw expression: test_bit() is a per-file macro (qwz.c:75, if_qwz_pci.c:66) */
+#define QWZ_CRASHED(sc)	((((sc)->sc_flags) & (1 << ATH12K_FLAG_CRASH_FLUSH)) || qwz_is_dead(sc))
 int qwz_mac_op_add_interface(struct qwz_pdev *);
 int	qwz_set_key(struct ieee80211com *, struct ieee80211_node *,
     struct ieee80211_key *);

@@ -9,6 +9,7 @@
 #include "qwz_compat.h"
 #include "qwzreg.h"
 #include "qwzvar.h"
+#include "qwz_sysctl.h"
 #undef malloc
 #undef free
 #undef wakeup
@@ -35,6 +36,70 @@ OSDefineMetaClassAndStructors(ItlQwz, ItlHalService)
 static IOCommandGate *qwz_hal_gate;
 static void (*qwz_if_start)(struct _ifnet *);
 static void (*qwz_if_watchdog)(struct _ifnet *);
+/*
+ * M0 (C18, S20): attemptAction has never been used on this gate (Apple's IO80211WorkQueue). The
+ * sentinel's probe (ItlQwz::healthSnapshot) finds out; until its first success (1), and for good
+ * if none comes in 30 probes (-1), the legacy watchdog keeps its blocking runAction (C16).
+ */
+static int qwz_gate_try;	/* 0 unknown, 1 attemptAction has succeeded on the main gate, -1 it never succeeded in 30 probes */
+static unsigned int qwz_wd_skipped;	/* C16: legacy watchdog / data-stall ticks skipped because the gate was busy (health line: wdskip) */
+
+/* WP4 (M2a): the same with AirportItlwm's handle for the frame; qwz_awdl_data_tx_ex is qwz_awdl_data_tx while the pool is off. */
+struct AwdlTxEx {
+	const uint8_t *frame;
+	size_t len;
+	uint32_t cookie;
+};
+
+int
+ItlQwz::awdlDataTxEx(const uint8_t *frame, size_t len, uint32_t cookie)
+{
+	struct AwdlTxEx a = { frame, len, cookie };
+	int ret = ENXIO;
+
+	if (!attached || shutdown || sc == NULL || wakeNeeded || qwz_hal_gate == NULL)
+		return ENXIO;
+	qwz_hal_gate->runAction(awdlDataTxExGated, this, (void *)&a, &ret);
+	return ret;
+}
+
+IOReturn
+ItlQwz::awdlDataTxExGated(OSObject *, void *arg0, void *arg1, void *arg2, void *)
+{
+	ItlQwz *that = (ItlQwz *)arg0;
+	struct AwdlTxEx *a = (struct AwdlTxEx *)arg1;
+
+	if (that->sc == NULL || !that->attached) {	/* fix2 (memory-R2-2): the caller tested this before it blocked behind the gate; detachGated may have freed the softc meanwhile */
+		*(int *)arg2 = ENXIO;
+		return kIOReturnSuccess;
+	}
+	*(int *)arg2 = qwz_awdl_data_tx_ex(that->sc, a->frame, a->len, a->cookie);
+	return kIOReturnSuccess;
+}
+
+/* The completion callback of the lane M pool (the workloop thread, the gate held); the argument first, as setAwdlDataRx. */
+void
+ItlQwz::setAwdlTxDone(qwz_awdl_txdone_fn fn, void *arg)
+{
+	if (sc == NULL)
+		return;
+	sc->sc_awdl_pool.done_arg = arg;
+	__atomic_store_n(&sc->sc_awdl_pool.done_fn, fn, __ATOMIC_RELEASE);
+}
+
+/* The lane's state for AirportItlwm's pacing and gate: plain loads, any thread. */
+void
+ItlQwz::awdlLane(struct qwz_awdl_lane *li)
+{
+	struct qwz_softc *s = __atomic_load_n(&sc, __ATOMIC_ACQUIRE);	/* fix1 (memory MEM-2): one read of the pointer for the test and the use, as detachGated clears it after it has freed the softc. The window between the test and the reads in qwz_awdl_lane_info (a driver stop without shutdownHardware, with awdl0's output thread inside this function) is not closed here: that needs the gate or a reader count in detachGated (M2b) */
+
+	if (!attached || shutdown || s == NULL || wakeNeeded) {
+		memset(li, 0, sizeof(*li));
+		li->state = QWZ_AWDL_LANE_DOWN;
+		return;
+	}
+	qwz_awdl_lane_info(s, li);
+}
 
 static IOReturn
 qwz_start_gated(OSObject *, void *ifp, void *, void *, void *)
@@ -59,7 +124,18 @@ qwz_watchdog_gated(OSObject *, void *ifp, void *, void *, void *)
 static void
 qwz_if_watchdog_wrapper(struct _ifnet *ifp)
 {
-	qwz_hal_gate->runAction(qwz_watchdog_gated, ifp);
+	/* M0 (C16): never block behind the gate this tick is meant to watch, but only once attemptAction has proven itself (S20) */
+	if (qwz_m0_on && __atomic_load_n(&qwz_gate_try, __ATOMIC_RELAXED) > 0) {
+		IOReturn r = qwz_hal_gate->attemptAction(qwz_watchdog_gated, ifp);
+
+		if (r == kIOReturnCannotLock) {
+			qwz_wd_skipped++;			/* the gate is busy: this tick is skipped, the sentinel names a busy gate */
+			return;
+		}
+		if (r == kIOReturnSuccess)
+			return;
+	}
+	qwz_hal_gate->runAction(qwz_watchdog_gated, ifp);	/* the legacy blocking call: attemptAction not proven usable yet, or any other result */
 }
 
 bool
@@ -68,8 +144,11 @@ ItlQwz::initWithController(IOEthernetController *controller, IOWorkLoop *workloo
 	if (!super::initWithController(controller, workloop, commandGate))
 		return false;
 	qwz_compat_init();
+	engineStateName = "UP";
 	if (sc == NULL)
 		sc = qwz_pci_macos_alloc();
+	if (sc != NULL)
+		qwz_compat_set_life(&sc->sc_life);
 	return sc != NULL;
 }
 
@@ -99,6 +178,7 @@ ItlQwz::attachGated(OSObject *, void *arg0, void *arg1, void *, void *)
 
 	if (that->sc == NULL && (that->sc = qwz_pci_macos_alloc()) == NULL)
 		return kIOReturnNoMemory;
+	qwz_compat_set_life(&that->sc->sc_life);	/* M0 (C01): the early return above guarantees that->sc != NULL */
 	err = qwz_pci_macos_attach(that->sc, pa);
 	if (err == QWZ_EPARKED) {
 		/* Parked at a stage >= 15: keep sc and the running firmware. */
@@ -107,12 +187,206 @@ ItlQwz::attachGated(OSObject *, void *arg0, void *arg1, void *, void *)
 	}
 	if (err) {
 		QWZLOG("attach failed: %d", err);
+		qwz_compat_set_life(NULL);				/* before the softc is freed (C01) */
 		qwz_pci_macos_detach(that->sc);
 		/* keep get80211Controller() valid: a fresh, empty softc */
 		that->sc = qwz_pci_macos_alloc();
+		if (that->sc != NULL)				/* the allocation can fail: never form &NULL->sc_life */
+			qwz_compat_set_life(&that->sc->sc_life);
 		return kIOReturnError;
 	}
 	that->attached = true;
+	qwz_sysctl_set_awdltest(awdlTestEntry, that);
+	qwz_sysctl_set_inject(injectEntry, that);	/* M0 (C32, C33) */
+	return kIOReturnSuccess;
+}
+
+int
+ItlQwz::awdlTestEntry(void *arg, int test)
+{
+	ItlQwz *that = (ItlQwz *)arg;
+	IOWorkLoop *wl;
+	int found = -ENXIO;
+
+	if (!that->attached || that->shutdown || that->sc == NULL ||
+	    that->wakeNeeded || qwz_hal_gate == NULL)
+		return -ENXIO;	/* no chip, or it is powered down */
+	wl = qwz_hal_gate->getWorkLoop();
+	if (wl != NULL && wl->onThread())
+		return -EBUSY;
+	qwz_hal_gate->runAction(awdlTestGated, that, (void *)(intptr_t)test, &found);
+	return found;
+}
+
+IOReturn
+ItlQwz::awdlTestGated(OSObject *, void *arg0, void *arg1, void *arg2, void *)
+{
+	ItlQwz *that = (ItlQwz *)arg0;	/* runAction's owner is the controller */
+
+	*(int *)arg2 = qwz_awdl_listen_test(that->sc, (int)(intptr_t)arg1);
+	return kIOReturnSuccess;
+}
+
+/*
+ * M0 (C33): debug.qwz.inject=<mode>. Mirrors awdlTestEntry: refuses when no
+ * chip is attached or it is powered down, and on the workloop thread (the
+ * harness sleeps); otherwise qwz_inject runs under the gate. The entry's own
+ * refusals are negative errnos like awdlTestEntry's; qwz_inject returns a
+ * positive errno or 0 (the sysctl handler normalises the sign).
+ */
+int
+ItlQwz::injectEntry(void *arg, int mode, int a)
+{
+	ItlQwz *that = (ItlQwz *)arg;
+	IOWorkLoop *wl;
+	int found = -ENXIO;
+
+	if (that == NULL)	/* the sysctl layer reads the callback and its argument in two steps */
+		return -ENXIO;
+	if (!that->attached || that->shutdown || that->sc == NULL ||
+	    that->wakeNeeded || qwz_hal_gate == NULL)
+		return -ENXIO;	/* no chip, or it is powered down */
+	wl = qwz_hal_gate->getWorkLoop();
+	if (wl != NULL && wl->onThread())
+		return -EBUSY;
+	qwz_hal_gate->runAction(injectGated, that, (void *)(intptr_t)mode, (void *)(intptr_t)a, &found);
+	return found;
+}
+
+IOReturn
+ItlQwz::injectGated(OSObject *, void *arg0, void *arg1, void *arg2, void *arg3)
+{
+	ItlQwz *that = (ItlQwz *)arg0;	/* the HAL is passed explicitly: runAction's owner is the controller */
+	int mode = (int)(intptr_t)arg1;
+
+	/*
+	 * Re-tested under the gate: injectEntry's tests ran before runAction waited for it, and a thread that
+	 * holds the gate releases it in every firmware wait, so a detach, a shutdown or a power-down can finish,
+	 * or be half done, in between. wakeNeeded is set only AFTER sleepHardware's power-down and fw_initialized
+	 * is cleared only at the end of qwz_core_deinit, so neither marks a teardown in flight; the ioctl lock does
+	 * (it is held for the whole of qwz_init, qwz_stop, sleepHardware and shutdownGated, and every gate release
+	 * of those happens inside it: the same test as qwz_state_work). sc_awdl_quiesce cannot be used: C17 leaves
+	 * it set after every teardown.
+	 */
+	if (!that->attached || that->shutdown || that->sc == NULL || that->wakeNeeded) {
+		qwz_log("qwz: inject: mode %d refused: no chip, or it was powered down while this call waited for the gate\n", mode);
+		*(int *)arg3 = -ENXIO;
+		return kIOReturnSuccess;
+	}
+	if (that->sc->ioctl_rwl.rwl_owner != NULL) {
+		qwz_log("qwz: inject: mode %d refused: an init, stop or power transition holds the ioctl lock; try again when it has finished\n", mode);
+		*(int *)arg3 = -EBUSY;
+		return kIOReturnSuccess;
+	}
+	*(int *)arg3 = qwz_inject(that->sc, mode, (int)(intptr_t)arg2);
+	return kIOReturnSuccess;
+}
+
+void
+ItlQwz::setAwdlRx(void (*fn)(void *, const uint8_t *, size_t, int, uint32_t, uint32_t, uint32_t), void *arg)
+{
+	if (sc == NULL)
+		return;
+	/* The argument first: the RX path reads fn, then arg. */
+	sc->sc_awdl_rx_arg = arg;
+	__atomic_store_n(&sc->sc_awdl_rx, fn, __ATOMIC_RELEASE);
+}
+
+int
+ItlQwz::awdlTx(const uint8_t *frame, size_t len)
+{
+	int ret = ENXIO;
+
+	if (!attached || shutdown || sc == NULL || wakeNeeded || qwz_hal_gate == NULL)
+		return ENXIO;
+	/* From the workloop's own thread (AirportItlwm's TX timer) runAction calls through. */
+	qwz_hal_gate->runAction(awdlTxGated, this, (void *)frame, (void *)len, &ret);
+	return ret;
+}
+
+IOReturn
+ItlQwz::awdlTxGated(OSObject *, void *arg0, void *arg1, void *arg2, void *arg3)
+{
+	ItlQwz *that = (ItlQwz *)arg0;
+
+	if (that->sc == NULL || !that->attached) {	/* fix2 (memory-R2-2): as awdlDataTxExGated */
+		*(int *)arg3 = ENXIO;
+		return kIOReturnSuccess;
+	}
+	*(int *)arg3 = qwz_awdl_tx(that->sc, (const uint8_t *)arg1, (size_t)arg2);
+	return kIOReturnSuccess;
+}
+
+void
+ItlQwz::setAwdlDataRx(void (*fn)(void *, const uint8_t *, size_t, int), void *arg)
+{
+	if (sc == NULL)
+		return;
+	sc->sc_awdl_data_rx_arg = arg;
+	__atomic_store_n(&sc->sc_awdl_data_rx, fn, __ATOMIC_RELEASE);
+}
+
+int
+ItlQwz::awdlPeerAdd(const uint8_t *mac)
+{
+	int ret = ENXIO;
+
+	if (!attached || shutdown || sc == NULL || wakeNeeded || qwz_hal_gate == NULL)
+		return ENXIO;
+	qwz_hal_gate->runAction(awdlPeerAddGated, this, (void *)mac, &ret);
+	return ret;
+}
+
+IOReturn
+ItlQwz::awdlPeerAddGated(OSObject *, void *arg0, void *arg1, void *arg2, void *)
+{
+	ItlQwz *that = (ItlQwz *)arg0;
+
+	if (that->sc == NULL || !that->attached) {	/* fix2 (memory-R2-2): as awdlDataTxExGated */
+		*(int *)arg2 = ENXIO;
+		return kIOReturnSuccess;
+	}
+	*(int *)arg2 = qwz_awdl_peer_add(that->sc, (const uint8_t *)arg1);
+	return kIOReturnSuccess;
+}
+
+void
+ItlQwz::setAwdlAddress(const uint8_t *mac)
+{
+	if (sc == NULL || mac == NULL)
+		return;
+	/* The bytes first, then the flag: qwz_awdltest_vdev_create reads the flag and then the bytes. */
+	memcpy(sc->sc_awdl_addr, mac, IEEE80211_ADDR_LEN);
+	__atomic_store_n(&sc->sc_awdl_addr_valid, 1, __ATOMIC_RELEASE);
+}
+
+uint32_t
+ItlQwz::awdlPeerGeneration()
+{
+	return sc != NULL ? __atomic_load_n(&sc->sc_awdl_peer_gen, __ATOMIC_RELAXED) : 0;
+}
+
+int
+ItlQwz::awdlDataTx(const uint8_t *frame, size_t len)
+{
+	int ret = ENXIO;
+
+	if (!attached || shutdown || sc == NULL || wakeNeeded || qwz_hal_gate == NULL)
+		return ENXIO;
+	qwz_hal_gate->runAction(awdlDataTxGated, this, (void *)frame, (void *)len, &ret);
+	return ret;
+}
+
+IOReturn
+ItlQwz::awdlDataTxGated(OSObject *, void *arg0, void *arg1, void *arg2, void *arg3)
+{
+	ItlQwz *that = (ItlQwz *)arg0;
+
+	if (that->sc == NULL || !that->attached) {	/* fix2 (memory-R2-2): as awdlDataTxExGated; M0.1 dereferenced the NULL softc here */
+		*(int *)arg3 = ENXIO;
+		return kIOReturnSuccess;
+	}
+	*(int *)arg3 = qwz_awdl_data_tx(that->sc, (const uint8_t *)arg1, (size_t)arg2);
 	return kIOReturnSuccess;
 }
 
@@ -177,6 +451,12 @@ ItlQwz::attach(IOPCIDevice *device)
 
 	snprintf(fwVersion, sizeof(fwVersion), "%s", sc->qmi_target.fw_build_id);
 	QWZLOG("attached: MAC %s, firmware %s", ether_sprintf(sc->sc_ic.ic_myaddr), fwVersion);
+	QWZLOG("M0: %s %s recover=%d silent=%d m0=%d deadaware=%d mmioguard=%d bme=%d softassert=%d awdlprobe=%d capsae=%d m0.1=late-reset,async-inject,dma-hold latesettle=%d (see debug.qwz.*)",
+	    ITLWM_VERSION, GIT_COMMIT, qwz_recover, qwz_silent, qwz_m0_on, qwz_dead_aware, qwz_mmio_guard, qwz_bme,
+	    qwz_softassert, qwz_awdlprobe, qwz_capsae, qwz_late_settle);
+	/* M0 (C12): one PCI config snapshot now (device alive, config reads only), so the first wake never starts from none */
+	saveConfig();
+	qwz_log("qwz: pm: attach-time PCI snapshot taken (valid %d) id %08x cmd %04x\n", saved.valid, saved.id, saved.cmd);
 	return true;
 }
 
@@ -186,7 +466,12 @@ ItlQwz::detachGated(OSObject *, void *arg0, void *, void *, void *)
 	ItlQwz *that = (ItlQwz *)arg0;	/* runAction's owner is the controller */
 
 	QWZLOG("detach: attached %d shutdown %d", that->attached, that->shutdown);
+	qwz_sysctl_set_awdltest(NULL, NULL);
+	qwz_sysctl_set_inject(NULL, NULL);
 	if (that->sc != NULL) {
+		/* R1-05: in the attached, not shut down case qwz_pci_macos_detach clears it itself, directly before it frees the softc, so DEAD (declared by qwz_pci_detach for a stuck lock) stays visible to the dead-aware sleeps of its teardown and of the woken holder */
+		if (!that->attached || that->shutdown)
+			qwz_compat_set_life(NULL);			/* M0 (C01): before the softc is freed; the free calls below follow */
 		if (that->attached && that->shutdown)
 			qwz_pci_macos_quiesced_detach(that->sc);	/* chip is off already */
 		else if (that->attached)
@@ -214,16 +499,44 @@ ItlQwz::shutdownGated(OSObject *, void *arg0, void *, void *, void *)
 
 	if (!that->attached || that->shutdown)
 		return kIOReturnSuccess;
+	qwz_sysctl_set_awdltest(NULL, NULL);
+	qwz_sysctl_set_inject(NULL, NULL);
 	ifp = &that->sc->sc_ic.ic_if;
 	qwz_logc("qwz: shutdown: stopping the interface\n");
-	rw_enter_write(&that->sc->ioctl_rwl);
+	/* AWDL stops at the START of the teardown (C17), also when the lock wait below is long */
+	__atomic_store_n(&that->sc->sc_awdl_quiesce, 1u, __ATOMIC_RELEASE);
+	/* C02: shutdown must never hang on a stuck holder: stop without the lock, then */
+	int locked = rw_enter_write(&that->sc->ioctl_rwl) == 0;
+
+	if (!locked) {
+		/*
+		 * R1-05: a holder that kept the lock for 20 s is stuck in a firmware wait, and a teardown beside it would be a full
+		 * firmware conversation. Declare DEAD as sleepHardware does: the holder's waits end and this teardown is host-only.
+		 * `shutdown` goes up FIRST: DEAD asks the engine to restart the firmware (sc_fault_cb) and the sentinel polls
+		 * faultPending() every second; this is not a chipClaim and wakeAllowed() does not exclude a system shutdown
+		 * (pmStopping is set only by stop(), sleepPending only by a power-off request), so without the flag the engine
+		 * could tear down or restart the chip beside this thread. With it faultPending() reads false and every HAL entry
+		 * point reads "chip off". The woken holder cannot run while this thread keeps the gate, so wait for the lock again
+		 * (rw_enter_write_grace releases the gate): the holder unwinds and the stop below runs with the lock.
+		 * With recover=0 or m0=0 DEAD is inert, there is no grace wait, and this is the C02 path (log, proceed).
+		 */
+		that->shutdown = true;
+		qwz_declare_dead(that->sc, QWZ_DEAD_DEADLINE, "ioctl lock");
+		if (qwz_dead_armed())
+			locked = rw_enter_write_grace(&that->sc->ioctl_rwl, QWZ_RWL_GRACE_MS) == 0;
+		if (locked)
+			qwz_logc("qwz: shutdown: the ioctl lock was released after DEAD: stopping with it\n");
+		else
+			qwz_logc("qwz: shutdown: the ioctl lock stayed busy: stopping without it\n");
+	}
 	ifp->if_flags &= ~IFF_UP;
 	if (ifp->if_flags & IFF_RUNNING)
 		qwz_stop(ifp);
 	qwz_logc("qwz: shutdown: interface stopped; firmware stop + power-down\n");
 	if (that->sc->fw_initialized)
 		qwz_core_deinit(that->sc);	/* firmware stop + chip power-down */
-	rw_exit(&that->sc->ioctl_rwl);
+	if (locked)
+		rw_exit(&that->sc->ioctl_rwl);
 	that->shutdown = true;
 	qwz_logc("qwz: chip powered down for system shutdown\n");
 	return kIOReturnSuccess;
@@ -289,14 +602,28 @@ void
 ItlQwz::saveConfig()
 {
 	UInt8 off = 0;
+	uint32_t id;
 
-	bzero(&saved, sizeof(saved));
 	if (pciDev == NULL)
 		return;
-	saved.id = pciDev->configRead32(0);
-	if (saved.id == 0xffffffffu)
+	/* M0 (C12): read the id BEFORE the snapshot is zeroed, so an all-ones id cannot destroy a good one */
+	id = pciDev->configRead32(0);
+	if (id == 0xffffffffu) {
+		qwz_log("qwz: pm: save config: id reads ffffffff: keeping the earlier snapshot (valid %d)\n", saved.valid);
+		if (qwz_bme)
+			saved.cmd &= ~kIOPCICommandBusMaster;	/* the chip may still run its old firmware: no bus mastering until the next power-up has reset it */
 		return;		/* nothing sane to save */
-	saved.cmd = pciDev->configRead16(kIOPCIConfigCommand);
+	}
+	bzero(&saved, sizeof(saved));
+	saved.id = id;
+	/*
+	 * M0 (C12): every snapshot is normalised. INTx stays disabled: after a
+	 * secondary bus reset the command register is at its default (INTx
+	 * enabled) and qwz_pci_msi_config sets INTx-disable only inside power_up,
+	 * after the chip reset (the window that froze the machine); wakeHardware
+	 * ORs MEM and BM back in.
+	 */
+	saved.cmd = pciDev->configRead16(kIOPCIConfigCommand) | kIOPCICommandInterruptDisable;
 	saved.cls = pciDev->configRead32(0x0c);
 	saved.bar[0] = pciDev->configRead32(kIOPCIConfigBaseAddress0);
 	saved.bar[1] = pciDev->configRead32(kIOPCIConfigBaseAddress0 + 4);
@@ -318,6 +645,10 @@ ItlQwz::saveConfig()
 	off = 0;
 	if (pciDev->findPCICapability(kIOPCIPowerManagementCapability, &off))
 		saved.pmOff = off;
+	saved.msiCtl &= ~0x0001;	/* M0 (C12): MSI stays off until qwz_pci_power_up enables it */
+	/* M0 (R1-02): a dead or no-link teardown cleared bus mastering, or tried to (a config write on a flapping link can be lost): the snapshot says off whatever the register reads now */
+	if (qwz_bme && sc != NULL && qwz_is_dead(sc))
+		saved.cmd &= ~kIOPCICommandBusMaster;
 	saved.valid = true;
 }
 
@@ -369,7 +700,7 @@ ItlQwz::sleepQuiesceGated(OSObject *, void *arg0, void *arg1, void *, void *)
 	}
 	/* The gate is released while asleep: the tasks need it to finish. */
 	while ((waited = qwz_pm_ms() - t0) < maxMs && qwz_state_work(sc, &t, &i, &l))
-		tsleep_nsec(that, 0, "qwzquiesce", MSEC_TO_NSEC(QWZ_QUIESCE_POLL_MS));
+		tsleep_delay_nsec(that, 0, "qwzquiesce", MSEC_TO_NSEC(QWZ_QUIESCE_POLL_MS));
 	if (qwz_state_work(sc, &t, &i, &l))
 		qwz_log("qwz: pm: sleep: waited %llu ms for in-flight state work and gave up: %d task(s), init task %d, ioctl lock %d; stopping anyway\n",
 		    qwz_pm_ms() - t0, t, i, l);
@@ -427,7 +758,26 @@ ItlQwz::sleepHardware()
 	qwz_log("qwz: pm: sleep: stopping the interface, fw_initialized %d\n", sc->fw_initialized);
 	qwz_log_publish();
 	/* As qwz_activate(DVACT_QUIESCE): the lock covers the stop and the power-down. */
-	rw_enter_write(&sc->ioctl_rwl);
+	int err = rw_enter_write(&sc->ioctl_rwl);
+	int locked = err == 0;
+
+	/*
+	 * M0 (R1-06): recover=0 or m0=0 selects the legacy handling, and qwz_declare_dead below is inert then, so a teardown without
+	 * the lock would not be host-only: it would be a full firmware conversation beside the stuck holder. Keep the pre-M0 contract
+	 * and wait for the holder (each call waits up to 20 s with the gate released; EBUSY and EDEADLK are final, so this never spins).
+	 * Arming the machinery again (sysctl debug.qwz.recover=1) ends the wait and the branch below declares DEAD.
+	 */
+	while (err == ETIMEDOUT && !qwz_dead_armed()) {
+		qwz_log("qwz: pm: sleep: the ioctl lock stayed busy for 20 s and DEAD is not armed (recover=0 or m0=0): waiting for the holder again\n");
+		qwz_log_publish();
+		err = rw_enter_write(&sc->ioctl_rwl);
+		locked = err == 0;
+	}
+	if (!locked) {
+		/* A stuck holder is by now well beyond every budget; DEAD makes the teardown host-only, so it cannot collide with the holder's firmware conversation. */
+		qwz_log("qwz: pm: sleep: the ioctl lock stayed busy for 20 s: declaring DEAD and tearing down without it\n");
+		qwz_declare_dead(sc, QWZ_DEAD_DEADLINE, "ioctl lock");
+	}
 	{
 		int t, i, l;
 
@@ -435,21 +785,25 @@ ItlQwz::sleepHardware()
 		if (qwz_state_work(sc, &t, &i, &l) && (t || i))
 			qwz_log("qwz: pm: sleep: in-flight state work appeared after the quiesce (%d task(s), init task %d): stopping anyway\n", t, i);
 	}
+	QWZ_CRUMB("sl:stop");
 	ifp->if_flags &= ~IFF_UP;
 	if (ifp->if_flags & IFF_RUNNING)
 		qwz_stop(ifp);
 	nfail = sc->sc_peer_del_fail - sleepFailBase;
-	dirtyTeardown = !TAILQ_EMPTY(&sc->peers) || nfail != 0;
+	dirtyTeardown = qwz_peer_find_bss(sc, &sc->sc_vif, NULL) != NULL || nfail != 0;
 	if (dirtyTeardown)
 		qwz_log("qwz: pm: sleep: DIRTY teardown: %d peer(s) still listed, %u peer delete failure(s) on the way down\n",
 		    sc->num_peers, nfail);
 	if (sc->fw_initialized) {
 		qwz_log("qwz: pm: sleep: firmware stop, MHI stop, MSI off, SoC reset (ath12k power down)\n");
 		qwz_log_publish();
+		QWZ_CRUMB("sl:deinit");
 		qwz_core_deinit(sc);
 	}
-	rw_exit(&sc->ioctl_rwl);
+	if (locked)
+		rw_exit(&sc->ioctl_rwl);
 	saveConfig();
+	QWZ_CRUMB("sl:saved");
 	wakeNeeded = true;
 	bzero(&stall, sizeof(stall));	/* the next firmware starts a new data-stall episode */
 	qwz_log("qwz: pm: sleep: chip down in %llu ms; saved id %08x cmd %04x bar0 %08x:%08x msi %04x/%08x:%08x/%04x devctl %04x\n",
@@ -490,6 +844,166 @@ void
 ItlQwz::requestBusReset()
 {
 	busResetNext = true;
+}
+
+/*
+ * M0 (C18): the fault state and engine plumbing AirportItlwm's sentinel (C14) and engine (C15) use.
+ * healthSnapshot and healthGated are the only ones that enter the gate, and only through attemptAction
+ * (a probe that is itself an assumption: qwz_gate_try, S20, spec section 12 item 12); linkAlive is a
+ * config read; the rest only touch atomics, so none of them can block.
+ */
+void
+ItlQwz::setFaultHandler(void (*cb)(void *, uint32_t), void *arg)
+{
+	if (sc == NULL)
+		return;
+	sc->sc_fault_arg = arg;			/* the argument first: qwz_declare_dead reads the callback, then the argument */
+	__atomic_store_n(&sc->sc_fault_cb, cb, __ATOMIC_RELEASE);
+}
+
+bool
+ItlQwz::faultPending(uint32_t *reason)
+{
+	bool d = sc != NULL && !shutdown && qwz_is_dead(sc);	/* R1-05: not once shutdownGated runs: its DEAD (stuck lock) must not get the firmware restarted */
+
+	if (reason != NULL)
+		*reason = d ? sc->sc_dead_reason : 0;
+	return d;
+}
+
+void
+ItlQwz::declareDead(uint32_t reason, const char *detail)
+{
+	if (sc != NULL)
+		qwz_declare_dead(sc, reason, detail);
+}
+
+const char *
+ItlQwz::deadName()
+{
+	uint32_t r = sc != NULL ? sc->sc_dead_reason : 0;
+
+	return qwz_dead_names[r < QWZ_DEAD_MAX ? r : 0];
+}
+
+void
+ItlQwz::releaseWaiters()
+{
+	if (sc != NULL)
+		qwz_wake_all_waiters(sc);
+}
+
+bool
+ItlQwz::linkAlive()
+{
+	if (sc != NULL && qwz_inject_ones_active(sc))	/* inject=3 reads as a link loss here too: T3.6 does not depend on interrupts arriving in the window */
+		return false;
+	return pciDev == NULL || pciDev->configRead32(0) != 0xffffffffu;
+}
+
+void
+ItlQwz::awdlQuiesce(bool on)
+{
+	if (sc == NULL)
+		return;
+	if (on && !sc->sc_awdl_quiesce && sc->sc_awdl_listening)
+		qwz_log("qwz: pm: AWDL quiesced before the teardown (listen vdev %d, %d peer(s))\n", sc->sc_awdl_listening, sc->sc_awdl_npeers);
+	__atomic_store_n(&sc->sc_awdl_quiesce, on ? 1u : 0u, __ATOMIC_RELEASE);
+}
+
+void
+ItlQwz::noteRecovered(uint32_t reason)
+{
+	if (sc == NULL)
+		return;
+	__atomic_fetch_and(&sc->sc_life, ~QWZ_LIFE_RECOVERY, __ATOMIC_ACQ_REL);
+	if (reason == QWZ_DEAD_RDDM && !qwz_recovery_proven) {	/* a REAL crash recovered in this boot: the AWDL probes may run (C24) */
+		qwz_recovery_proven = 1;
+		qwz_log("qwz: probe: recovery proven by a real crash (RDDM) in this boot\n");
+	}
+}
+
+/*
+ * M2a WP0: is a recovery episode open? QWZ_LIFE_RECOVERY is set by qwz_declare_dead together with DEAD and cleared only by
+ * noteRecovered, so it survives the restart's own clear of DEAD (qwz_init) and a failed attempt: it is the one word that still
+ * knows the episode when AirportItlwm's engine memory (engDeferred, engFailCont, engGivenUp) has been re-armed away by the
+ * Wi-Fi on or the wake that brings the chip up. Lock-free reads of the life word and of the numbers qwz_declare_dead stored (a
+ * torn read can only misprint a log value); false once shutdownHardware() ran, like faultPending().
+ */
+bool
+ItlQwz::recoveryOpen(uint32_t *reason, uint32_t *episode, uint64_t *sinceMs)
+{
+	bool open = sc != NULL && !shutdown && (__atomic_load_n(&sc->sc_life, __ATOMIC_ACQUIRE) & QWZ_LIFE_RECOVERY) != 0;
+
+	if (reason != NULL)
+		*reason = open ? sc->sc_dead_reason : 0;
+	if (episode != NULL)
+		*episode = open ? sc->sc_dead_episodes : 0;
+	if (sinceMs != NULL)
+		*sinceMs = open ? (getnsecuptime() - sc->sc_dead_ns) / 1000000ULL : 0;
+	return open;
+}
+
+void
+ItlQwz::setEngineState(const char *state, uint32_t fails, bool givenUp)
+{
+	if (sc == NULL)
+		return;
+	if (givenUp)
+		__atomic_fetch_or(&sc->sc_life, QWZ_LIFE_GIVEN_UP, __ATOMIC_ACQ_REL);
+	else
+		__atomic_fetch_and(&sc->sc_life, ~QWZ_LIFE_GIVEN_UP, __ATOMIC_ACQ_REL);
+	engineStateName = state;
+	engineFails = fails;
+}
+
+/*
+ * The sentinel's gate probe, once per tick, from the watchdog workloop thread and without the gate:
+ * attemptAction on the main gate never sleeps and returns kIOReturnCannotLock at once when the gate is
+ * busy. Returns false only for a busy gate, and only after the probe has proven itself (first success);
+ * a disabled gate (kIOReturnNotPermitted, around a power transition) is not a stall.
+ */
+bool
+ItlQwz::healthSnapshot(bool print)
+{
+	static unsigned int probes;
+	IOReturn r;
+	int st;
+
+	if (!attached || shutdown || sc == NULL || qwz_hal_gate == NULL)
+		return true;			/* nothing to probe */
+	st = __atomic_load_n(&qwz_gate_try, __ATOMIC_RELAXED);
+	if (st < 0)
+		return true;			/* attemptAction never succeeded on this gate: no gate accounting */
+	r = qwz_hal_gate->attemptAction(healthGated, this, (void *)(intptr_t)print);
+	if (r == kIOReturnSuccess) {
+		if (st == 0) {
+			__atomic_store_n(&qwz_gate_try, 1, __ATOMIC_RELAXED);
+			qwz_log("qwz: sentinel: first gate probe: attemptAction on the main gate returned 0x0: usable (the legacy watchdog skips a busy tick from now on)\n");
+		}
+		return true;
+	}
+	if (st == 0 && ++probes >= 30) {
+		__atomic_store_n(&qwz_gate_try, -1, __ATOMIC_RELAXED);
+		qwz_log("qwz: sentinel: attemptAction never succeeded on the main gate in %u probes (last result 0x%x): gate probing is off, the legacy watchdog keeps its blocking runAction\n", probes, (unsigned)r);
+		return true;
+	}
+	return st == 0 || r != kIOReturnCannotLock;	/* only a busy gate is a gate-busy tick, and only once the probe has proven itself; a disabled gate (kIOReturnNotPermitted, around a power transition) is not a stall */
+}
+
+IOReturn
+ItlQwz::healthGated(OSObject *, void *arg0, void *arg1, void *, void *)
+{
+	ItlQwz *that = (ItlQwz *)arg0;	/* runAction's owner is the controller: the HAL is passed explicitly */
+
+	if (that->sc == NULL)		/* detached between the probe's test and the gate (cannot happen while the sentinel runs: stop() ends it first) */
+		return kIOReturnSuccess;
+	that->sc->sc_gate_ok_ns = getnsecuptime();
+	if ((intptr_t)arg1)
+		qwz_health_log(that->sc, qwz_wd_skipped);		/* C26: under the gate, and safe in every state: it checks fw_initialized and the ring pointer itself (qwz_dp_free frees the array and sets it to NULL) */
+	if ((intptr_t)arg1)
+		qwz_awdl_pool_log(that->sc);		/* WP4 (M2a): the lane M pool's lines, at the health cadence. LOG ONLY, and it sits in the sentinel's probe body (healthGated), as qwz_health_log above does: it reads the pool, prints, and sets the per-slot 'reported' flag; nothing while the pool is unused */
+	return kIOReturnSuccess;
 }
 
 /*
@@ -535,8 +1049,8 @@ ItlQwz::stallCheckGated(OSObject *, void *arg0, void *arg1, void *arg2, void *)
 		return kIOReturnSuccess;
 	}
 	ic = &sc->sc_ic;
-	data = sc->sc_probe_data_seen;
-	mgmt = sc->sc_probe_mgmt_seen;
+	data = sc->sc_stall_data_seen;		/* M0 (C23): the frames that are not AWDL (sc_probe_* keep counting everything for the probe summary) */
+	mgmt = sc->sc_stall_mgmt_seen;
 	if (!that->stall.valid) {
 		that->stall.valid = true;
 		that->stall.data = data;
@@ -597,8 +1111,17 @@ ItlQwz::dataStalled(bool *healthy)
 {
 	bool stalled = false, ok = false;
 
-	if (attached && !shutdown && qwz_hal_gate != NULL)
-		qwz_hal_gate->runAction(stallCheckGated, this, &stalled, &ok);
+	if (attached && !shutdown && qwz_hal_gate != NULL) {
+		/* M0 (C16): never block behind the gate this poll is meant to watch, but only once attemptAction has proven itself (S20) */
+		IOReturn r = kIOReturnNotReady;
+
+		if (qwz_m0_on && __atomic_load_n(&qwz_gate_try, __ATOMIC_RELAXED) > 0)
+			r = qwz_hal_gate->attemptAction(stallCheckGated, this, &stalled, &ok);
+		if (r == kIOReturnCannotLock)
+			qwz_wd_skipped++;			/* the gate is busy: no verdict this tick (stalled and ok stay false) */
+		else if (r != kIOReturnSuccess)
+			qwz_hal_gate->runAction(stallCheckGated, this, &stalled, &ok);	/* the legacy blocking call */
+	}
 	if (healthy != NULL)
 		*healthy = ok;
 	return stalled;
@@ -620,6 +1143,7 @@ ItlQwz::wakeHardware()
 	int i;
 
 	busResetNext = false;
+	QWZ_CRUMB("wk:begin");
 	if (!attached || shutdown || pciDev == NULL)
 		return kIOReturnNotReady;
 	if (!saved.valid) {
@@ -656,6 +1180,7 @@ ItlQwz::wakeHardware()
 
 	if (id == 0xffffffffu) {
 		/* a. wait: the link may still be training */
+		QWZ_CRUMB("wk:poll");
 		for (i = 0; i < 100 && id == 0xffffffffu; i++) {
 			IOSleep(10);
 			id = pciDev->configRead32(0);
@@ -671,6 +1196,7 @@ ItlQwz::wakeHardware()
 
 		qwz_log("qwz: pm: wake: still down: retraining the parent link\n");
 		qwz_log_publish();
+		QWZ_CRUMB("wk:retrain");
 		br->configWrite16(exp + QWZ_PM_PCIE_LNKCTL, lc | QWZ_PM_PCIE_LNKCTL_RL);
 		for (i = 0; i < 50; i++) {	/* up to 500 ms */
 			IOSleep(10);
@@ -700,6 +1226,7 @@ ItlQwz::wakeHardware()
 			qwz_log("qwz: pm: wake: secondary bus reset on the parent bridge%s\n",
 			    id != 0xffffffffu ? " (requested, the device still answers)" : "");
 			qwz_log_publish();
+			QWZ_CRUMB("wk:sbr");
 			br->configWrite16(QWZ_PM_BRIDGE_CTL, bc | QWZ_PM_BRIDGE_CTL_SBR);
 			IOSleep(2);		/* PCI_RESET_ASSERT 2 ms (>= 1 ms) */
 			br->configWrite16(QWZ_PM_BRIDGE_CTL, bc & ~QWZ_PM_BRIDGE_CTL_SBR);
@@ -739,6 +1266,7 @@ ItlQwz::wakeHardware()
 			IOSleep(10);
 		}
 	}
+	QWZ_CRUMB("wk:restore");
 	if (saved.valid) {
 		UInt8 off = saved.msiOff;
 
@@ -768,16 +1296,23 @@ ItlQwz::wakeHardware()
 		}
 		if (saved.expOff && pciDev->configRead16(saved.expOff + 8) != saved.devCtl)
 			pciDev->configWrite16(saved.expOff + 8, saved.devCtl);
+		/*
+		 * M0 (R1-02): with the bus-master rule on, BM comes only from the snapshot. The snapshot of a dead or no-link
+		 * teardown has it off (qwz_pci_power_down cleared it, saveConfig records it): it stays off until qwz_pci_power_up
+		 * has reset the chip and asserts it. A healthy snapshot carries BM (cmd 0406), so a healthy wake writes what it wrote before.
+		 */
 		pciDev->configWrite16(kIOPCIConfigCommand,
-		    saved.cmd | kIOPCICommandMemorySpace | kIOPCICommandBusMaster);
+		    saved.cmd | kIOPCICommandMemorySpace | (qwz_bme ? 0 : kIOPCICommandBusMaster));
 	} else {
+		/* M0 (C12): INTx stays disabled here too (the valid branch carries it in the normalised saved.cmd) */
 		pciDev->configWrite16(kIOPCIConfigCommand,
-		    pciDev->configRead16(kIOPCIConfigCommand) | kIOPCICommandMemorySpace | kIOPCICommandBusMaster);
+		    pciDev->configRead16(kIOPCIConfigCommand) | kIOPCICommandMemorySpace | (qwz_bme ? 0 : kIOPCICommandBusMaster) | kIOPCICommandInterruptDisable);
 	}
 	qwz_log("qwz: pm: wake: PCI ready (recovery step: %s) in %llu ms: id %08x cmd %04x bar0 %08x\n",
 	    step, qwz_pm_ms() - t0, pciDev->configRead32(0),
 	    pciDev->configRead16(kIOPCIConfigCommand), pciDev->configRead32(kIOPCIConfigBaseAddress0));
 	qwz_log_publish();
+	QWZ_CRUMB("wk:done");
 	return kIOReturnSuccess;
 }
 
@@ -792,6 +1327,16 @@ ItlQwz::shutdownHardware()
 void
 ItlQwz::detach(IOPCIDevice *device)
 {
+	IOWorkLoop *wl = qwz_hal_gate != NULL ? qwz_hal_gate->getWorkLoop() : NULL;
+
+	/*
+	 * M0.1 (HF-4): detachGated frees the softc, and the starvation task of debug.qwz.inject=2 or 7 keeps raw pointers into it
+	 * for up to 6 s, asleep with the gate released. Close the sysctl first (no new window), then wait for a running one here,
+	 * OUTSIDE the gate: the task needs the gate to finish. On the workloop thread or inside the gate an IOSleep would hold the
+	 * gate itself, so qwz_inject_quiesce is then told it cannot wait and only logs.
+	 */
+	qwz_sysctl_set_inject(NULL, NULL);
+	qwz_inject_quiesce(wl == NULL || (!wl->onThread() && !wl->inGate()));
 	if (qwz_hal_gate != NULL)
 		qwz_hal_gate->runAction(detachGated, this);
 	qwz_compat_fini();
@@ -811,7 +1356,10 @@ ItlQwz::enableGated(OSObject *, void *arg0, void *, void *, void *)
 	int err = 0;
 
 	/* What qwz_ioctl(SIOCSIFFLAGS) does when the interface goes up. */
-	rw_enter_write(&that->sc->ioctl_rwl);
+	if (rw_enter_write(&that->sc->ioctl_rwl) != 0) {
+		QWZLOG("enable: the ioctl lock stayed busy");
+		return kIOReturnBusy;
+	}
 	ifp->if_flags |= IFF_UP;
 	if (!(ifp->if_flags & IFF_RUNNING))
 		err = qwz_init(ifp);
@@ -833,7 +1381,12 @@ ItlQwz::disableGated(OSObject *, void *arg0, void *, void *, void *)
 	ItlQwz *that = (ItlQwz *)arg0;	/* runAction's owner is the controller */
 	struct _ifnet *ifp = &that->sc->sc_ic.ic_if;
 
-	rw_enter_write(&that->sc->ioctl_rwl);
+	if (rw_enter_write(&that->sc->ioctl_rwl) != 0) {
+		QWZLOG("disable: the ioctl lock stayed busy");
+		return kIOReturnBusy;
+	}
+	/* AWDL stops at the START of every teardown (C17): its entry points return ENOTCONN while the flag is set */
+	__atomic_store_n(&that->sc->sc_awdl_quiesce, 1u, __ATOMIC_RELEASE);
 	{
 		int t, i, l;
 

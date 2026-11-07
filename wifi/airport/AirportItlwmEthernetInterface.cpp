@@ -7,6 +7,7 @@
 //
 
 #include "AirportItlwmEthernetInterface.hpp"
+#include "qwz_log.h"
 
 #include <sys/_if_ether.h>
 #include <net80211/ieee80211_var.h>
@@ -26,6 +27,29 @@ initWithSkywalkInterfaceAndProvider(IONetworkController *controller, IO80211Skyw
         this->interface = interface;
     this->isAttach = false;
     return ret;
+}
+
+const char *AirportItlwmEthernetInterface::getNamePrefix() const
+{
+    return namePrefix ? namePrefix : super::getNamePrefix();
+}
+
+void AirportItlwmEthernetInterface::setOwnAddress(const uint8_t *address)
+{
+    memcpy(ownAddress, address, sizeof(ownAddress));
+    hasOwnAddress = true;
+}
+
+/* IOEthernetInterface takes the unique id from the provider's (the controller's) IOMACAddress. */
+bool AirportItlwmEthernetInterface::initIfnetParams(struct ifnet_init_params *params)
+{
+    if (!super::initIfnetParams(params))
+        return false;
+    if (hasOwnAddress) {
+        params->uniqueid = ownAddress;
+        params->uniqueid_len = sizeof(ownAddress);
+    }
+    return true;
 }
 
 #ifdef AIRPORT_WCL
@@ -48,10 +72,14 @@ attachToDataLinkLayer( IOOptionBits options, void *parameter )
     char infName[IFNAMSIZ];
 #ifdef AIRPORT_WCL
     if (!setInterfaceSubType(3)) {
+        qwz_log("airport: %s: attachToDataLinkLayer: setInterfaceSubType(3) failed\n", getNamePrefix());
+        qwz_log_publish();
         return kIOReturnNotReady;
     }
 #endif
     IOReturn ret = super::attachToDataLinkLayer(options, parameter);
+    qwz_log("airport: %s: attachToDataLinkLayer: IOEthernetInterface 0x%x, ifnet %s%u\n", getNamePrefix(), ret,
+            getIfnet() ? ifnet_name(getIfnet()) : "-", getIfnet() ? ifnet_unit(getIfnet()) : 0);
     if (ret == kIOReturnSuccess && interface) {
         UInt8 builtIn = 0;
         IOEthernetAddress addr;
@@ -60,11 +88,20 @@ attachToDataLinkLayer( IOOptionBits options, void *parameter )
         interface->setProperty("IOInterfaceName", OSString::withCString(infName));
         interface->setProperty(kIOInterfaceUnit, OSNumber::withNumber(ifnet_unit(getIfnet()), 8));
         interface->setProperty(kIOInterfaceNamePrefix, OSString::withCString(ifnet_name(getIfnet())));
-        if (OSDynamicCast(IOEthernetController, getController())->getHardwareAddress(&addr) == kIOReturnSuccess)
+        if (hasOwnAddress) {
+            errno_t e = ifnet_set_lladdr(getIfnet(), ownAddress, sizeof(ownAddress));
+            setProperty(kIOMACAddress, (void *) ownAddress, sizeof(ownAddress));
+            qwz_log("airport: %s%u: own address %02x:%02x:%02x:%02x:%02x:%02x (lladdr %d)\n", ifnet_name(getIfnet()),
+                    ifnet_unit(getIfnet()), ownAddress[0], ownAddress[1], ownAddress[2], ownAddress[3],
+                    ownAddress[4], ownAddress[5], e);
+        } else if (OSDynamicCast(IOEthernetController, getController())->getHardwareAddress(&addr) == kIOReturnSuccess)
             setProperty(kIOMACAddress,  (void *) &addr,
                         kIOEthernetAddressSize);
 #ifdef AIRPORT_WCL
         ret = _fCommandGate ? _fCommandGate->runAction(prepareBSDGated, this) : kIOReturnNotReady;
+        qwz_log("airport: %s%u: attachToDataLinkLayer: prepareBSDInterface 0x%x%s\n", ifnet_name(getIfnet()),
+                ifnet_unit(getIfnet()), ret, ret != kIOReturnSuccess ? ", detaching" : "");
+        qwz_log_publish();
         if (ret != kIOReturnSuccess) {
             super::detachFromDataLinkLayer(options, parameter);
             isAttach = false;

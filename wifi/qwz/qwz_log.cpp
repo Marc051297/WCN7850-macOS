@@ -5,6 +5,7 @@
  * Copyright (c) 2026 razvanccr. GPL-2.0-or-later (see LICENSE).
  */
 #include "qwz_log.h"
+#include "qwz_life.h"	/* the M0 knobs (C25 reads qwz_m0_on); dependency-free */
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
@@ -219,4 +220,48 @@ qwz_log_stage(const char *stage)
 		qwz_log_target->setProperty("QwzMacStage", stage);
 	qwz_log("qwz: stage: %s\n", stage);
 	qwz_log_publish();
+}
+
+/*
+ * M0 crumbs (C25): a step marker written BEFORE a risky step. One ring line
+ * ("qwz: crumb: <text>"), the text copied into a 96-byte buffer with its time
+ * (plain stores: racy, but good enough to name the last step) and, outside
+ * interrupt context and with debug.qwz.m0 on, the registry property
+ * QwzMacCrumb on the PCI device (a tiny string, not the 64 KB ring), so
+ * `ioreg -l -w0 -r -k QwzMacCrumb` shows the last step within one stream tick
+ * even when QwzMacLog is stale. If the machine freezes, the last crumb the
+ * MacBook received names the step (scripts/qwz-m0-stream.sh runs once a second).
+ */
+static char qwz_crumb_buf[96];
+static volatile uint64_t qwz_crumb_ns;
+
+void
+qwz_crumb(const char *fmt, ...)
+{
+	va_list ap;
+	char tmp[96];
+
+	va_start(ap, fmt);
+	vsnprintf(tmp, sizeof(tmp), fmt, ap);
+	va_end(ap);
+	memcpy(qwz_crumb_buf, tmp, sizeof(tmp));
+	qwz_crumb_ns = mach_absolute_time();
+	qwz_log("qwz: crumb: %s\n", tmp);
+	if (qwz_log_target != NULL && qwz_m0_on && !ml_at_interrupt_context())
+		qwz_log_target->setProperty("QwzMacCrumb", tmp);
+}
+
+const char *
+qwz_crumb_text(void)
+{
+	return qwz_crumb_buf;
+}
+
+uint32_t
+qwz_crumb_age_ms(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time() - qwz_crumb_ns, &ns);
+	return (uint32_t)(ns / 1000000ULL);
 }

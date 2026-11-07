@@ -52,8 +52,9 @@ build_kext() {
   fi
 
   # kmod_info (what Xcode generates for kext targets) must keep C symbol names.
+  # KMOD_FLAGS: extra defines for kmod_info.c only (QWZ_KMOD_REALMAIN).
   xcrun clang -arch x86_64 -mmacosx-version-min=13.0 -mkernel -nostdinc -isystem "$MKSDK/Headers" \
-    -DKERNEL -DQWZMAC_VERSION=\"$VERSION\" -DQWZ_KMOD_NAME=com.razvanccr.$NAME -x c -c kmod/kmod_info.c -o "$OBJ/kmod_info.o"
+    -DKERNEL -DQWZMAC_VERSION=\"$VERSION\" -DQWZ_KMOD_NAME=com.razvanccr.$NAME ${KMOD_FLAGS:-} -x c -c kmod/kmod_info.c -o "$OBJ/kmod_info.o"
 
   # Classic ld64, as the reference kexts were linked with; debug STABS are stripped afterwards (keepsyms=1 only needs the symbol table).
   xcrun clang++ -arch x86_64 -mmacosx-version-min=13.0 -fapple-kext -nostdlib -Xlinker -kext -Xlinker -no_data_const -Xlinker -ld_classic \
@@ -62,7 +63,8 @@ build_kext() {
   # Without these the kernel and OpenCore reject the kext ("Invalid Parameter").
   local sym
   for sym in _kmod_info __start __stop __realmain; do
-    nm "$KEXT/Contents/MacOS/$NAME" | grep -q " $sym\$" || { echo "STOP: $sym missing from $NAME"; exit 1; }
+    # grep must read all of nm's output: with -q it exits at the match, nm gets SIGPIPE and pipefail fails the check.
+    nm "$KEXT/Contents/MacOS/$NAME" | grep " $sym\$" >/dev/null || { echo "STOP: $sym missing from $NAME"; exit 1; }
   done
   # A kext must never define a symbol the kernel exports: every call to it in the
   # kext would bind to ours instead (a macro once turned explicit_bzero into a
@@ -86,7 +88,15 @@ if [ "$PRODUCT" = all ] || [ "$PRODUCT" = QwzMac ]; then
 fi
 if [ "$PRODUCT" = all ] || [ "$PRODUCT" = AirportWCN7850 ]; then
   # controller/ItlQwz.cpp is the HAL and is shared; itlwm.cpp, the user client and pm.cpp are HeliPort-only.
-  build_kext AirportWCN7850 airport/Info.plist airport "$CORE controller/ItlQwz.cpp $(find airport -name '*.cpp' | sort)" \
+  # The AWDL interface class is the AWDL kext's alone: with it in this kext the Mac froze at boot.
+  build_kext AirportWCN7850 airport/Info.plist airport "$CORE controller/ItlQwz.cpp $(find airport -name '*.cpp' ! -name AirportWCN7850AWDLInterface.cpp | sort)" \
+    -I airport -I airport/WCL -I include/Airport $(find include/Airport -type d | sed 's/^/-I /' | tr '\n' ' ') \
+    -DAIRPORT -DAIRPORT_WCL -D__IO80211_TARGET=__MAC_26_0 -DIO80211FAMILY_V2
+fi
+# The AWDL interface class alone, in a kext loaded after boot (not in all: built on request only).
+# No personality: OpenCore links it into the boot, and only `kmutil load -b` loads it.
+if [ "$PRODUCT" = AWDLProbe ]; then
+  KMOD_FLAGS=-DQWZ_KMOD_REALMAIN=qwz_awdlprobe_start build_kext AirportWCN7850AWDLProbe awdlprobe/Info.plist awdlprobe "airport/AirportWCN7850AWDLInterface.cpp awdlprobe/AirportWCN7850AWDLProbe.cpp" \
     -I airport -I airport/WCL -I include/Airport $(find include/Airport -type d | sed 's/^/-I /' | tr '\n' ' ') \
     -DAIRPORT -DAIRPORT_WCL -D__IO80211_TARGET=__MAC_26_0 -DIO80211FAMILY_V2
 fi

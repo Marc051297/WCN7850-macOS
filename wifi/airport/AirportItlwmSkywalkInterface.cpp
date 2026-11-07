@@ -746,6 +746,63 @@ getHE_CAPABILITY(apple80211_he_capability *)
     return kIOReturnUnsupported;
 }
 
+/*
+ * The chip's HT and VHT capability elements. The AWDL engine
+ * (IO80211PeerManager::setHtCapabilityIE / setVHtCapabilityIE, 26.7.1)
+ * takes 28 bytes after the version for HT (id, length, then the 26-byte
+ * element body) and 14 for VHT (id, length, the 4 capability bytes, the
+ * 8-byte MCS map), puts them in its master indication frames as TLVs 7 and
+ * 0x11, and a peer caches us as a data peer only with one of them
+ * ("Ignoring cache request ... have HTorVHT:0"). Without the HT one it also
+ * skips the enhanced data rate TLV ("Invalid _htCapabilityLength 0").
+ */
+IOReturn AirportItlwmSkywalkInterface::
+getHT_CAPABILITY(apple80211_ht_capability *cap)
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+
+    if (ic->ic_htcaps == 0)
+        return kIOReturnUnsupported;
+    memset(cap, 0, sizeof(*cap));
+    cap->version = APPLE80211_VERSION;
+    cap->hc_id = 45;	/* IEEE80211_ELEMID_HTCAPS */
+    cap->hc_len = 26;
+    cap->hc_cap = ic->ic_htcaps;
+    cap->hc_param = ic->ic_ampdu_params;
+    memcpy(cap->hc_mcsset, ic->ic_sup_mcs, sizeof(ic->ic_sup_mcs) < sizeof(cap->hc_mcsset) ?
+           sizeof(ic->ic_sup_mcs) : sizeof(cap->hc_mcsset));
+    cap->hc_extcap = ic->ic_htxcaps;
+    cap->hc_txbf = ic->ic_txbfcaps;
+    cap->hc_antenna = ic->ic_aselcaps;
+    return kIOReturnSuccess;
+}
+
+IOReturn AirportItlwmSkywalkInterface::
+getVHT_CAPABILITY(apple80211_vht_capability *data)
+{
+    struct ieee80211com *ic = fHalService->get80211Controller();
+    /* The layout the engine reads, not apple80211_ioctl.h's guess. */
+    struct __attribute__((packed)) vhtcap {
+        uint32_t version;
+        uint8_t id, len;
+        uint32_t cap;
+        uint16_t rx_mcs_map, rx_highest, tx_mcs_map, tx_highest;
+    } *cap = (struct vhtcap *)data;
+
+    static_assert(sizeof(*cap) == 18, "VHT capability element");
+    if (ic->ic_vhtcaps == 0)
+        return kIOReturnUnsupported;
+    cap->version = APPLE80211_VERSION;
+    cap->id = 191;	/* IEEE80211_ELEMID_VHTCAPS */
+    cap->len = 12;
+    cap->cap = ic->ic_vhtcaps;
+    cap->rx_mcs_map = ic->ic_vht_rx_mcs_map;
+    cap->rx_highest = ic->ic_vht_rx_highest;
+    cap->tx_mcs_map = ic->ic_vht_tx_mcs_map;
+    cap->tx_highest = ic->ic_vht_tx_highest;
+    return kIOReturnSuccess;
+}
+
 IOReturn AirportItlwmSkywalkInterface::
 getHE_MCS_INDEX_SET(apple80211_he_mcs_index_set_data *)
 {
@@ -1277,8 +1334,12 @@ IOReturn AirportItlwmSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
 #endif
 
 /*
- * Records what wifip2pd asks for, then declines: there is no Tahoe AWDL
- * interface class yet, and a half-created one is worse than none.
+ * What wifip2pd asks for: an AWDL interface (role 6, a new private address with every request, repeatedly
+ * after boot). Recorded and declined on purpose, not for lack of a class: AirportWCN7850AWDLInterface
+ * exists, in the separately loaded AWDL kext, and awdl0 is made from it by debug.qwz.awdl=1
+ * (AirportItlwm::awdlCreate, once per boot: awdlTried), after that kext is loaded by hand (the same class
+ * inside this kext froze the boot on 2026-11-04). Answering wifip2pd here would risk a second awdl0, made at
+ * a time nobody controls. Making awdl0 on demand is the M3 product trigger (docs/redesign-plan.md, 2.5).
  */
 IOReturn AirportItlwmSkywalkInterface::
 setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)

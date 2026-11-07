@@ -74,6 +74,18 @@ typedef CTimeout *qwz_timeout_t;
 #define DELAY(us)	IODelay(us)
 #define delay(us)	IODelay(us)
 #define KASSERT(e)	do { if (!(e)) panic("qwz: KASSERT %s at %s:%d", #e, __FILE__, __LINE__); } while (0)
+/* M0: the life word lives in struct qwz_softc (sc_life); qwz_compat.cpp reaches it through a pointer set at attach and cleared before the softc is freed */
+#include "qwz_life.h"
+void	qwz_compat_set_life(volatile uint32_t *life);
+int	qwz_tsleep_delay(const volatile void *, int, const char *, uint64_t);
+#define tsleep_delay_nsec	qwz_tsleep_delay
+/* soft assert: true when the BAD condition holds; panics like KASSERT only if debug.qwz.softassert=0 */
+int	qwz_rassert_hit(const char *expr, const char *file, int line);
+#define QWZ_RBAD(bad)	(__builtin_expect(!!(bad), 0) && qwz_rassert_hit(#bad, __FILE__, __LINE__))
+/* M0 (C26), for the health line: live qwz_malloc blocks and bytes, and the number of refused sleeps (C01) */
+extern volatile uint32_t qwz_mem_blocks;
+extern volatile uint64_t qwz_mem_bytes;
+unsigned int	qwz_refused_count(void);
 #define KERNEL_ASSERT_LOCKED()	do {} while (0)
 #define rw_assert_wrlock(rwl)	do {} while (0)
 
@@ -146,6 +158,8 @@ struct device {
 void	qwz_compat_set_gate(IOCommandGate *);
 void	qwz_compat_init(void);	/* before attach */
 void	qwz_compat_fini(void);	/* after detach */
+/* MS-1: 1 = every DMA block the host would free (qwz_free_low) is parked instead, until 0; for a chip whose firmware may still run and whose bus-master bit could not be cleared */
+void	qwz_dma_hold(int);
 void	qwz_pci_unmap_bar(void);
 /* Renamed so they never resolve to XNU's BSD tsleep/wakeup. */
 #define tsleep_nsec	qwz_tsleep_nsec
@@ -174,13 +188,17 @@ struct rwlock {
 #define RW_NOSLEEP	0x40
 void	rw_init(struct rwlock *, const char *);
 int	rw_enter(struct rwlock *, int);
-void	rw_enter_write(struct rwlock *);
+int	rw_enter_write(struct rwlock *);
+/* R1-05: the lock once more after qwz_declare_dead ended a stuck holder's firmware waits: waits at most `ms`, releasing the gate for the holder */
+int	rw_enter_write_grace(struct rwlock *, unsigned int ms);
+#define QWZ_RWL_GRACE_MS	3000
 void	rw_exit(struct rwlock *);
 void	rw_exit_write(struct rwlock *);
 
 /* refcnt(9) */
 struct refcnt {
 	volatile SInt32	r_refs;
+	int		r_gaveup;	/* M0 (C02): set by a refcnt_finalize give-up; the next refcnt_init carries the still-running tasks' references over */
 };
 void	refcnt_init(struct refcnt *);
 void	refcnt_take(struct refcnt *);

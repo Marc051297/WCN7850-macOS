@@ -31,6 +31,12 @@ void	qwz_stage_reset(void);
 /* Republishes the log ring as QwzMacLog. */
 void	qwz_log_publish(void);
 
+/* M0 crumbs: written BEFORE a risky step; the text also goes to the QwzMacCrumb registry property (C25) */
+void		qwz_crumb(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+const char	*qwz_crumb_text(void);
+uint32_t	qwz_crumb_age_ms(void);
+#define QWZ_CRUMB(...)	qwz_crumb(__VA_ARGS__)
+
 /*
  * Rate limit for a log site. *count is the site's running total (it always
  * counts); returns non-zero for the first `first` calls and then for every

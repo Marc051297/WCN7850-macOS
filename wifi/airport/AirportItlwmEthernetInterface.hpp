@@ -45,13 +45,29 @@ public:
                                  void *          param   = 0 ) override;
     
     virtual IOService * getProvider( void ) const override;
-    
+
+    /* awdl0's BSD interface is this class too, named awdl: set before registerService(). */
+    void setNamePrefix(const char *prefix) { namePrefix = prefix; }
+    virtual const char * getNamePrefix() const override;
+    /*
+     * awdl0's own address, before registerService(): its ifnet unique id and
+     * link-layer address. Without it the unique id is the controller's (en1's)
+     * MAC, and the kernel refuses a second ifnet with the same id.
+     */
+    void setOwnAddress(const uint8_t *address);
+
+protected:
+    virtual bool initIfnetParams(struct ifnet_init_params *params) override;
+
 private:
 #ifdef AIRPORT_WCL
     static IOReturn prepareBSDGated(OSObject *, void *, void *, void *, void *);
 #endif
     IO80211SkywalkInterface *interface;
     bool isAttach;
+    const char *namePrefix;	/* NULL: IOEthernetInterface's "en" */
+    bool hasOwnAddress;	/* false: the controller's address, as for en1 */
+    uint8_t ownAddress[6];
 };
 
 #endif /* AirportItlwmEthernetInterface_hpp */

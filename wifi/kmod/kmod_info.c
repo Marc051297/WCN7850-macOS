@@ -18,6 +18,13 @@ extern kern_return_t _stop(kmod_info_t *ki, void *data);
 __attribute__((visibility("default")))
 QWZ_KMOD(QWZ_KMOD_NAME)
 
+/* A product with a start routine of its own names it (-DQWZ_KMOD_REALMAIN=<fn>);
+ * _start runs it after the C++ constructors and class registration. */
+#ifdef QWZ_KMOD_REALMAIN
+extern kern_return_t QWZ_KMOD_REALMAIN(kmod_info_t *ki, void *data);
+__private_extern__ kmod_start_func_t *_realmain = QWZ_KMOD_REALMAIN;
+#else
 __private_extern__ kmod_start_func_t *_realmain = 0;
+#endif
 __private_extern__ kmod_stop_func_t *_antimain = 0;
 __private_extern__ int _kext_apple_cc = __APPLE_CC__;

@@ -23,6 +23,14 @@ struct qwz_mhdr {
 };
 #define QWZ_MAGIC	0x71777a6dUL	/* "qwzm" */
 
+/*
+ * M0 (C26): live malloc(9) blocks and bytes, the leak detector the 15th-wake
+ * failure lacked (health line "mem=<blocks>/<KB>"). Relaxed atomics: the
+ * numbers are read by a sampler, nothing orders against them.
+ */
+volatile uint32_t qwz_mem_blocks;
+volatile uint64_t qwz_mem_bytes;
+
 void *
 qwz_malloc(size_t sz, int type, int flags)
 {
@@ -39,6 +47,8 @@ qwz_malloc(size_t sz, int type, int flags)
 	}
 	h->size = tot;
 	h->magic = QWZ_MAGIC;
+	__atomic_add_fetch(&qwz_mem_blocks, 1u, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&qwz_mem_bytes, (uint64_t)tot, __ATOMIC_RELAXED);
 	if (flags & M_ZERO)
 		bzero(h + 1, sz);
 	return h + 1;
@@ -63,6 +73,8 @@ qwz_free(void *p, int type, size_t sz)
 	if (h->magic != QWZ_MAGIC)
 		panic("qwz: free(%p) of a block malloc() did not return", p);
 	h->magic = 0;
+	__atomic_sub_fetch(&qwz_mem_blocks, 1u, __ATOMIC_RELAXED);
+	__atomic_sub_fetch(&qwz_mem_bytes, (uint64_t)h->size, __ATOMIC_RELAXED);
 	IOFree(h, h->size);
 }
 
@@ -101,27 +113,82 @@ qwz_compat_set_gate(IOCommandGate *gate)
 }
 
 /*
+ * M0 (C01): the life word of the softc (sc_life) is reached through a pointer
+ * that ItlQwz sets at attach and clears BEFORE the softc is freed. NULL means
+ * "not dead". Every writer and every reader runs under the gate (a task wakes
+ * inside commandSleep with the gate held), so the NULL store is ordered before
+ * any later read.
+ */
+static volatile uint32_t *qwz_life_word;
+static unsigned int qwz_refused_total;
+static char qwz_dead_yield_chan;			/* nobody ever wakes this channel: a pure 1 ms yield */
+
+void
+qwz_compat_set_life(volatile uint32_t *life)
+{
+	qwz_life_word = life;
+}
+
+/* M0 (C26): the refused-sleep total for the health line ("refused="); qwz_refused_total itself stays file-static */
+unsigned int
+qwz_refused_count(void)
+{
+	return __atomic_load_n(&qwz_refused_total, __ATOMIC_RELAXED);
+}
+
+static inline bool
+qwz_dead_now(void)
+{
+	return qwz_dead_aware && qwz_life_word != NULL &&
+	    (__atomic_load_n(qwz_life_word, __ATOMIC_ACQUIRE) & QWZ_LIFE_DEAD) != 0;
+}
+
+/*
+ * A DEAD return yields the gate for 1 ms first, so an unaudited retry loop
+ * degrades into a slow loop, never a gate-held spin.
+ */
+static void
+qwz_dead_yield(void)
+{
+	uint64_t interval, deadline;
+
+	nanoseconds_to_absolutetime(1000000ULL, &interval);	/* 1 ms */
+	deadline = mach_absolute_time() + interval;
+	qwz_gate->commandSleep((void *)&qwz_dead_yield_chan, deadline, THREAD_UNINT);
+}
+
+/*
  * Sleep on `ident`, releasing the gate while asleep. Only legal from a thread
  * that holds the gate and is not the workloop thread itself; OpenBSD forbids
- * the equivalent (sleeping in interrupt context) too.
+ * the equivalent (sleeping in interrupt context) too. A refusal returns
+ * EDEADLK (not EWOULDBLOCK, which is a real timeout). With dead_aware, a DEAD
+ * firmware ends the wait with ESHUTDOWN; waits that are not about the firmware
+ * (delay and poll loops) use qwz_tsleep_delay, which passes dead_aware = false.
  */
-int
-qwz_tsleep_nsec(const volatile void *ident, int prio, const char *wmesg, uint64_t nsecs)
+static int
+qwz_tsleep_common(const volatile void *ident, const char *wmesg, uint64_t nsecs, bool dead_aware, void *ra)
 {
 	IOWorkLoop *wl;
 	IOReturn ret;
 
-	if (qwz_gate == NULL || (wl = qwz_gate->getWorkLoop()) == NULL) {
+	if (qwz_gate == NULL || (wl = qwz_gate->getWorkLoop()) == NULL) {		/* unchanged */
 		QWZLOG("tsleep(%s) before the gate exists", wmesg);
 		IOSleep(nsecs == INFSLP ? 1000 : (uint32_t)(nsecs / 1000000) + 1);
 		return EWOULDBLOCK;
 	}
 	if (wl->onThread() || !wl->inGate()) {
-		QWZLOG("tsleep(%s) from %s; not sleeping", wmesg,
-		    wl->onThread() ? "the workloop thread" : "outside the gate");
-		return EWOULDBLOCK;
-	}
+		unsigned int n = __atomic_add_fetch(&qwz_refused_total, 1u, __ATOMIC_RELAXED);
 
+		if (n <= 8 || (n % 256) == 0)
+			QWZLOG("tsleep(%s) refused #%u: %s; caller +0x%lx from qwz_tsleep_nsec", wmesg, n,
+			    wl->onThread() ? "workloop thread" : "outside the gate",
+			    (unsigned long)((uintptr_t)ra - (uintptr_t)&qwz_tsleep_nsec));
+		return EDEADLK;
+	}
+	if (dead_aware && qwz_dead_now()) {
+		qwz_dead_yield();
+		return ESHUTDOWN;
+	}
 	if (nsecs == INFSLP) {
 		ret = qwz_gate->commandSleep((void *)ident, THREAD_UNINT);
 	} else {
@@ -131,17 +198,33 @@ qwz_tsleep_nsec(const volatile void *ident, int prio, const char *wmesg, uint64_
 		deadline = mach_absolute_time() + interval;
 		ret = qwz_gate->commandSleep((void *)ident, deadline, THREAD_UNINT);
 	}
+	if (dead_aware && qwz_dead_now())	/* woken by qwz_wake_all_waiters, or by a real event that no longer matters */
+		return ESHUTDOWN;
 	switch (ret) {
-	case kIOReturnSuccess:
+	case THREAD_AWAKENED:			/* == kIOReturnSuccess == 0 */
 		return 0;
+	case THREAD_TIMED_OUT:			/* 1: what commandSleep really returns (kern_types.h:53) */
 	case kIOReturnTimeout:
 		return EWOULDBLOCK;
+	case THREAD_INTERRUPTED:
 	case kIOReturnAborted:
 		return EINTR;
 	default:
 		QWZLOG("tsleep(%s): commandSleep returned 0x%x", wmesg, ret);
 		return EWOULDBLOCK;
 	}
+}
+
+int
+qwz_tsleep_nsec(const volatile void *ident, int prio, const char *wmesg, uint64_t nsecs)
+{
+	return qwz_tsleep_common(ident, wmesg, nsecs, true, __builtin_return_address(0));
+}
+
+int
+qwz_tsleep_delay(const volatile void *ident, int prio, const char *wmesg, uint64_t nsecs)
+{
+	return qwz_tsleep_common(ident, wmesg, nsecs, false, __builtin_return_address(0));
 }
 
 void
@@ -167,34 +250,89 @@ rw_init(struct rwlock *rwl, const char *name)
 	rwl->rwl_owner = NULL;
 }
 
+/*
+ * M0 (C02): a waiter sleeps in 100 ms slices with qwz_tsleep_delay (not
+ * DEAD-aware: it must really release the gate so the owner can finish), never
+ * spins on a refusal, and gives up after QWZ_RWL_WAIT_MS (above the longest
+ * legitimate hold: a healthy qwz_init is about 1 s). Every caller handles a
+ * failure; nobody may rw_exit a lock it did not get.
+ */
+#define QWZ_RWL_WAIT_MS		20000
+#define QWZ_REFCNT_WAIT_MS	15000
+
 int
 rw_enter(struct rwlock *rwl, int flags)
 {
 	void *self = current_thread();
+	uint64_t dl = getnsecuptime() + MSEC_TO_NSEC(QWZ_RWL_WAIT_MS);
 	int err;
 
 	while (rwl->rwl_owner != NULL) {
-		if (rwl->rwl_owner == self)
-			panic("qwz: rwlock %s recursed", rwl->rwl_name);
+		if (rwl->rwl_owner == self) {
+			QWZLOG("rwlock %s: recursive acquire refused (EDEADLK)", rwl->rwl_name);
+			return EDEADLK;
+		}
 		if (flags & RW_NOSLEEP)
 			return EBUSY;
-		err = qwz_tsleep_nsec(rwl, 0, rwl->rwl_name, INFSLP);
-		if (err && (flags & RW_INTR))
-			return err;
+		err = qwz_tsleep_delay(rwl, 0, rwl->rwl_name, MSEC_TO_NSEC(100));
+		if (err == EDEADLK) {		/* this thread cannot sleep: the owner cannot run while we spin */
+			QWZLOG("rwlock %s busy (owner %p) and this thread cannot sleep: EBUSY, no spin", rwl->rwl_name, rwl->rwl_owner);
+			return EBUSY;
+		}
+		if (err == EINTR && (flags & RW_INTR))
+			return EINTR;
+		if (getnsecuptime() >= dl) {
+			QWZLOG("rwlock %s not acquired in %u ms (owner %p): ETIMEDOUT", rwl->rwl_name, QWZ_RWL_WAIT_MS, rwl->rwl_owner);
+			return ETIMEDOUT;
+		}
+	}
+	rwl->rwl_owner = self;
+	return 0;
+}
+
+int
+rw_enter_write(struct rwlock *rwl)
+{
+	return rw_enter(rwl, RW_WRITE);
+}
+
+/*
+ * R1-05: the lock once more, after qwz_declare_dead ended the stuck holder's firmware waits (its next
+ * wait fails at once, so it unwinds and releases within a few slices). Waits at most `ms`, in 100 ms
+ * slices of qwz_tsleep_delay: unlike a DEAD-aware sleep (which returns at once while DEAD) it really
+ * releases the gate, which the woken holder needs to run. Never spins: a refusal (workloop thread, or
+ * outside the gate) returns EBUSY, a recursive acquire EDEADLK, a lapsed grace ETIMEDOUT; the caller then
+ * goes on without the lock (C02). The owner is tested before the deadline: a lock released in the last
+ * slice is taken.
+ */
+int
+rw_enter_write_grace(struct rwlock *rwl, unsigned int ms)
+{
+	void *self = current_thread();
+	uint64_t dl = getnsecuptime() + MSEC_TO_NSEC(ms);
+
+	while (rwl->rwl_owner != NULL) {
+		if (rwl->rwl_owner == self)
+			return EDEADLK;
+		if (qwz_tsleep_delay(rwl, 0, rwl->rwl_name, MSEC_TO_NSEC(100)) == EDEADLK)
+			return EBUSY;
+		if (rwl->rwl_owner != NULL && getnsecuptime() >= dl)
+			return ETIMEDOUT;
 	}
 	rwl->rwl_owner = self;
 	return 0;
 }
 
 void
-rw_enter_write(struct rwlock *rwl)
-{
-	rw_enter(rwl, RW_WRITE);
-}
-
-void
 rw_exit(struct rwlock *rwl)
 {
+	if (rwl->rwl_owner != NULL && rwl->rwl_owner != current_thread()) {
+		static unsigned int not_owner;
+
+		if (qwz_log_ratelimit(&not_owner, 4, 64))
+			QWZLOG("rw_exit(%s) by a thread that is not the owner: ignored", rwl->rwl_name);
+		return;
+	}
 	rwl->rwl_owner = NULL;
 	qwz_wakeup(rwl);
 }
@@ -208,7 +346,12 @@ rw_exit_write(struct rwlock *rwl)
 void
 refcnt_init(struct refcnt *r)
 {
-	r->r_refs = 1;
+	SInt32 stale = r->r_gaveup && r->r_refs > 0 ? r->r_refs : 0;	/* tasks a give-up left running */
+
+	r->r_gaveup = 0;
+	r->r_refs = 1 + stale;			/* 1 exactly as today unless a give-up happened; the stale tasks release into this count */
+	if (stale)
+		QWZLOG("refcnt: %d task reference(s) left by an earlier give-up carried into the new epoch", (int)stale);
 }
 
 void
@@ -230,12 +373,58 @@ refcnt_rele_wake(struct refcnt *r)
 		qwz_wakeup(r);
 }
 
+/*
+ * M0 (C02): waits in 100 ms slices; after 5 s logs how many references are
+ * still held; gives up after QWZ_REFCNT_WAIT_MS with a log and returns; returns
+ * at once on a refusal. A give-up leaves tasks that still hold a reference, so
+ * r_gaveup is set and the next refcnt_init carries their references over: the
+ * count stays exact and the stale tasks release into it when they finish.
+ */
 void
 refcnt_finalize(struct refcnt *r, const char *wmesg)
 {
+	uint64_t t0 = getnsecuptime(), now;
+	bool warned = false;
+
 	refcnt_rele(r);
-	while (r->r_refs > 0)
-		qwz_tsleep_nsec(r, 0, wmesg, INFSLP);
+	while (r->r_refs > 0) {
+		if (qwz_tsleep_delay(r, 0, wmesg, MSEC_TO_NSEC(100)) == EDEADLK) {
+			QWZLOG("refcnt %s: %d held and this thread cannot sleep: not waiting", wmesg, (int)r->r_refs);
+			r->r_gaveup = 1;
+			return;
+		}
+		now = getnsecuptime();
+		if (!warned && now - t0 > SEC_TO_NSEC(5)) {
+			warned = true;
+			QWZLOG("refcnt %s: %d task(s) did not finish in 5 s", wmesg, (int)r->r_refs);
+		}
+		if (now - t0 > MSEC_TO_NSEC(QWZ_REFCNT_WAIT_MS)) {
+			QWZLOG("refcnt %s: giving up after %u ms with %d held", wmesg, QWZ_REFCNT_WAIT_MS, (int)r->r_refs);
+			r->r_gaveup = 1;			/* the next refcnt_init carries the still-running tasks over */
+			return;
+		}
+	}
+}
+
+/* ---- soft asserts (C03) ------------------------------------------------- */
+
+/*
+ * QWZ_RBAD(bad) is true when the BAD condition holds. With debug.qwz.softassert=0
+ * this panics like KASSERT (the message names the assertion that failed, !(bad)).
+ * Otherwise it counts, logs (the first 8, then every 64th) and returns 1, and the
+ * site runs its fix instead of panicking. A panic cannot be shown or saved on
+ * this machine, so it looks like a hard freeze.
+ */
+int
+qwz_rassert_hit(const char *expr, const char *file, int line)
+{
+	static unsigned int n;
+
+	if (!qwz_softassert)
+		panic("qwz: KASSERT !(%s) at %s:%d", expr, file, line);
+	if (qwz_log_ratelimit(&n, 8, 64))
+		qwz_log("qwz: soft-assert #%u: !(%s) at %s:%d: continuing (debug.qwz.softassert=0 panics)\n", n, expr, file, line);
+	return 1;
 }
 
 /* ---- process-context timeouts ----------------------------------------- */
@@ -502,11 +691,94 @@ qwz_alloc_low(size_t size, bus_size_t align, bus_addr_t high, bus_addr_t *pa)
 	return md;
 }
 
+/*
+ * MS-1: the DMA hold. A no-link teardown cannot clear the bus-master bit (a config write to a downed link is
+ * lost) and cannot reset the chip, so a firmware that survived the outage may DMA into anything the host frees
+ * until the next power-up has verified the chip in reset (qwz_pci_late_reset). While the hold is on, qwz_free_low
+ * parks the descriptor (the pages stay allocated and keep their contents, so the firmware keeps seeing its own
+ * rings) and qwz_dma_hold(0) frees them. qwz_dma_hold(0) is called only on verified paths (late-reset success,
+ * a healthy power-down with a live link). A teardown returns only descriptors. DETACH also returns the MHI,
+ * event and cmd rings, the context arrays, the amss buffers, fwmem and m3 (qwz_pci_detach, qwz_detach), and
+ * qwz_compat_fini returns the pool chunks (the bounce slots, the CE rx buffers among them). With the hold on,
+ * detach parks the first group and qwz_compat_fini leaves all of them allocated on purpose (HF-6). The lock is
+ * the one of the bounce pools: nothing calls qwz_free_low with it held.
+ */
+static IOLock *qwz_dma_lock;
+struct qwz_dma_parked {
+	struct qwz_dma_parked	*next;
+	IOBufferMemoryDescriptor *md;
+	size_t			 len;
+};
+static int			qwz_dma_hold_on;
+static struct qwz_dma_parked	*qwz_dma_parked_head;
+static uint32_t			qwz_dma_parked_n, qwz_dma_leaked_n;
+static uint64_t			qwz_dma_parked_bytes;
+
 static void
 qwz_free_low(IOBufferMemoryDescriptor *md)
 {
+	if (qwz_dma_lock != NULL) {
+		IOLockLock(qwz_dma_lock);
+		if (qwz_dma_hold_on) {
+			struct qwz_dma_parked *p = (struct qwz_dma_parked *)qwz_malloc(sizeof(*p), M_DEVBUF, M_NOWAIT | M_ZERO);
+
+			if (p != NULL) {
+				p->md = md;
+				p->len = md->getLength();
+				p->next = qwz_dma_parked_head;
+				qwz_dma_parked_head = p;
+				qwz_dma_parked_n++;
+				qwz_dma_parked_bytes += p->len;
+			} else
+				qwz_dma_leaked_n++;	/* no node: leak the block, never free a page the firmware may still write */
+			IOLockUnlock(qwz_dma_lock);
+			return;				/* no complete(): the block stays prepared until it is released */
+		}
+		IOLockUnlock(qwz_dma_lock);
+	}
 	md->complete();
 	md->release();
+}
+
+void
+qwz_dma_hold(int on)
+{
+	struct qwz_dma_parked *list, *p;
+	uint32_t n, leaked;
+	uint64_t bytes;
+
+	if (qwz_dma_lock == NULL)
+		return;
+	IOLockLock(qwz_dma_lock);
+	if (on) {
+		int was = qwz_dma_hold_on;
+
+		qwz_dma_hold_on = 1;
+		IOLockUnlock(qwz_dma_lock);
+		if (!was)
+			QWZLOG("dma: hold on: DMA memory freed from now on is parked until the chip is verified in reset");
+		return;
+	}
+	if (!qwz_dma_hold_on) {
+		IOLockUnlock(qwz_dma_lock);
+		return;
+	}
+	qwz_dma_hold_on = 0;
+	list = qwz_dma_parked_head;
+	n = qwz_dma_parked_n;
+	leaked = qwz_dma_leaked_n;
+	bytes = qwz_dma_parked_bytes;
+	qwz_dma_parked_head = NULL;
+	qwz_dma_parked_n = qwz_dma_leaked_n = 0;
+	qwz_dma_parked_bytes = 0;
+	IOLockUnlock(qwz_dma_lock);
+	while ((p = list) != NULL) {
+		list = p->next;
+		p->md->complete();
+		p->md->release();
+		qwz_free(p, M_DEVBUF, sizeof(*p));
+	}
+	QWZLOG("dma: hold released: %u block(s), %llu KB freed, %u leaked (no list node)", n, (unsigned long long)(bytes / 1024), leaked);
 }
 
 /*
@@ -531,7 +803,6 @@ struct qwz_pool_chunk {
 	IOBufferMemoryDescriptor *md;
 };
 
-static IOLock *qwz_dma_lock;
 static struct qwz_bounce *qwz_pool_free[QWZ_NPOOLS];
 static struct qwz_pool_chunk *qwz_pool_chunks;
 
@@ -641,8 +912,55 @@ qwz_compat_init(void)
 void
 qwz_compat_fini(void)
 {
+	struct qwz_dma_parked *plist = NULL, *pn;
+	struct qwz_pool_chunk *clist = NULL, *cn;
+	uint32_t parked_n = 0, leaked_n = 0, chunk_n = 0;
+	uint64_t parked_bytes = 0;
 	unsigned int cls;
+	int unverified = 0;
 
+	/*
+	 * MS-1 (HF-6): the hold is still on here when the chip was never verified in reset (a no-link teardown set it, and no power-up with a
+	 * live link has run the late reset since). Detach has just freed the MHI and event rings, the amss buffers, fwmem and m3 into the
+	 * parked list, and the CE rx descriptors still point at the pool chunks: a firmware that survived the outage, with bus mastering
+	 * on again, may write into all of them, and nothing here can reset it. So they are left allocated, on purpose: no release of the
+	 * parked list, no chunk free. Only the host-side bookkeeping goes (list nodes, counters, the flag): the descriptors stay retained
+	 * and prepared with nothing pointing at them, and a later attach starts from clean statics. The cost is a few MB of wired low
+	 * memory, once, in a state the chip has to be recovered from anyway; the alternative is a stray DMA write into reused pages.
+	 * Everything is taken and reset in ONE critical section, the log and the node frees come after the unlock.
+	 */
+	if (qwz_dma_lock != NULL) {
+		IOLockLock(qwz_dma_lock);
+		if (qwz_dma_hold_on) {
+			unverified = 1;
+			plist = qwz_dma_parked_head;
+			parked_n = qwz_dma_parked_n;
+			leaked_n = qwz_dma_leaked_n;
+			parked_bytes = qwz_dma_parked_bytes;
+			clist = qwz_pool_chunks;
+			for (cn = clist; cn != NULL; cn = cn->next)
+				chunk_n++;
+			qwz_dma_hold_on = 0;
+			qwz_dma_parked_head = NULL;
+			qwz_dma_parked_n = qwz_dma_leaked_n = 0;
+			qwz_dma_parked_bytes = 0;
+			qwz_pool_chunks = NULL;
+		}
+		IOLockUnlock(qwz_dma_lock);
+	}
+	if (unverified) {
+		QWZLOG("dma: fini with the hold on: %u parked block(s), %llu KB (%u more without a list node), and %u pool chunk(s), %u KB, are left allocated on purpose: the chip was never verified in reset",
+		    parked_n, (unsigned long long)(parked_bytes / 1024), leaked_n, chunk_n, chunk_n * (QWZ_POOL_CHUNK / 1024));
+		while ((pn = plist) != NULL) {		/* the list nodes only; never pn->md */
+			plist = pn->next;
+			qwz_free(pn, M_DEVBUF, sizeof(*pn));
+		}
+		while ((cn = clist) != NULL) {		/* the list nodes only; never cn->md */
+			clist = cn->next;
+			qwz_free(cn, M_DEVBUF, sizeof(*cn));
+		}
+	}
+	qwz_dma_hold(0);		/* the hold is off here (dropped above when it was on, so nothing is released): a no-op that keeps the invariant that no block is parked once fini runs, and the chunk frees below are never parked */
 	for (cls = 0; cls < QWZ_NPOOLS; cls++) {
 		while (qwz_pool_free[cls] != NULL) {
 			struct qwz_bounce *b = qwz_pool_free[cls];
@@ -657,6 +975,7 @@ qwz_compat_fini(void)
 		qwz_free(c, M_DEVBUF, sizeof(*c));
 	}
 	qwz_pci_unmap_bar();
+	qwz_life_word = NULL;		/* the softc is gone (C01) */
 	if (qwz_dma_lock != NULL) {
 		IOLockFree(qwz_dma_lock);
 		qwz_dma_lock = NULL;

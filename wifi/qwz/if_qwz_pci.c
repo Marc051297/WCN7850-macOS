@@ -311,7 +311,12 @@ struct qwz_pci_softc {
 	int			sc_msi_off;
 #ifdef __APPLE__
 	int			sc_powered_down;	/* chip reset by power_down: keep off the bus */
+	int			sc_late_reset;		/* M0.1 (F1): the last power-down found no link and did NOT reset the chip: its firmware may still run, so the next power-up with a live link resets it first (qwz_pci_late_reset) */
 #endif
+	/* M0 (C08, C10): interrupt-handler link-loss and SYS_ERR bookkeeping, and the MMIO guard's log limiter */
+	uint32_t		sc_ones_seen;		/* consecutive interrupts whose BHI/MHI reads were all-ones */
+	uint64_t		sc_syserr_ns;		/* when MHI SYS_ERR was first seen (0: not in SYS_ERR) */
+	unsigned int		sc_mmio_blk_log;	/* blocked BAR accesses so far (qwz_log_ratelimit counter) */
 	pcireg_t		sc_msi_cap;
 	void			*sc_ih[QWZ_NUM_MSI_VEC];
 	char			sc_ivname[QWZ_NUM_MSI_VEC][16];
@@ -393,6 +398,9 @@ void	qwz_pci_aspm_disable(struct qwz_softc *);
 void	qwz_pci_aspm_restore(struct qwz_softc *);
 int	qwz_pci_power_up(struct qwz_softc *);
 void	qwz_pci_power_down(struct qwz_softc *);
+#ifdef __APPLE__
+static int	qwz_pci_late_reset(struct qwz_pci_softc *);	/* M0.1 (F1): defined above qwz_pci_power_down, where the MHI register macros exist */
+#endif
 
 int	qwz_pci_bus_wake_up(struct qwz_softc *);
 void	qwz_pci_bus_release(struct qwz_softc *);
@@ -425,6 +433,7 @@ int	qwz_mhi_fw_load_handler(struct qwz_pci_softc *);
 int	qwz_mhi_await_device_reset(struct qwz_softc *);
 int	qwz_mhi_await_device_ready(struct qwz_softc *);
 void	qwz_mhi_ready_state_transition(struct qwz_pci_softc *);
+void	qwz_pci_bhi_ready_note(struct qwz_pci_softc *);	/* M2a (WP3, I9) */
 void	qwz_mhi_mission_mode_state_transition(struct qwz_pci_softc *);
 void	qwz_mhi_low_power_mode_state_transition(struct qwz_pci_softc *);
 void	qwz_mhi_set_state(struct qwz_softc *, uint32_t);
@@ -1082,15 +1091,37 @@ qwz_pci_detach(struct device *self, int flags)
 	struct qwz_softc *sc = &psc->sc_sc;
 	struct ifnet *ifp = &sc->sc_ic.ic_if;
 
-	rw_enter_write(&sc->ioctl_rwl);
+	/* M0 (C02): a lock that stays busy must not hang the kext unload: detach without it. */
+	int locked = rw_enter_write(&sc->ioctl_rwl) == 0;
+
+	if (!locked) {
+		/*
+		 * R1-05: a holder that kept the lock for 20 s is stuck in a firmware wait, and the softc is freed below. Declare DEAD as
+		 * sleepHardware does (the holder's waits end, the teardown is host-only), then wait for the lock again: the woken holder
+		 * cannot run while this thread keeps the gate, and rw_enter_write_grace releases it. The holder then unwinds and the
+		 * detach runs with the lock. No engine guard is needed: stop() ran quiescePM first, so the DEAD callback requests
+		 * nothing. With recover=0 or m0=0 DEAD is inert, there is no grace wait, and this is the C02 path.
+		 */
+		qwz_declare_dead(sc, QWZ_DEAD_DEADLINE, "ioctl lock");
+		if (qwz_dead_armed())
+			locked = rw_enter_write_grace(&sc->ioctl_rwl, QWZ_RWL_GRACE_MS) == 0;
+		if (locked)
+			qwz_log("qwz: detach: the ioctl lock was released after DEAD: detaching with it\n");
+		else
+			qwz_log("qwz: detach: the ioctl lock stayed busy: detaching without it\n");
+	}
 	if (ifp->if_flags & IFF_RUNNING)
 		qwz_stop(ifp);
 	if (sc->fw_initialized)
 		qwz_core_deinit(sc);
-	rw_exit(&sc->ioctl_rwl);
+	if (locked)
+		rw_exit(&sc->ioctl_rwl);
 
 	qwz_pci_disestablish_all(psc);
 
+#ifdef __APPLE__
+	qwz_awdl_pool_destroy(sc);	/* WP4 (M2a): the lane M maps (none unless the pool was used); qwz_core_deinit above has reaped the frames */
+#endif
 	qwz_detach(sc);
 	qwz_vif_free(sc);
 #ifdef __APPLE__
@@ -1360,11 +1391,54 @@ qwz_pci_init_cmd_ring(struct qwz_softc *sc, struct qwz_pci_cmd_ring *ring)
 	return 0;
 }
 
+/*
+ * M0 (C08): the MMIO funnel guard. While QWZ_LIFE_MMIO_BLOCK is set (and
+ * debug.qwz.mmioguard is 1) BAR reads answer 0xffffffff and writes are
+ * dropped; the first 8 blocked accesses are logged with the caller's offset.
+ * The flag is set by qwz_declare_dead(LINK), by a failed link check (C09,
+ * C11), by a refused power-up and at the very end of qwz_pci_power_down
+ * (nothing legitimate reads a chip that was just reset; reading one froze
+ * this AMD platform). It is cleared in exactly TWO places, each directly
+ * after a passed config-space link check: the dead branch of
+ * qwz_pci_power_down and the top of qwz_pci_power_up (S15).
+ * The helpers are static and sit above qwz_pci_read (compiled as C++14: a
+ * use before the definition is an error); qwz_pci_read itself is declared
+ * near the top of the file.
+ */
+static void
+qwz_mmio_blocked_note(struct qwz_pci_softc *psc, uint32_t addr, int wr, void *ra)
+{
+	if (qwz_log_ratelimit(&psc->sc_mmio_blk_log, 8, 4096))
+		qwz_log("qwz: mmio: blocked %s 0x%x #%u caller +0x%lx\n", wr ? "write" : "read", addr, psc->sc_mmio_blk_log,
+		    (unsigned long)((uintptr_t)ra - (uintptr_t)&qwz_pci_read));
+}
+
+static void
+qwz_mmio_block(struct qwz_softc *sc, const char *why)
+{
+	if (!(__atomic_fetch_or(&sc->sc_life, QWZ_LIFE_MMIO_BLOCK, __ATOMIC_ACQ_REL) & QWZ_LIFE_MMIO_BLOCK))
+		qwz_log("qwz: mmio: blocked: %s\n", why);
+}
+
+static void
+qwz_mmio_unblock(struct qwz_softc *sc, const char *why)
+{
+	if (__atomic_fetch_and(&sc->sc_life, ~QWZ_LIFE_MMIO_BLOCK, __ATOMIC_ACQ_REL) & QWZ_LIFE_MMIO_BLOCK)
+		qwz_log("qwz: mmio: unblocked: %s\n", why);
+}
+
 uint32_t
 qwz_pci_read(struct qwz_softc *sc, uint32_t addr)
 {
 	struct qwz_pci_softc *psc = (struct qwz_pci_softc *)sc;
 
+	if (__builtin_expect(((sc->sc_life & QWZ_LIFE_MMIO_BLOCK) && qwz_mmio_guard) ||
+	    sc->sc_inject_ones_until_ns != 0, 0)) {
+		if (((sc->sc_life & QWZ_LIFE_MMIO_BLOCK) && qwz_mmio_guard) || qwz_inject_ones_active(sc)) {
+			qwz_mmio_blocked_note(psc, addr, 0, __builtin_return_address(0));
+			return 0xffffffff;
+		}
+	}
 	return (bus_space_read_4(psc->sc_st, psc->sc_sh, addr));
 }
 
@@ -1373,6 +1447,15 @@ qwz_pci_write(struct qwz_softc *sc, uint32_t addr, uint32_t val)
 {
 	struct qwz_pci_softc *psc = (struct qwz_pci_softc *)sc;
 
+	if (__builtin_expect(((sc->sc_life & QWZ_LIFE_MMIO_BLOCK) && qwz_mmio_guard) ||
+	    sc->sc_inject_ones_until_ns != 0, 0)) {
+		if (((sc->sc_life & QWZ_LIFE_MMIO_BLOCK) && qwz_mmio_guard) || qwz_inject_ones_active(sc)) {
+			qwz_mmio_blocked_note(psc, addr, 1, __builtin_return_address(0));
+			if (addr == ATH12K_PCI_WINDOW_REG_ADDRESS)
+				psc->register_window = 0;	/* the select did not reach the chip: forget the cached window, 0 is never a dynamic window, so the next windowed access selects again */
+			return;				/* the write is dropped */
+		}
+	}
 	bus_space_write_4(psc->sc_st, psc->sc_sh, addr, val);
 }
 
@@ -1753,10 +1836,16 @@ qwz_pci_select_window(struct qwz_softc *sc, uint32_t offset)
 	window |= psc->register_window & ATH12K_PCI_WINDOW_STATIC_MASK;
 
 	if (window != psc->register_window) {
+		/*
+		 * M0 (C08): the cache is stored BEFORE the write. When the MMIO funnel
+		 * drops the write (QWZ_LIFE_MMIO_BLOCK or the inject=3 window) it resets
+		 * the cache to 0 in the same branch that decides the drop, so the cache
+		 * never names a window the chip was not told to select.
+		 */
+		psc->register_window = window;
 		qwz_pci_write(sc, ATH12K_PCI_WINDOW_REG_ADDRESS,
 		    ATH12K_PCI_WINDOW_ENABLE_BIT | window);
 		(void) qwz_pci_read(sc, ATH12K_PCI_WINDOW_REG_ADDRESS);
-		psc->register_window = window;
 	}
 }
 
@@ -2070,6 +2159,8 @@ qwz_pci_msi_config(struct qwz_softc *sc, bool enable)
 #endif
 	val = pci_conf_read(psc->sc_pc, psc->sc_tag,
 	    psc->sc_msi_off + PCI_MSI_MC);
+	if (val == 0xffffffff)			/* M0.1 (HF-5): the link is down; writing "every bit but one" back to a device that comes back in between would set Multiple Message Enable to 7 (the chip's MMC is 5) and misroute its single MSI. A real capability dword never reads all-ones (its id byte is 0x05) */
+		return;
 
 	if (enable)
 		val |= PCI_MSI_MC_MSIE;
@@ -2123,6 +2214,80 @@ qwz_pci_aspm_restore(struct qwz_softc *sc)
 	}
 }
 
+/*
+ * M0 (C09): the config-space link check, the bus-master rule and the power-up
+ * preflight. All five helpers sit directly above qwz_pci_power_up so that
+ * qwz_pci_power_down (below it) sees them as well. A config read of the
+ * vendor/device word is the probe, never a BAR read: UNVERIFIED on this board
+ * that a config read to a downed link completes (UR) instead of hanging; PCIe
+ * root ports complete config reads with an unsupported-request status.
+ */
+static pcireg_t
+qwz_pci_link_id(struct qwz_pci_softc *psc)
+{
+	pcireg_t id = pci_conf_read(psc->sc_pc, psc->sc_tag, 0);
+
+	return qwz_inject_ones_active(&psc->sc_sc) ? 0xffffffff : id;		/* inject=3 (C33) */
+}
+
+int
+qwz_pci_link_alive(struct qwz_softc *sc)			/* a config-space read: no log, no BAR access */
+{
+	pcireg_t id = qwz_pci_link_id((struct qwz_pci_softc *)sc);
+
+	return id != 0xffffffff && PCI_VENDOR(id) == PCI_VENDOR_QUALCOMM;
+}
+
+static int
+qwz_pci_link_ok(struct qwz_pci_softc *psc, const char *what)
+{
+	pcireg_t id = qwz_pci_link_id(psc);
+
+	if (id != 0xffffffff && PCI_VENDOR(id) == PCI_VENDOR_QUALCOMM)
+		return 1;
+	qwz_log("qwz: mmio: %s: config space reads %08x: the link is not usable, no BAR access\n", what, id);
+	return 0;
+}
+
+#ifdef __APPLE__
+/*
+ * MS-1: sc_late_reset says "the chip may still run firmware that nobody has verified in reset". While it is set,
+ * the host must not return DMA memory to the kernel: the bus-master clear of a no-link teardown cannot reach a downed
+ * link, and a firmware that survived the outage has bus mastering on again when the link returns. The hold parks every
+ * block qwz_free_low would free (qwz_compat.cpp) and releases them when the late reset has verified the reset.
+ */
+static void
+qwz_pci_set_late_reset(struct qwz_pci_softc *psc, int v)
+{
+	psc->sc_late_reset = v;
+	qwz_dma_hold(v);
+}
+#endif
+
+static void
+qwz_pci_bme(struct qwz_pci_softc *psc, int on)
+{
+	pcireg_t v = pci_conf_read(psc->sc_pc, psc->sc_tag, PCI_COMMAND_STATUS_REG);
+
+	if (v == 0xffffffff)			/* M0.1: the link is down; writing "every command bit but one" to a device that comes back in between would enable SERR# and parity reporting */
+		return;
+	v = (v & 0xffff) | PCI_COMMAND_INTERRUPT_DISABLE;	/* command half only (status bits are write-1-to-clear); INTx stays off */
+	v = on ? (v | PCI_COMMAND_MEM_ENABLE | PCI_COMMAND_MASTER_ENABLE) : (v & ~PCI_COMMAND_MASTER_ENABLE);
+	pci_conf_write(psc->sc_pc, psc->sc_tag, PCI_COMMAND_STATUS_REG, v);
+}
+
+static void
+qwz_pci_bme_assert(struct qwz_pci_softc *psc)
+{
+	pcireg_t v;
+
+	if (!qwz_bme)
+		return;
+	v = pci_conf_read(psc->sc_pc, psc->sc_tag, PCI_COMMAND_STATUS_REG);
+	if ((v & (PCI_COMMAND_MEM_ENABLE | PCI_COMMAND_MASTER_ENABLE)) != (PCI_COMMAND_MEM_ENABLE | PCI_COMMAND_MASTER_ENABLE))
+		qwz_pci_bme(psc, 1);
+}
+
 int
 qwz_pci_power_up(struct qwz_softc *sc)
 {
@@ -2132,12 +2297,46 @@ qwz_pci_power_up(struct qwz_softc *sc)
 	psc->register_window = 0;
 	clear_bit(ATH12K_FLAG_DEVICE_INIT_DONE, sc->sc_flags);
 #ifdef __APPLE__
+	/*
+	 * inject 5 (C33) first: the hold releases the gate, so an interrupt action queued while the gate
+	 * was held (the chip signals as it resets) runs during it. Until the link check below passes,
+	 * psc->sc_powered_down and the MMIO block are still set from the last power-down, which makes
+	 * qwz_pci_intr return before it reads a register of the reset chip. The link check, the unblock
+	 * and the clearing of sc_powered_down come after the hold, so the link verdict is fresh when the
+	 * reset starts. DEAD ends the hold within 100 ms and the preflight below decides as usual.
+	 */
+	QWZ_CRUMB("pu:begin");
+	qwz_inject_hold(sc, "power-up");				/* inject 5: held with the gate released, still powered down and blocked; DEAD ends it */
+	if (sc->sc_inject_powerup_fail != 0) {			/* inject 4 (C33) */
+		sc->sc_inject_powerup_fail--;
+		qwz_log("qwz: inject: power-up refused (%u more)\n", sc->sc_inject_powerup_fail);
+		psc->sc_powered_down = 1;			/* refused: the chip stays as the last power-down left it (reset), off the bus */
+		qwz_mmio_block(sc, "power-up refused");
+		return EIO;
+	}
+	if (!qwz_pci_link_ok(psc, "power-up")) {
+		psc->sc_powered_down = 1;
+		qwz_mmio_block(sc, "no link at power-up");
+		return EIO;
+	}
+	qwz_mmio_unblock(sc, "link verified at power-up");		/* clear site 2 of 2 (S15) */
+	if (psc->sc_late_reset && qwz_pci_late_reset(psc) != 0) {	/* M0.1 (F1): the first BAR access after a no-link teardown is the reset that teardown skipped; sc_powered_down is still 1, so no interrupt reads a register meanwhile */
+		psc->sc_powered_down = 1;
+		qwz_mmio_block(sc, "late reset not verified");		/* bus mastering and MSI stay off and sc_late_reset stays set: the engine's next attempt starts here again */
+		return EIO;
+	}
 	psc->sc_powered_down = 0;
+	psc->sc_ones_seen = 0;					/* a new episode: "two consecutive all-ones interrupts" never spans a power cycle */
+	psc->sc_syserr_ns = 0;
 #endif
 
 	if (!qwz_stage_ok(9, "chip reset (LTSSM, SoC global reset)"))
 		return EIO;
+	QWZ_CRUMB("pu:sw-reset");
 	qwz_pci_sw_reset(sc, true);
+#ifdef __APPLE__
+	qwz_pci_bme_assert(psc);					/* M0 (R1-02): bus mastering only after the SoC reset has stopped any firmware that survived the dead teardown; MSI is enabled below */
+#endif
 
 	/* Disable ASPM during firmware download due to problems switching
 	 * to AMSS state.
@@ -2148,6 +2347,7 @@ qwz_pci_power_up(struct qwz_softc *sc)
 
 	if (!qwz_stage_ok(10, "MHI start (BHI registers, execution environment)"))
 		return EIO;
+	QWZ_CRUMB("pu:mhi-start");
 	error = qwz_mhi_start(psc);
 	if (error)
 		return error;
@@ -2155,6 +2355,7 @@ qwz_pci_power_up(struct qwz_softc *sc)
 	if (sc->static_window_map)
 		qwz_pci_select_static_window(sc);
 
+	QWZ_CRUMB("pu:done");
 	return 0;
 }
 
@@ -2417,51 +2618,257 @@ qwz_mhi_flush_mhi_event_rings(struct qwz_pci_softc *psc)
 	qwz_pci_intr_data_event(psc, &psc->event_rings[1], 1);
 }
 
+#ifdef __APPLE__
+/*
+ * M0.1 (F1): the late reset. A power-down that finds the PCIe link gone (the no-link branch of
+ * qwz_pci_power_down) can only touch config space: it neither stops MHI nor resets the SoC, so the
+ * firmware may still run when the link returns, while the host has freed the rings, link descriptors,
+ * REO queues and buffers its REO, WBM, TCL and RXDMA engines address. Linux never meets this state:
+ * ath12k_pci_power_down (force wake, MSI off, ath12k_mhi_stop, ath12k_pci_sw_reset(false)) precedes any
+ * freeing, and ath12k_pci_sw_reset(true) runs only on a chip that was just reset or is fresh. The M0
+ * build froze the machine (T3.6, 2026-11-05) at the first power-up after such a teardown, which ran
+ * qwz_pci_sw_reset(true) against the live firmware, without a force wake.
+ *
+ * So the first BAR access after a no-link teardown is what the healthy dead power-down does to a live
+ * chip: force wake, MHI reset, qwz_pci_sw_reset(false) (the SoC global reset); then BHI EXECENV and
+ * MHI_STATUS are read until the EE is PBL-class (MHI_IN_PBL, qwz_mhi_start's test for "a firmware
+ * download follows") and the MHI state is not running. Bus mastering and MSI stay off throughout (config
+ * writes, repeated with a read-back because the write of the teardown is lost on a flapping link): with
+ * Bus Master Enable clear the function cannot issue memory requests, but that holds only once the clear
+ * has landed, and on a real link loss the clear of the teardown cannot reach the downed link. So the DMA
+ * memory the teardown frees (DP rings, link banks, SPT pages, REO queues) is parked instead, from the
+ * no-link teardown until this reset has verified the chip (MS-1: qwz_dma_hold, set and cleared together
+ * with sc_late_reset by qwz_pci_set_late_reset). The normal power-up turns bus mastering and MSI on after
+ * its own reset (R1-02). The QMI target memory (fwmem, m3_mem) and the MHI, CE and HAL pointer memory are
+ * never freed by a teardown, and fwmem is zeroed only by the next QMI handshake, after this reset. A late
+ * reset that cannot be verified fails the power-up (EIO); the engine retries and the flag stays. Each of
+ * the three risky BAR steps (the force wake, the MHI reset, the SoC reset) is preceded by a crumb, and the
+ * first two also by a pause (debug.qwz.latesettle, ms, 0 = none; at most 3000 per pause, 2000 in latemode 1; it
+ * ends at once on DEAD or a pending system sleep or stop: qwz_late_pause) so that the 1 Hz stream window holds the
+ * crumb of the step a freeze would name. The SoC reset gets no pause: every proven dead power-down starts
+ * it about 0.1 s after the MHI reset (the 100 ms DELAY at the top of qwz_pci_sw_reset), and a 2 s dwell
+ * between the two would be a chip state no run has proven. Each step is also preceded by a config-space
+ * link check made AFTER its pause, if it has one (qwz_late_link): the check of qwz_pci_power_up is up to
+ * 4 s old by the time the last step runs, and a link that dropped meanwhile must fail the attempt, not
+ * meet a BAR read. The verification polls after the first are probed the same way (HF-2: a config read before
+ * each, none before the first, which follows the last read of the SoC reset by microseconds).
+ * debug.qwz.latemode=1 (H1) first resets the SoC by two posted writes and no read
+ * (crumbs pd:late-blind and pd:late-post), for the case that the first BAR read itself is what freezes.
+ */
+#define QWZ_LATE_POLLS		30	/* verification reads per SoC reset, 10 ms apart */
+#define QWZ_LATE_RESETS		2	/* SoC global resets tried before the attempt is failed */
+#define QWZ_LATE_SETTLE_MAX	3000	/* ms per pause (HF-1); in latemode 1, which has three pauses, 2000: at most 6 s of pauses per late reset, so that a system wake that waited up to 4 s for the chip still ends inside its 12 s deadline */
+#define QWZ_LATE_SETTLE_MAX_H1	2000
+#define QWZ_LATE_SLICE_MS	100	/* a pause is slept in slices: nothing wakes its channel, DEAD does not (the sleep is not DEAD-aware) and neither does a sleep request */
+
+/*
+ * HF-1, HF-3: a pause is a diagnostic aid for the 1 Hz stream, never a reason to hold the chip. It is capped (the
+ * knob is a plain int), slept in slices, and it ends at once, and stays off for the rest of the late reset, when the
+ * firmware is DEAD or a system sleep or the driver's stop() is pending (qwz_pm_pending, set by AirportItlwm): the
+ * power-state thread waits at most 4 s for the chip, and a pause that outlasted it let the machine go to S3 in the
+ * middle of the attempt. The EDEADLK break is for the workloop thread: no pause there, never a spin.
+ */
+static void
+qwz_late_pause(struct qwz_softc *sc, const char *crumb)
+{
+	int ms = qwz_late_settle, cap = qwz_late_mode == 1 ? QWZ_LATE_SETTLE_MAX_H1 : QWZ_LATE_SETTLE_MAX;
+	const char *why = NULL;
+	uint64_t end, now;
+
+	QWZ_CRUMB("%s", crumb);
+	if (ms <= 0)
+		return;
+	if (ms > cap)
+		ms = cap;
+	qwz_log_publish();
+	end = getnsecuptime() + MSEC_TO_NSEC(ms);
+	while ((now = getnsecuptime()) < end) {
+		uint64_t left = end - now;
+
+		if (qwz_is_dead(sc)) {
+			why = "the firmware is DEAD";
+			break;
+		}
+		if (__atomic_load_n(&qwz_pm_pending, __ATOMIC_ACQUIRE)) {
+			why = "a system sleep or stop is pending";
+			break;
+		}
+		if (tsleep_delay_nsec(&qwz_late_settle, 0, "qwzlate", left < MSEC_TO_NSEC(QWZ_LATE_SLICE_MS) ? left : MSEC_TO_NSEC(QWZ_LATE_SLICE_MS)) == EDEADLK)
+			break;		/* refused on the workloop thread (or outside the gate): no pause there, never a spin */
+	}
+	if (why != NULL)
+		qwz_log("qwz: pm: late reset: the pause after '%s' ends early: %s\n", crumb, why);
+}
+
+static int
+qwz_late_link(struct qwz_pci_softc *psc, const char *step)	/* 1: the link answers; 0: it does not, the attempt must be failed before the BAR step */
+{
+	pcireg_t id = qwz_pci_link_id(psc);			/* a config read, honours inject=3; no BAR access */
+
+	if (id != 0xffffffff && PCI_VENDOR(id) == PCI_VENDOR_QUALCOMM)
+		return 1;
+	qwz_log("qwz: pm: late reset after a no-link teardown: FAILED before %s: config space reads %08x, the link dropped during the late reset: no BAR access, this attempt is failed, bus mastering and MSI stay off, the engine retries\n", step, id);
+	QWZ_CRUMB("pd:late-failed");
+	return 0;
+}
+
+static int
+qwz_pci_late_reset(struct qwz_pci_softc *psc)
+{
+	struct qwz_softc *sc = &psc->sc_sc;
+	uint64_t t0 = getnsecuptime();
+	uint32_t ee = 0xffffffff, st = 0xffffffff, mst = 0xff;
+	pcireg_t cmd;
+	int i = 0, n, resets = 0, mret, ok = 0;
+
+	QWZ_CRUMB("pd:late-reset");
+	psc->register_window = 0;			/* the window register of a chip that was never reset is unknown to the cache */
+	qwz_pci_msi_disable(sc);			/* config space only; repeated, see above */
+	if (qwz_bme)
+		qwz_pci_bme(psc, 0);
+	cmd = pci_conf_read(psc->sc_pc, psc->sc_tag, PCI_COMMAND_STATUS_REG);
+	if (cmd == 0xffffffff || (qwz_bme && (cmd & PCI_COMMAND_MASTER_ENABLE))) {
+		qwz_log("qwz: pm: late reset after a no-link teardown: FAILED before any BAR access: command/status reads %08x (the link is gone, or bus mastering cannot be cleared)\n", cmd);
+		QWZ_CRUMB("pd:late-failed");
+		return EIO;
+	}
+	qwz_late_pause(sc, "pd:late-wake");
+	if (!qwz_late_link(psc, "the force wake"))
+		return EIO;
+	qwz_pcic_ce_irq_disable_sync(sc);
+	qwz_pci_force_wake(sc);				/* the first BAR access: one posted write, then 5 ms, as the healthy power-down */
+	qwz_late_pause(sc, "pd:late-mhi");
+	if (!qwz_late_link(psc, "the MHI reset"))
+		return EIO;
+	if (qwz_late_mode == 1) {			/* H1: no BAR read while the live firmware may hold DMA back: SoC reset by posted writes alone */
+		QWZ_CRUMB("pd:late-blind");
+		qwz_pcic_write32(sc, PCIE_SOC_GLOBAL_RESET, PCIE_SOC_GLOBAL_RESET_V);	/* 0x3008 < ATH12K_PCI_WINDOW_START: a direct write, no window select, no read-back */
+		DELAY(10 * 1000);
+		qwz_pcic_write32(sc, PCIE_SOC_GLOBAL_RESET, 0);
+		DELAY(10 * 1000);			/* the cadence of qwz_pci_soc_global_reset, whose first read follows 10 ms after the deassert */
+		qwz_late_pause(sc, "pd:late-post");	/* crumb + pause: a freeze in the first read after the blind reset leaves THIS crumb last, a freeze in the writes above leaves pd:late-mhi */
+		if (!qwz_late_link(psc, "the first read after the blind reset"))
+			return EIO;
+	}
+	mret = qwz_mhi_reset_device(sc, 1);		/* MHI reset with its 24 ms wait; the verdict only goes to the log, as in the healthy power-down */
+	clear_bit(ATH12K_FLAG_DEVICE_INIT_DONE, sc->sc_flags);
+	QWZ_CRUMB("pd:late-soc");			/* no pause on purpose: the SoC reset keeps the proven 0.1 s spacing after the MHI reset (qwz_pci_sw_reset starts with a 100 ms DELAY) */
+	if (!qwz_late_link(psc, "the SoC reset"))
+		return EIO;
+	for (n = 0; n < QWZ_LATE_RESETS && !ok; n++) {
+		if (n > 0 && !qwz_late_link(psc, "the repeated SoC reset"))	/* the first one was checked above; the repeat comes 0.3 s after a reset that did not verify */
+			return EIO;
+		qwz_pci_sw_reset(sc, false);		/* DELAY 100 ms, MHI vectors, debug registers, SoC global reset, MHI reset check */
+		resets++;
+		psc->register_window = 0;		/* the reset cleared the chip's window register */
+		QWZ_CRUMB("pd:late-verify");
+		if (psc->bhi_off == 0 || psc->bhi_off >= psc->sc_mapsize) {
+			qwz_log("qwz: pm: late reset: no usable BHI offset (%u): the execution environment cannot be read, so the reset cannot be verified\n", psc->bhi_off);
+			break;
+		}
+		for (i = 0; i < QWZ_LATE_POLLS; i++) {
+			if (i > 0 && !qwz_late_link(psc, "the next verification read"))	/* M0.1 (HF-2): a config read, no BAR access: 10 ms have passed since the last completed read, so a link that dropped in that gap fails the attempt instead of meeting the next read; poll 0 follows the last read of qwz_pci_sw_reset by microseconds */
+				return EIO;
+			ee = qwz_pci_read(sc, psc->bhi_off + MHI_BHI_EXECENV);
+			st = qwz_pci_read(sc, MHI_STATUS);
+			mst = (st & MHI_STATUS_MHISTATE_MASK) >> MHI_STATUS_MHISTATE_SHFT;
+			if (ee != 0xffffffff && st != 0xffffffff && MHI_IN_PBL(ee) && (mst < MHI_STATE_M0 || mst > MHI_STATE_M3_FAST)) {
+				ok = 1;
+				break;
+			}
+			DELAY(10 * 1000);
+		}
+		if (!ok)
+			qwz_log("qwz: pm: late reset: SoC reset %d of %d did not verify (ee 0x%x mhistate 0x%x after %d reads)\n", resets, QWZ_LATE_RESETS, ee, mst, i);
+	}
+	if (!ok) {
+		qwz_log("qwz: pm: late reset after a no-link teardown: FAILED, the chip is not verified in reset (ee 0x%x mhistate 0x%x after %d SoC reset(s), MHI reset %s): this attempt is failed, bus mastering and MSI stay off, the engine retries\n",
+		    ee, mst, resets, mret == 0 ? "ok" : "not confirmed");
+		QWZ_CRUMB("pd:late-failed");
+		return EIO;
+	}
+	qwz_log("qwz: pm: late reset after a no-link teardown: ok in %llu ms (the chip is in reset: ee %u mhistate 0x%x, MHI reset %s, %d SoC reset(s)); the power-up continues, bus mastering and MSI come back after its own chip reset\n",
+	    (unsigned long long)((getnsecuptime() - t0) / 1000000ULL), ee, mst, mret == 0 ? "ok" : "not confirmed", resets);
+	qwz_pci_set_late_reset(psc, 0);			/* MS-1: the chip is verified in reset: the parked DMA blocks go back to the kernel (after the verdict line, so a stall in the release leaves the verdict in the stream and no pd:late-done) */
+	QWZ_CRUMB("pd:late-done");
+	return 0;
+}
+#endif
+
 void
 qwz_pci_power_down(struct qwz_softc *sc)
 {
 	struct qwz_pci_softc *psc = (struct qwz_pci_softc *)sc;
 	struct qwz_pci_xfer_ring *ring;
 	uint32_t state;
-	int i;
+	int i, dead = qwz_is_dead(sc), nolink = 0;	/* M0 (C11): the transient CRASH_FLUSH is NOT a reason to skip the graceful steps */
 
+	QWZ_CRUMB("pd:begin dead=%d", dead);
 	/* Restore ASPM in case firmware bootup fails. */
 	qwz_pci_aspm_restore(sc);
-
-	qwz_pcic_ce_irq_disable_sync(sc);
-	qwz_pci_force_wake(sc);
-
-	qwz_mhi_stop_channels(psc);
-	qwz_mhi_flush_mhi_event_rings(psc);
-
-	/*
-	 * Ask firmware to transition to M3 before resetting the device
-	 * so it can flush state cleanly.  Otherwise stale chip RAM from
-	 * the previous boot causes the next firmware boot to silently
-	 * drop WMI PDEV commands.
-	 */
-	state = (qwz_pci_read(sc, MHI_STATUS) & MHI_STATUS_MHISTATE_MASK) >>
-	    MHI_STATUS_MHISTATE_SHFT;
-	if (state == MHI_STATE_M0) {
-		qwz_mhi_set_state(sc, MHI_STATE_M3);
-		for (i = 0; i < 100; i++) {
-			state = (qwz_pci_read(sc, MHI_STATUS) &
-			    MHI_STATUS_MHISTATE_MASK) >>
-			    MHI_STATUS_MHISTATE_SHFT;
-			if (state == MHI_STATE_M3)
-				break;
-			DELAY(10 * 1000);
-		}
-		if (state != MHI_STATE_M3)
-			printf("%s: MHI M3 transition timeout (state=0x%x)\n",
-			    sc->sc_dev.dv_xname, state);
+#ifdef __APPLE__
+	if (psc->sc_powered_down) {			/* reset by the previous power-down; a refused power-up leaves it so (C09): no BAR access */
+		QWZ_CRUMB("pd:already-down");
+		return;
 	}
+	if (!qwz_pci_link_ok(psc, dead ? "dead power-down" : "power-down")) {
+		if (!dead)
+			qwz_declare_dead(sc, QWZ_DEAD_LINK, "link down at power-down");
+		qwz_pci_set_late_reset(psc, 1);			/* M0.1 (F1): the chip is NOT reset here; the next power-up with a live link resets it first. MS-1: set before anything is freed (the frees follow this function) and before the clear below, which cannot reach a downed link: the DMA hold parks every block qwz_free_low would free until that late reset has verified the chip */
+		if (qwz_bme)
+			qwz_pci_bme(psc, 0);			/* M0.1: first, before any DMA map is unloaded or any host memory freed (here and in qwz_core_deinit afterwards): a firmware that still runs must not DMA into it. A config write; a downed link is left alone (qwz_pci_bme) */
+		qwz_pci_msi_disable(sc);			/* config writes only */
+		nolink = 1;
+		qwz_log("qwz: pm: no-link teardown: the chip is not reset and its firmware may still run; the bus-master and MSI clears cannot reach a downed link (only the late reset verifies them), so the DMA memory freed next is parked, not freed, until the next power-up with a live link has run a late reset\n");
+		QWZ_CRUMB("pd:no-link");
+	} else if (dead) {
+		qwz_mmio_unblock(sc, "link verified at dead power-down");	/* clear site 1 of 2 (S15) */
+		psc->register_window = 0;			/* the chip may have lost its window register while the link was down: the reset sequence below must select again */
+	}
+#endif
+	if (!nolink) {					/* every BAR access of the original function lives in this block */
+		qwz_pcic_ce_irq_disable_sync(sc);
+		qwz_pci_force_wake(sc);
 
-	qwz_pci_msi_disable(sc);
+		if (!dead) {				/* a dead firmware answers none of the graceful steps: they only add waits */
+			qwz_mhi_stop_channels(psc);
+			qwz_mhi_flush_mhi_event_rings(psc);
 
-	qwz_mhi_stop(sc);
-	clear_bit(ATH12K_FLAG_DEVICE_INIT_DONE, sc->sc_flags);
-	qwz_pci_sw_reset(sc, false);
+			/*
+			 * Ask firmware to transition to M3 before resetting the device
+			 * so it can flush state cleanly.  Otherwise stale chip RAM from
+			 * the previous boot causes the next firmware boot to silently
+			 * drop WMI PDEV commands.
+			 */
+			state = (qwz_pci_read(sc, MHI_STATUS) & MHI_STATUS_MHISTATE_MASK) >>
+			    MHI_STATUS_MHISTATE_SHFT;
+			if (state == MHI_STATE_M0) {
+				qwz_mhi_set_state(sc, MHI_STATE_M3);
+				for (i = 0; i < 100; i++) {
+					state = (qwz_pci_read(sc, MHI_STATUS) &
+					    MHI_STATUS_MHISTATE_MASK) >>
+					    MHI_STATUS_MHISTATE_SHFT;
+					if (state == MHI_STATE_M3)
+						break;
+					DELAY(10 * 1000);
+				}
+				if (state != MHI_STATE_M3)
+					printf("%s: MHI M3 transition timeout (state=0x%x)\n",
+					    sc->sc_dev.dv_xname, state);
+			}
+		}
+
+		qwz_pci_msi_disable(sc);
+
+		QWZ_CRUMB("pd:mhi-reset");
+		qwz_mhi_stop(sc);
+		clear_bit(ATH12K_FLAG_DEVICE_INIT_DONE, sc->sc_flags);	/* before the reset, as in the original: it changes how qwz_pcic_write32 wakes the device */
+		QWZ_CRUMB("pd:soc-reset");
+		qwz_pci_sw_reset(sc, false);
+		QWZ_CRUMB("pd:soc-reset-done");
+		qwz_pci_set_late_reset(psc, qwz_pci_link_alive(sc) ? 0 : 1);	/* M0.1: the chip was reset here; if the link dropped meanwhile nobody can tell whether the reset took, and the next power-up resets it again, first (MS-1: and the DMA memory freed next is parked until then) */
+	} else
+		clear_bit(ATH12K_FLAG_DEVICE_INIT_DONE, sc->sc_flags);
 
 	for (i = 0; i < nitems(psc->xfer_rings); i++)
 		psc->xfer_rings[i].mhi_chan_state = MHI_CH_STATE_DISABLED;
@@ -2480,7 +2887,11 @@ qwz_pci_power_down(struct qwz_softc *sc)
 	}
 	ring->queued = 0;
 #ifdef __APPLE__
+	if ((dead || nolink) && qwz_bme)
+		qwz_pci_bme(psc, 0);			/* no DMA into memory the host frees or reuses next */
 	psc->sc_powered_down = 1;
+	qwz_mmio_block(sc, nolink ? "link down at power-down" : "chip reset");	/* re-opened only by qwz_pci_power_up (or the dead branch above) after a passed link check */
+	QWZ_CRUMB("pd:done");
 #endif
 }
 
@@ -2924,15 +3335,26 @@ qwz_mhi_start(struct qwz_pci_softc *psc)
 {
 	struct qwz_softc *sc = &psc->sc_sc;
 	uint32_t off;
+	uint32_t boff;				/* M0 (C10): a checked BHI/BHIE offset read */
 	uint32_t ee, state;
 	int ret;
 
 	qwz_mhi_init_dev_ctxt(psc);
 
-	psc->bhi_off = qwz_pci_read(sc, MHI_BHI_OFFSET);
+	boff = qwz_pci_read(sc, MHI_BHI_OFFSET);
+	if (boff == 0xffffffff || boff >= psc->sc_mapsize) {
+		qwz_log("qwz: mmio: MHI start: BHI offset reads %08x: not kept, bring-up refused\n", boff);
+		return 1;			/* qwz_pci_power_up returns it; bhi_off keeps its previous value */
+	}
+	psc->bhi_off = boff;
 	DNPRINTF(QWZ_D_MHI, "%s: BHI offset 0x%x\n", __func__, psc->bhi_off);
 
-	psc->bhie_off = qwz_pci_read(sc, MHI_BHIE_OFFSET);
+	boff = qwz_pci_read(sc, MHI_BHIE_OFFSET);	/* the BHIE clears below write at bhie_off + off */
+	if (boff == 0xffffffff || boff >= psc->sc_mapsize) {
+		qwz_log("qwz: mmio: MHI start: BHIE offset reads %08x: not kept, bring-up refused\n", boff);
+		return 1;
+	}
+	psc->bhie_off = boff;
 	DNPRINTF(QWZ_D_MHI, "%s: BHIE offset 0x%x\n", __func__, psc->bhie_off);
 
 	/* Clean BHIE RX registers */
@@ -3044,9 +3466,15 @@ qwz_mhi_reset_device(struct qwz_softc *sc, int force)
 		if (ret)
 			return ret;
 
-		if (psc->bhi_off == 0)
-			psc->bhi_off = qwz_pci_read(sc, MHI_BHI_OFFSET);
+		if (psc->bhi_off == 0) {
+			uint32_t off = qwz_pci_read(sc, MHI_BHI_OFFSET);
 
+			if (off == 0xffffffff || off >= psc->sc_mapsize) {	/* all-ones or outside the BAR: never kept */
+				qwz_log("qwz: mmio: MHI reset: BHI offset reads %08x: not kept, INTVEC not written\n", off);
+				return EIO;				/* bhi_off stays 0 */
+			}
+			psc->bhi_off = off;
+		}
 		/* Device clear BHI INTVEC so re-program it. */
 		qwz_pci_write(sc, psc->bhi_off + MHI_BHI_INTVEC, 0x00);
 	}
@@ -3236,6 +3664,8 @@ qwz_mhi_ready_state_transition(struct qwz_pci_softc *psc)
 {
 	struct qwz_softc *sc = &psc->sc_sc;
 	int ret, i;
+
+	qwz_pci_bhi_ready_note(psc);		/* M2a (WP3, I9) */
 
 	ret = qwz_mhi_await_device_reset(sc);
 	if (ret)
@@ -4057,7 +4487,10 @@ qwz_pci_intr_data_event_tx(struct qwz_pci_softc *psc, struct qwz_mhi_ring_elemen
 				qwz_qrtr_recv_msg(sc, xfer->m);
 
 				/* Reset RX mbuf instead of free/alloc */
-				KASSERT(mbuf_next(xfer->m) == NULL);
+				if (QWZ_RBAD(mbuf_next(xfer->m) != NULL)) {
+					mbuf_freem(mbuf_next(xfer->m));
+					mbuf_setnext(xfer->m, NULL);
+				}
 				mbuf_setdata(xfer->m, o_data,
 				    QWZ_PCI_XFER_MAX_DATA_SIZE);
 				M_SETLEN(xfer->m, QWZ_PCI_XFER_MAX_DATA_SIZE);
@@ -4215,6 +4648,100 @@ qwz_pci_intr_mhi_data(void *arg)
 	return 0;
 }
 
+/*
+ * M0 (C10): the interrupt handler's helpers. They sit above qwz_pci_intr
+ * (compiled as C++14: a use before the definition is an error).
+ * The BHI error words are Linux's BHI_ERRCODE/ERRDBG1..3 (drivers/bus/mhi/host/
+ * internal.h): UNVERIFIED on this board, read only after the all-ones check
+ * passed, once per episode and only when the device already reports a crash.
+ */
+#define QWZ_MHI_BHI_ERRCODE	0x30	/* UNVERIFIED: Linux bhi offsets */
+#define QWZ_MHI_BHI_ERRDBG1	0x34
+#define QWZ_MHI_BHI_ERRDBG2	0x38
+#define QWZ_MHI_BHI_ERRDBG3	0x3c
+
+/*
+ * tag: "crash" from the RDDM branch of qwz_pci_intr only (T3.3 counts one
+ * "crash: ee 3" line per RDDM episode); "syserr" from the SYS_ERR shadow note,
+ * whose first sight may precede the EE change to RDDM.
+ */
+static void
+qwz_pci_crash_snapshot(struct qwz_pci_softc *psc, uint32_t ee, uint32_t state, const char *tag)
+{
+	struct qwz_softc *sc = &psc->sc_sc;
+
+	qwz_log("qwz: %s: ee %u mhistate 0x%x mhictrl 0x%x bhistatus 0x%x err 0x%x dbg %x %x %x (fw_initialized %d, ifflags 0x%x)\n",
+	    tag, ee, state, qwz_pci_read(sc, MHI_CTRL), qwz_pci_read(sc, psc->bhi_off + MHI_BHI_STATUS),
+	    qwz_pci_read(sc, psc->bhi_off + QWZ_MHI_BHI_ERRCODE), qwz_pci_read(sc, psc->bhi_off + QWZ_MHI_BHI_ERRDBG1),
+	    qwz_pci_read(sc, psc->bhi_off + QWZ_MHI_BHI_ERRDBG2), qwz_pci_read(sc, psc->bhi_off + QWZ_MHI_BHI_ERRDBG3),
+	    sc->fw_initialized, sc->sc_ic.ic_if.if_flags);
+}
+
+/*
+ * M2a (WP3, I9): the BHI error words at MHI READY, once per power-up (every power-up, with or without AWDL: whether `cafecace` is
+ * the power-on default of this firmware is answered by the value read here, before the host loaded a firmware image in this power cycle). The BHI
+ * offset was validated by qwz_mhi_start; the reads go through the guarded qwz_pci_read (nothing is read under the MMIO block).
+ */
+void
+qwz_pci_bhi_ready_note(struct qwz_pci_softc *psc)
+{
+	struct qwz_softc *sc = &psc->sc_sc;
+	static unsigned int n;
+
+	if (!qwz_log_ratelimit(&n, 32, 8))
+		return;
+	qwz_log("qwz: bhi: ready #%u epoch %u: ee %u mhistatus 0x%x bhistatus 0x%x err 0x%x dbg %x %x %x\n", n, sc->sc_fw_epoch,
+	    qwz_pci_read(sc, psc->bhi_off + MHI_BHI_EXECENV), qwz_pci_read(sc, MHI_STATUS), qwz_pci_read(sc, psc->bhi_off + MHI_BHI_STATUS),
+	    qwz_pci_read(sc, psc->bhi_off + QWZ_MHI_BHI_ERRCODE), qwz_pci_read(sc, psc->bhi_off + QWZ_MHI_BHI_ERRDBG1),
+	    qwz_pci_read(sc, psc->bhi_off + QWZ_MHI_BHI_ERRDBG2), qwz_pci_read(sc, psc->bhi_off + QWZ_MHI_BHI_ERRDBG3));
+}
+
+static void
+qwz_pci_syserr_note(struct qwz_pci_softc *psc, uint32_t ee, uint32_t state)
+{
+	struct qwz_softc *sc = &psc->sc_sc;
+	uint64_t now = getnsecuptime();
+
+	if (psc->sc_syserr_ns == 0) {
+		psc->sc_syserr_ns = now;
+		qwz_pci_crash_snapshot(psc, ee, state, "syserr");
+	} else if (now - psc->sc_syserr_ns > SEC_TO_NSEC(1)) {
+		static unsigned int n;
+
+		if (qwz_silent >= 2 && now - psc->sc_syserr_ns > SEC_TO_NSEC(3)) {	/* armed only by silent=2 (S4) */
+			qwz_declare_dead(sc, QWZ_DEAD_SYSERR, "MHI SYS_ERR persists");
+			return;
+		}
+		if (qwz_log_ratelimit(&n, 4, 256))
+			qwz_log("qwz: crash: MHI SYS_ERR persists for %llu ms: would declare DEAD(SYS_ERR) (shadow; debug.qwz.silent=2 arms it)\n",
+			    (unsigned long long)((now - psc->sc_syserr_ns) / 1000000ULL));
+	}
+}
+
+void
+qwz_pci_cached_ee_state(struct qwz_softc *sc, uint32_t *ee, uint32_t *state)
+{
+	struct qwz_pci_softc *psc = (struct qwz_pci_softc *)sc;
+
+	if (ee != NULL)
+		*ee = psc->bhi_ee;		/* cached values only: no register read from a gated sampler or the sentinel */
+	if (state != NULL)
+		*state = psc->mhi_state;
+}
+
+void
+qwz_pci_wake_all(struct qwz_softc *sc)
+{
+	struct qwz_pci_softc *psc = (struct qwz_pci_softc *)sc;
+	int i;
+
+	wakeup(&psc->bhi_ee);
+	wakeup(&psc->mhi_state);
+	wakeup(&psc->bhie_off);
+	for (i = 0; i < nitems(psc->xfer_rings); i++)
+		wakeup(&psc->xfer_rings[i].cmd_status);
+}
+
 int
 qwz_pci_intr(void *arg)
 {
@@ -4229,21 +4756,54 @@ qwz_pci_intr(void *arg)
 	 * resets) runs as soon as the gate is released, after power_down has
 	 * reset the chip. Reading registers of the reset chip hung the whole
 	 * machine on this AMD platform, so leave it alone until power_up.
+	 * M0 (C10): the same while the MMIO block is set (a dead or vanished
+	 * chip): no register read at all.
 	 */
-	if (psc->sc_powered_down)
+	if (psc->sc_powered_down || (sc->sc_life & QWZ_LIFE_MMIO_BLOCK))
 		return 1;
 #endif
 	/*
 	 * Interrupts can trigger before mhi_start() during boot if the device
-	 * is still active after a warm reboot.
+	 * is still active after a warm reboot. M0 (C10): an all-ones read must
+	 * never become an offset.
 	 */
-	if (psc->bhi_off == 0)
-		psc->bhi_off = qwz_pci_read(sc, MHI_BHI_OFFSET);
+	if (psc->bhi_off == 0) {
+		uint32_t off = qwz_pci_read(sc, MHI_BHI_OFFSET);
+
+		if (off == 0xffffffff || off >= psc->sc_mapsize) {
+			if (++psc->sc_ones_seen >= 2)
+				qwz_declare_dead(sc, QWZ_DEAD_LINK, "all-ones BHI offset");
+			return 1;
+		}
+		psc->bhi_off = off;
+	}
 
 	ee = qwz_pci_read(sc, psc->bhi_off + MHI_BHI_EXECENV);
 	state = qwz_pci_read(sc, MHI_STATUS);
+	if (ee == 0xffffffff && state == 0xffffffff) {			/* gone, not SYS_ERR (0xff after the mask) */
+		if (++psc->sc_ones_seen >= 2)
+			qwz_declare_dead(sc, QWZ_DEAD_LINK, "all-ones MHI registers");
+		return 1;
+	}
+	psc->sc_ones_seen = 0;
 	state = (state & MHI_STATUS_MHISTATE_MASK) >>
 	    MHI_STATUS_MHISTATE_SHFT;
+	/*
+	 * Shadow note (S4): MHI SYS_ERR with an EE that is not RDDM is logged
+	 * with a snapshot at first sight and its persistence is noted; it never
+	 * changes control flow unless debug.qwz.silent=2, and debug.qwz.silent=0
+	 * switches it off (4.5). An RDDM crash is the RDDM branch's alone.
+	 * UNVERIFIED: that an RDDM crash reads MHI SYS_ERR together with EE RDDM.
+	 * If the first interrupt that sees SYS_ERR still reads another EE, the
+	 * first-sight snapshot is tagged "syserr:" (never "crash:"), so the RDDM
+	 * branch still prints the one "crash: ee 3" line of the episode (T3.3).
+	 * Only the persistence line, which needs more than 1 s of SYS_ERR with a
+	 * non-RDDM EE, is tagged "crash:".
+	 */
+	if (qwz_silent != 0 && state == MHI_STATE_SYS_ERR && ee != MHI_EE_RDDM && sc->fw_initialized && !qwz_is_dead(sc))
+		qwz_pci_syserr_note(psc, ee, state);
+	else if (state != MHI_STATE_SYS_ERR)
+		psc->sc_syserr_ns = 0;
 
 	DNPRINTF(QWZ_D_MHI,
 	    "%s: BHI interrupt with EE: 0x%x -> 0x%x state: 0x%x -> 0x%x\n",
@@ -4259,14 +4819,22 @@ qwz_pci_intr(void *arg)
 			psc->rddm_triggered = 1;
 		}
 #else
-		printf("%s: fatal firmware error\n",
-		   sc->sc_dev.dv_xname);
-		if (!test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags) &&
-		    (sc->sc_ic.ic_if.if_flags & (IFF_UP | IFF_RUNNING)) ==
-		    (IFF_UP | IFF_RUNNING)) {
-			/* Try to reset the device. */
-			set_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags);
-			task_add(systq, &sc->init_task);
+		if (qwz_dead_armed()) {
+			if (!qwz_is_dead(sc)) {				/* one report per episode */
+				qwz_pci_crash_snapshot(psc, ee, state, "crash");
+				printf("%s: fatal firmware error\n", sc->sc_dev.dv_xname);
+			}
+			qwz_declare_dead(sc, QWZ_DEAD_RDDM, "EE RDDM");	/* flags first, then the engine: Linux mhi.c:159-161 order */
+		} else {						/* debug.qwz.recover=0 or m0=0: awdldata8 behaviour, verbatim */
+			printf("%s: fatal firmware error\n",
+			   sc->sc_dev.dv_xname);
+			if (!test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags) &&
+			    (sc->sc_ic.ic_if.if_flags & (IFF_UP | IFF_RUNNING)) ==
+			    (IFF_UP | IFF_RUNNING)) {
+				/* Try to reset the device. */
+				set_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags);
+				task_add(systq, &sc->init_task);
+			}
 		}
 #endif
 		return 1;
@@ -4340,6 +4908,7 @@ qwz_pci_macos_quiesced_detach(struct qwz_softc *sc)
 	struct qwz_pci_softc *psc = (struct qwz_pci_softc *)sc;
 
 	qwz_pci_disestablish_all(psc);
+	qwz_awdl_pool_destroy(sc);	/* WP4 (M2a): the lane M maps and bounce slots go back before the softc is freed (host memory only; none unless the pool was used) */
 	free(psc, M_DEVBUF, sizeof(*psc));
 }
 
@@ -4381,6 +4950,7 @@ qwz_pci_macos_detach(struct qwz_softc *sc)
 		qwz_pci_detach(&sc->sc_dev, 0);
 	else
 		qwz_pci_disestablish_all(psc);
+	qwz_compat_set_life(NULL);		/* R1-05: ItlQwz::detachGated keeps the life word for this path; nothing may read it once the softc is freed */
 	free(psc, M_DEVBUF, sizeof(*psc));
 }
 #endif /* __APPLE__ */

@@ -35,6 +35,9 @@
 #endif
 
 #include "AirportItlwmEthernetInterface.hpp"
+/* awdl0's class is in the AWDL kext (AirportWCN7850AWDLBridge.h); this kext only calls Apple's base. */
+#include "macOS26/IO80211VirtualInterface.h"
+#include "AirportWCN7850AWDLBridge.h"
 
 enum
 {
@@ -52,8 +55,12 @@ enum
     kWakeViaRetry,
     kWakeViaStall,
     kWakeViaDeferred,
+    kWakeViaDead,		/* M0 (C15): the engine's restart after a DEAD episode */
     kWakeViaCount
 };
+
+/* M0 (C15): the engine's request bits (engineRequest); kEngRecover restarts a chip that is down after failed recoveries (debug.qwz.recover=2, C34) */
+enum { kEngDead = 1, kEngRecover = 2 };
 
 #define kWatchDogTimerPeriod 1000
 #ifdef AIRPORT_WCL
@@ -280,6 +287,7 @@ public:
     thread_call_t powerOffThreadCall;
     thread_call_t wakeRetryCall;
     thread_call_t stallCall;
+    thread_call_t deadCall, radioOffCall;	/* M0 (C15, C16): the dead-firmware engine, the Wi-Fi-off hop off the workloop thread */
     bool noWakeFix;
     bool noRadioReset;  /* -qwznoradioreset: Wi-Fi off/on only stops and starts the interface */
     bool noStallFix;  /* -qwznostallfix: no data-stall restart */
@@ -290,9 +298,47 @@ public:
      * second thread must wait for the first, never run beside it.
      */
     bool chipBusy;
-    bool chipClaim(const char *who, uint32_t maxMs);
+    /*
+     * M0 (C13, C14): who holds the chip, since when and with which limit; written by chipClaim BEFORE chipBusy is
+     * published (release store), read by the sentinel after chipBusy (acquire). sinceMs and limitMs are arguments of
+     * the claim: the power-state thread passes the time of its power change request (S19), 0 means "now"/default.
+     */
+    volatile uint64_t chipBusySince;
+    const char *volatile chipBusyWho;
+    volatile uint32_t chipBusyLimitMs;
+    volatile bool deadlineFired, chipBusyPm;	/* chipBusyPm: the clock started at the power change request (C13) */
+    volatile uint64_t pmAckStartMs;		/* time of the last setPowerState call (C13) */
+    bool chipClaim(const char *who, uint32_t maxMs, uint64_t sinceMs = 0, uint32_t limitMs = 0);
     bool chipWait(const char *who, uint32_t maxMs);
     void chipRelease();
+    /* M0 (C14): the sentinel, a gate-free timer on fWatchdogWorkLoop, independent of the adapter, never takes the gate */
+    IOTimerEventSource *sentinelTimer;
+    volatile bool sentinelStopping;	/* M0 (C14, R1-03): stopSentinel() began; sentinelFired neither ticks nor re-arms. NOT pmStopping: the sentinel keeps its deadlines while stop() waits inside quiescePM */
+    uint32_t gateBusyTicks, linkBadTicks;
+    uint64_t sentinelPubMs, sentinelHealthMs, lastEpisodeMs;
+    void sentinelTick();
+    void stopSentinel();
+    static void sentinelFired(OSObject *owner, IOTimerEventSource *sender);
+    /* M0 (C15): the dead-firmware engine v0 (single flight by engineBusy, limiter, GIVEN_UP, re-arm) */
+    volatile uint32_t engineReq, engineReason;
+    uint32_t engReason;			/* reason of the first attempt of the open episode: retries reuse it (the DEAD flag is clear by then) */
+    bool engineBusy, engGivenUp, engDeferred;
+    uint32_t engFailCont, engEpisodes;
+    unsigned int engAbsorbed, engChipBusy, engClosed;	/* rate limiters of the single-flight logs (engClosed: the "recovered by" line, M2a WP0) */
+    uint64_t engCooldownMs, engLastOkMs, engBeginMs;
+    void engineRequest(uint32_t bits, uint32_t reason);
+    void engineRun();
+    void engineNoteFailure(const char *why);
+    void engineGiveUp(const char *why);
+    void engineRearm(const char *who);
+    void scheduleEngine(uint32_t ms);
+    static void faultCb(void *arg, uint32_t reason);
+    static IOReturn engineGated(OSObject *owner, void *, void *, void *, void *);
+    /* M0 (C16): setPOWER(0) on the workloop thread queues disableAdapter on a thread that may sleep */
+    void scheduleRadioOff();
+    static IOReturn radioOffDisableGated(OSObject *owner, void *, void *, void *, void *);
+    /* M0 (C34): debug.qwz.state, recover=2, health=1 (qwz_sysctl_m0_fn) */
+    static int m0Sysctl(void *arg, int what, int val, char *buf, size_t len);
     const char *wakeLabel;  /* what the next recovery is called in the log */
     bool chipIsDown;  /* a chip power-down completed and no recovery has started since */
     bool chipUsed;  /* the interface was enabled since the firmware was last (re)started */
@@ -302,6 +348,7 @@ public:
     int wakeRetryVia;  /* what the queued thread call runs the recovery as */
     bool chipDown(const char *why, const char *wakeName, uint32_t maxWaitMs, uint64_t budgetStartMs);
     bool wakeRecover(int via);
+    void wakeCloseEpisode(int via, uint64_t chipMs);	/* M2a WP0: a chip-up other than the engine's succeeded: closes the open recovery episode */
     bool wakeAllowed();
     bool onWorkLoopThread();
     bool pmReady();
@@ -341,7 +388,167 @@ public:
     uint32_t btcMode;
     uint32_t btcOptions;
     bool awdlSyncEnable;
-    
+
+    /*
+     * awdl0 (debug.qwz.awdl=1, discovery build): the IO80211AWDLProtocol
+     * object Tahoe's AWDL engine drives, and its BSD interface. Created once,
+     * on request, never torn down before a reboot.
+     */
+    int awdlCreate();
+    static int awdlSysctl(void *arg, int value);
+    static IOReturn awdlLinkGated(OSObject *target, void *arg0, void *, void *, void *);
+    /* AWDL action frames from qwz (ItlQwz::setAwdlRx) into the AWDL engine, while awdl0's link is up. */
+    static void awdlRx(void *arg, const uint8_t *frame, size_t len, int rssi, uint32_t freq,
+                       uint32_t chan, uint32_t rate);
+    static IOReturn awdlRxGated(OSObject *target, void *arg0, void *, void *, void *);
+    bool awdlLinkUp;
+    uint32_t awdlRxDelivered;
+    uint32_t awdlRxDropped;
+    /*
+     * AWDL frames from the AWDL engine (the bridge's tx): queued on any thread,
+     * sent from the workloop by awdlTxTimer; the latest OOB auto request is
+     * resent every 125 ms.
+     */
+    static int awdlTxEnqueue(void *ctx, const uint8_t *frame, size_t len, int repeat);
+    static void awdlTxTimerFired(OSObject *owner, IOTimerEventSource *sender);
+    void awdlTxSend(uint8_t *frame, size_t len);
+    struct AwdlTxQueue *awdlTxq;
+    IOLock *awdlTxLock;
+    IOTimerEventSource *awdlTxTimer;
+    bool awdlTxStopped;		/* stop() ran: the engine may still call, nothing is sent */
+    /*
+     * The AW clock: APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START/_EXTENSIONS_END
+     * to the engine every availability window, aligned to the master's sync
+     * parameters while we follow one (awdlRxGated), free-running as master.
+     */
+    static void awdlMaster(void *ctx, const uint8_t *master, int self);
+    static void awdlChannelSequence(void *ctx, const uint32_t *channels, const uint32_t *flags);
+    /* awdl0's data path: the engine's cached peers get firmware peers; data frames with the AWDL BSSID become awdl0 packets. */
+    static int awdlPeerCb(void *ctx, const uint8_t *mac, int add);
+    /*
+     * The engine calls the peer hook holding its lock; the firmware peer
+     * needs the driver's gate, which the AW timer holds while posting into
+     * the engine. So the hook only queues, and this thread call creates.
+     */
+    static void awdlPeerCallFired(thread_call_param_t p0, thread_call_param_t p1);
+    thread_call_t awdlPeerCall;
+    uint8_t awdlPeerSeen[8][6];	/* senders of AWDL frames given a firmware peer */
+    int awdlPeersSeen;
+    uint32_t awdlPeerGen;	/* M2a WP2: ItlQwz::awdlPeerGeneration() that the list above belongs to */
+    uint32_t awdlPeerOps[4];	/* M2a WP2: setPEER_CACHE_CONTROL ops that reached awdlPeerCb: add, update, delete, other (counted with the switch off too) */
+    uint8_t awdlPeerQueue[8][6];
+    uint32_t awdlPeerQHead, awdlPeerQTail;
+    static void awdlDataRx(void *arg, const uint8_t *frame, size_t len, int rssi);
+    uint8_t awdlMac[6];		/* awdl0's address: the listen vdev's */
+    uint32_t awdlDataRxCount;
+    uint32_t awdlDataTxCount;
+    uint32_t awdlDataTxFail;
+    uint16_t awdlDataSeq;
+    uint32_t awdlAwChan[16];	/* the engine's channel sequence: what each AW start reports */
+    uint32_t awdlAwChanFlags[16];
+    static void awdlAwTimerFired(OSObject *owner, IOTimerEventSource *sender);
+    void awdlAwFollow(const uint8_t *frame, size_t len, uint64_t rxNs);
+    void awdlAwStart(bool on);
+    IOTimerEventSource *awdlAwTimer;
+    bool awdlAwOn;
+    bool awdlAwInWindow;	/* the next timer event is the window's end */
+    bool awdlAwSelfMaster;
+    uint8_t awdlAwMaster[6];
+    uint32_t awdlAwSeq;		/* the next window's sequence number */
+    uint64_t awdlAwNextNs;	/* when it starts */
+    uint64_t awdlAwStartUs;	/* the last start's firmware time (host us) */
+    uint64_t awdlAwPeriodNs;
+    uint32_t awdlAwStarts;
+    uint32_t awdlAwResyncs;
+    /* A peer's sync parameters (type 4) and channel sequence (0x12) TLVs, whole, inserted into our frames. */
+    uint8_t awdlSyncTlv[192];
+    uint16_t awdlSyncTlvLen;
+    uint8_t awdlChanTlv[192];
+    uint16_t awdlChanTlvLen;
+    uint32_t awdlTxTlvLogged;
+    uint32_t awdlRxTlvLogged;
+    uint32_t awdlSyncLogged;
+    uint32_t awdlTxSent;
+    uint32_t awdlTxFailed;
+    uint32_t awdlTxDropped;
+
+    /*
+     * M2a WP5 (truthful sync, docs/research-airdrop-2026-11-06.md 3.5 Y1 to Y3). Idle with debug.qwz.awdltruth and
+     * debug.qwz.awdlclk at 0 (the setters are stored either way).
+     */
+    struct AwdlSetters {		/* the engine's sync setters, from the AWDL kext (bridge tx, repeat 4) */
+        uint32_t valid;			/* bit 0 SYNC_PARAMS, 1 EXTENSION_STATE_MACHINE_PARAMETERS, 2 MASTER_CHANNEL, 3 PRESENCE_MODE, 4 SECONDARY_MASTER_CHANNEL, 5 AF_TX_MODE */
+        uint32_t awLen, awPeriod, extLen, afPeriod;	/* setAWDL_SYNC_PARAMS */
+        uint32_t extCnt[4];		/* setAWDL_EXTENSION_STATE_MACHINE_PARAMETERS */
+        uint32_t masterChan, presence, secChan, afTxMode;
+    } awdlSet;				/* guarded by awdlTxLock */
+    /* awdlAfTxMode (setAWDL_AF_TX_MODE as the engine last set it) and awdlAfSuppressed() are WP4's members (further down, with the gate's); awdlSetterIn case 46 stores into them */
+    uint8_t awdlMasterSeq[38];		/* awdltruth 3: the followed master's channel sequence structure */
+    uint8_t awdlMasterSeqMac[6];	/* the master it was heard from: it counts only while that is still the master the engine follows */
+    uint8_t awdlMasterSeqLen;		/* 0: none */
+    uint64_t awdlMasterSeqNs;		/* when it was last heard */
+    uint8_t awdlBestMac[6];		/* awdlclk 2: the clock reference while the engine says we are master */
+    bool awdlBestRoot;
+    uint64_t awdlBestNs, awdlClkAlignNs;
+    uint32_t awdlAwPosted;		/* the last AW start sequence number posted to the engine */
+    uint32_t awdlTruthHash;		/* the hash of the static part of the TLVs last logged */
+    uint32_t awdlTruthBuilt, awdlTruthRefused, awdlRealigns, awdlTxFollower;
+    unsigned int awdlTruthLog, awdlTruthRefuseLog, awdlTruthTplLog, awdlRealignLog, awdlWrapLog, awdlFollowerLog, awdlSetLog, awdlRefLog, awdlCfgLog, awdlClkSampleLog;
+    int awdlCfgTruth, awdlCfgClk;	/* the switches as awdlTxSend last saw them */
+    uint32_t awdlClkSample;		/* clock sample lines still to log after a switch change */
+    int awdlSetterIn(const uint8_t *rec, size_t len);
+    bool awdlTruthBuild(uint8_t *out, size_t outSize, const uint8_t *frame, size_t len, uint64_t ns, size_t *outLen);
+    bool awdlTruthRefuse(const char *why);
+    const char *awdlSyncNote(const uint8_t *frame, size_t len, uint64_t rxNs);
+    uint32_t awdlTxCounterTu(uint64_t ns);
+    uint32_t awdlPhyDelayUs();
+    IO80211VirtualInterface *awdlIf;	/* an AirportWCN7850AWDLInterface, from the AWDL kext */
+    AirportItlwmEthernetInterface *awdlBsd;
+    bool creatingAwdlBsd;	/* createInterface()/configureInterface() are for awdl0 */
+    bool awdlTried;
+    uint32_t awdlDropped;	/* packets the stack queued on awdl0: no AWDL data path yet */
+    /*
+     * WP4 (M2a): awdl0's data lane: pacing (debug.qwz.awdlhyg), the gate and the requeue (debug.qwz.awdlgate). The gate's state is
+     * touched only inside the command gate; awdlLaneHasRoom and awdlGateSubmit run on awdl0's output thread.
+     */
+    struct AwdlGate *awdlGate;
+    IOTimerEventSource *awdlGateTimer;
+    uint64_t awdlGateAtNs;			/* when the pending gate run is due; 0: none */
+    volatile uint32_t awdlOutBlocked;		/* outputStart stopped for lack of room: the next completion starts the output thread again */
+    bool awdlGateStopped;			/* stop() ran */
+    bool awdlGateOn() const { return qwz_awdlgate != 0 && qwz_awdlprobe == 1 && awdlGate != NULL && awdlGateTimer != NULL && !awdlGateStopped; }
+    bool awdlPaced() const { return qwz_awdlhyg != 0 || qwz_awdlgate != 0; }
+    static void awdlTxDone(void *arg, const struct qwz_awdl_txdone *d);	/* ItlQwz::setAwdlTxDone: a lane M completion */
+    static void awdlGateTimerFired(OSObject *owner, IOTimerEventSource *sender);
+    static IOReturn awdlGateSubmitGated(OSObject *target, void *arg0, void *, void *, void *);
+    static IOReturn awdlGateObserveGated(OSObject *target, void *arg0, void *, void *, void *);
+    int awdlGateSubmit(const uint8_t *frame, size_t len);
+    int awdlGateEnqueue(const uint8_t *frame, size_t len);
+    void awdlGateRun();
+    bool awdlGateSync(struct qwz_awdl_lane *li);
+    bool awdlGateEligible(struct AwdlGEntry *e, uint64_t ns, int *why);
+    int awdlGateRelease(struct AwdlGEntry *e, uint64_t ns, int why);
+    void awdlGateRequeue(struct AwdlGEntry *e, uint64_t ns);
+    void awdlGateDrop(struct AwdlGEntry *e, uint32_t *counter, const char *why);
+    void awdlGateFlush(const char *why);
+    struct AwdlGPeer *awdlGatePeer(const uint8_t *mac, bool create);
+    void awdlGateObserve(const uint8_t *frame, size_t len, uint64_t ns);
+    void awdlGateArm(uint64_t atNs);
+    void awdlGateLink(bool up);
+    void awdlGateLog();
+    bool awdlLaneHasRoom();
+    void awdlKickOutput();
+    bool awdlSlotAt(uint64_t ns, uint32_t *slot, uint64_t *phaseNs);
+    bool awdlServedSlot(uint32_t slot);
+    /*
+     * awdlgate 2 and AF_TX_MODE: the engine's setAWDL_AF_TX_MODE (3 suppress action frames, 0 allow). WP5 stores the value (awdlSetterIn, case 46);
+     * WP4 consumes it in awdlTxSend. Without WP5 nothing stores it, it stays 0 and nothing is held back.
+     */
+    volatile uint32_t awdlAfTxMode;
+    bool awdlAfSuppressed() const { return awdlAfTxMode == 3; }
+    uint32_t awdlAfHeld;			/* engine action frames not sent because of it */
+    uint32_t awdlAfLog;
+
     CCPipe *driverLogPipe;
     CCPipe *driverDataPathPipe;
     CCPipe *driverSnapshotsPipe;

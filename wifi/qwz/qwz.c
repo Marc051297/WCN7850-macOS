@@ -93,6 +93,7 @@ hweight8(uint8_t x)
 
 #include "qwzreg.h"
 #include "qwzvar.h"
+#include "qwz_awdlx.h"	/* M2a (WP3): the AWDL evidence layer, log only */
 
 #ifdef QWZ_DEBUG
 uint32_t	qwz_debug = 0
@@ -254,7 +255,8 @@ qwz_free_peers(struct qwz_softc *sc)
 		free(peer, M_DEVBUF, sizeof(*peer));
 		sc->num_peers--;
 	}
-	KASSERT(sc->num_peers == 0);
+	if (QWZ_RBAD(sc->num_peers != 0))
+		sc->num_peers = 0;
 }
 
 #ifdef __APPLE__
@@ -322,6 +324,18 @@ qwz_init(struct ifnet *ifp)
 	struct ieee80211com *ic = &sc->sc_ic;
 	int s = splnet();
 
+	/*
+	 * M0 (C06): after a crash the firmware is DEAD but the host still
+	 * believes it runs. Tear the host side down first, so a plain
+	 * interface-up performs a real restart and not the re-scan-only branch
+	 * below, and so the vdev-recreate block (a firmware conversation) is
+	 * never entered against a dead firmware.
+	 */
+	if (sc->fw_initialized && qwz_is_dead(sc)) {
+		qwz_log("qwz: life: init with a DEAD firmware: host-only core deinit, then the full init\n");
+		qwz_core_deinit(sc);
+	}
+
 #ifdef __APPLE__
 	/*
 	 * macOS may change the interface address (private Wi-Fi address per
@@ -350,7 +364,7 @@ qwz_init(struct ifnet *ifp)
 #endif
 	/* Firmware stays running across ifconfig down/up; only re-scan. */
 	if (sc->fw_initialized) {
-		if (!TAILQ_EMPTY(&sc->peers) || sc->num_started_vdevs > 0) {
+		if (qwz_peer_find_bss(sc, &sc->sc_vif, NULL) != NULL || sc->sc_vif.is_started) {	/* M0 (C06): the infra vdev only */
 			error = qwz_deauth(sc);
 			if (error) {
 				splx(s);
@@ -473,6 +487,8 @@ full_init:
 		qwz_log("qwz: pm: hal ring pointers reset for the restart\n");
 	}
 	sc->fw_started = 1;
+	qwz_clear_dead(sc, "full init, HAL rings rebuilt");	/* M0 (C06): the ONE place DEAD is cleared (also at the very first init) */
+	QWZ_CRUMB("init:full");
 #endif
 	error = qwz_core_init(sc);
 	if (error) {
@@ -500,6 +516,7 @@ full_init:
 	if (error)
 		goto fail;
 	core_ready = 1;
+	QWZ_CRUMB("init:qmi-done");
 
 	if (sc->attached) {
 		/* Update MAC in case the upper layers changed it. */
@@ -536,6 +553,7 @@ full_init:
 #endif
 
 	if (ifp->if_flags & IFF_UP) {
+		QWZ_CRUMB("init:mac-start");
 		error = qwz_mac_start(sc);
 		if (error)
 			goto fail;
@@ -548,6 +566,7 @@ full_init:
 		ieee80211_begin_scan(ifp);
 	}
 
+	QWZ_CRUMB("init:done");
 	sc->fw_initialized = 1;
 	splx(s);
 	return 0;
@@ -563,7 +582,7 @@ qwz_add_task(struct qwz_softc *sc, struct taskq *taskq, struct task *task)
 {
 	int s = splnet();
 
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags)) {
+	if (QWZ_CRASHED(sc)) {
 		splx(s);
 		return;
 	}
@@ -589,10 +608,14 @@ qwz_stop(struct ifnet *ifp)
 	int s = splnet();
 
 	rw_assert_wrlock(&sc->ioctl_rwl);
+	QWZ_CRUMB("stop:begin");
 
 	timeout_del(&sc->mon_reap_timer);
 
 	/* Disallow new tasks. */
+	/* M0 (C28): who raises the transient flag, from which thread, with how many tasks outstanding */
+	qwz_log("qwz: flag: qwz_stop sets CRASH_FLUSH (ic_state %s, task_refs %d, thread %llx)\n", ieee80211_state_name[ic->ic_state],
+	    (int)sc->task_refs.r_refs, (unsigned long long)thread_tid(current_thread()));
 	set_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags);
 
 	/* Cancel scheduled tasks and let any stale tasks finish up. */
@@ -611,6 +634,18 @@ qwz_stop(struct ifnet *ifp)
 
 	clear_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags);
 
+	/*
+	 * M0 (C06): a DEAD firmware answers no scan abort, no vdev stop and no
+	 * peer delete: each would only add a timeout. The host-only teardown
+	 * happens in qwz_core_deinit. DEAD is untouched by the clear above.
+	 */
+	if (qwz_is_dead(sc)) {
+		qwz_log("qwz: stop: firmware DEAD (%s): scan abort, run stop and deauth skipped, host-only teardown follows\n",
+		    qwz_dead_names[sc->sc_dead_reason < QWZ_DEAD_MAX ? sc->sc_dead_reason : 0]);
+		sc->sc_vif.is_up = 0;
+		goto stopped;
+	}
+
 	if (sc->scan.state != ATH12K_SCAN_IDLE)
 		qwz_scan_abort(sc);
 
@@ -619,10 +654,11 @@ qwz_stop(struct ifnet *ifp)
 		if (ic->ic_state == IEEE80211_S_RUN)
 			qwz_run_stop(sc);
 		if (ic->ic_state >= IEEE80211_S_AUTH ||
-		    sc->num_started_vdevs > 0 || !TAILQ_EMPTY(&sc->peers))
+		    sc->sc_vif.is_started || qwz_peer_find_bss(sc, &sc->sc_vif, NULL) != NULL)	/* M0 (C06): the infra vdev only */
 			qwz_deauth(sc);
 	}
 
+stopped:
 	sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
 	sc->ns_nstate = IEEE80211_S_INIT;
 	sc->scan.state = ATH12K_SCAN_IDLE;
@@ -644,6 +680,7 @@ qwz_stop(struct ifnet *ifp)
 	if (ic->ic_event_handler)
 		ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_STOPPED, NULL);
 #endif
+	QWZ_CRUMB("stop:done");
 	splx(s);
 }
 
@@ -845,8 +882,10 @@ qwz_watchdog(struct ifnet *ifp)
 	if (sc->sc_tx_timer > 0) {
 		if (--sc->sc_tx_timer == 0) {
 			printf("%s: device timeout\n", sc->sc_dev.dv_xname);
-			if (!test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags))
+			if (!QWZ_CRASHED(sc)) {
+				qwz_log("qwz: runexit: init_task queued by qwz_watchdog (device timeout)\n");
 				task_add(systq, &sc->init_task);
+			}
 			ifp->if_oerrors++;
 			return;
 		}
@@ -1056,7 +1095,7 @@ qwz_add_sta_key(struct qwz_softc *sc, struct ieee80211_node *ni,
 		return ret;
 	}
 
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags) ||
+	if (QWZ_CRASHED(sc) ||
 	    (ic->ic_if.if_flags & IFF_RUNNING) == 0 ||
 	    ic->ic_state != IEEE80211_S_RUN ||
 	    sc->ns_nstate != IEEE80211_S_RUN)
@@ -1086,7 +1125,7 @@ qwz_add_sta_key(struct qwz_softc *sc, struct ieee80211_node *ni,
 			return ret;
 		}
 
-		if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags) ||
+		if (QWZ_CRASHED(sc) ||
 		    (ic->ic_if.if_flags & IFF_RUNNING) == 0 ||
 		    ic->ic_state != IEEE80211_S_RUN ||
 		    sc->ns_nstate != IEEE80211_S_RUN)
@@ -1115,7 +1154,7 @@ qwz_del_sta_key(struct qwz_softc *sc, struct ieee80211_node *ni,
 		return ret;
 	}
 
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags) ||
+	if (QWZ_CRASHED(sc) ||
 	    (ic->ic_if.if_flags & IFF_RUNNING) == 0 ||
 	    ic->ic_state != IEEE80211_S_RUN ||
 	    sc->ns_nstate != IEEE80211_S_RUN)
@@ -1146,7 +1185,7 @@ qwz_setkey_task(void *arg)
 	int err = 0, s = splnet();
 
 	while (sc->setkey_nkeys > 0) {
-		if (err || test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags))
+		if (err || QWZ_CRASHED(sc))
 			break;
 		a = sc->setkey_arg[sc->setkey_tail];
 		memset(&sc->setkey_arg[sc->setkey_tail], 0,
@@ -1261,6 +1300,13 @@ qwz_bss_rssi_sample(struct qwz_softc *sc, const uint8_t *ta, int rssi_dbm)
 static const uint8_t qwz_awdl_bssid[IEEE80211_ADDR_LEN] =
     { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
 
+/* awdl0's side of the data path, defined with the AWDL tests below. */
+static int qwz_awdl_is_our_addr(struct qwz_softc *, const uint8_t *);
+static int qwz_awdl_is_peer(struct qwz_softc *, const uint8_t *);
+static void qwz_awdl_rx_err_note(struct qwz_softc *, struct qwz_rx_msdu *);
+static void qwz_awdl_tx_done_note(struct qwz_softc *, struct qwz_tx_data *,
+    struct hal_tx_status *);
+
 /*
  * Once a minute: the probe's totals and the RSSI views, in one ring line. Zero
  * AWDL counters next to non-zero "seen" counters mean the probe ran and the
@@ -1301,7 +1347,7 @@ qwz_rx_probe_summary(struct qwz_softc *sc)
  */
 static void
 qwz_rx_observe_mgmt(struct qwz_softc *sc, struct mbuf *m, int rssi,
-    uint32_t freq, uint32_t chan)
+    uint32_t freq, uint32_t chan, uint32_t rate)
 {
 	const struct ieee80211_frame *wh = mtod(m, const struct ieee80211_frame *);
 	const uint8_t *f = (const uint8_t *)wh;
@@ -1320,10 +1366,34 @@ qwz_rx_observe_mgmt(struct qwz_softc *sc, struct mbuf *m, int rssi,
 	    len >= sizeof(*wh) + 4 && f[24] == IEEE80211_CATEG_VENDOR &&
 	    f[25] == 0x00 && f[26] == 0x17 && f[27] == 0xf2;
 	a3 = IEEE80211_ADDR_EQ(wh->i_addr3, qwz_awdl_bssid);
+	if (!action && !a3)		/* M0 (C23): what the data-stall detector reads: AWDL frames do not show that the infra firmware is alive */
+		sc->sc_stall_mgmt_seen++;
+	if (sc->sc_ic.ic_bss == NULL ||
+	    !IEEE80211_ADDR_EQ(wh->i_addr2, sc->sc_ic.ic_bss->ni_bssid)) {
+		/* Not from our AP: what a promiscuous listen changes, AWDL or not. */
+		if (subtype == IEEE80211_FC0_SUBTYPE_BEACON ||
+		    subtype == IEEE80211_FC0_SUBTYPE_PROBE_RESP)
+			sc->sc_probe_foreign_bcn++;
+		else
+			sc->sc_probe_foreign_other++;
+	}
 	if (action)
 		sc->sc_awdl_mgmt_action++;
 	if (a3)
 		sc->sc_awdl_mgmt_bssid++;
+	if (action && sc->sc_awdl_listening)	/* M2a (WP3, I3): the receive split, the peer table and the slot tag; counters and ring lines only, while the listen vdev is joined */
+		qwz_awdlx_rx_mgmt(f, len, rssi, qwz_awdl_is_our_addr(sc, wh->i_addr1));
+	/* OUI type 8 = AWDL: to awdl0's AWDL engine, as Broadcom's handleActionFrame_rx. */
+	if (action && sc->sc_awdl_rx != NULL && len >= sizeof(*wh) + 8 &&
+	    f[28] == 0x08)
+		sc->sc_awdl_rx(sc->sc_awdl_rx_arg, f, len, rssi, freq, chan, rate);
+	if (action && sc->sc_awdltest_capture && len >= 40 &&
+	    len <= sizeof(sc->sc_awdltest_tmpl) && f[28] == 0x08 && f[30] == 0x00) {
+		/* debug.qwz.awdltest=5: a peer's synchronization frame (PSF) as the TX template. */
+		memcpy(sc->sc_awdltest_tmpl, f, len);
+		sc->sc_awdltest_tmpl_len = (uint16_t)len;
+		sc->sc_awdltest_capture = 0;
+	}
 	if ((action || a3) &&
 	    qwz_log_ratelimit(&sc->sc_awdl_log_mgmt, 24, 64)) {
 		/* After the OUI: OUI type (8 = AWDL), version, subtype (0 PSF, 3 MIF). */
@@ -1363,6 +1433,8 @@ qwz_rx_observe_data(struct qwz_softc *sc, struct qwz_rx_msdu *msdu)
 	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA)
 		return;
 	sc->sc_probe_data_seen++;
+	if (!IEEE80211_ADDR_EQ(wh->i_addr3, qwz_awdl_bssid))	/* M0 (C23): an AWDL data MSDU does not show that the infra data path works */
+		sc->sc_stall_data_seen++;
 	if (fresh && (wh->i_fc[1] & IEEE80211_FC1_DIR_MASK) ==
 	    IEEE80211_FC1_DIR_FROMDS)
 		qwz_bss_rssi_sample(sc, wh->i_addr2, msdu->rxi.rxi_rssi);
@@ -1380,14 +1452,41 @@ qwz_rx_observe_data(struct qwz_softc *sc, struct qwz_rx_msdu *msdu)
 	}
 }
 
+/*
+ * M0 (C28): who ended the association. net80211 passes the cause in the arg
+ * of the state change: 0xc0 deauthentication received, 0xa0 disassociation
+ * received, -1 local (leave, timer, probe failure). Logged once, where the
+ * state change reaches the driver, with the RUN duration (sc_runup_ns is set
+ * when the state task reaches RUN and cleared here). Log-only.
+ */
+static void
+qwz_runexit_note(struct qwz_softc *sc, int nstate, int arg)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+
+	qwz_log("qwz: runexit: RUN -> %s requested (arg 0x%x: %s) after %llu ms in RUN; deauth reason %u; bss " QWZ_MACFMT
+	    " rssi %d; dead %d; fwev %u; awdl listening %d quiesce %d probe %d; txmgmt q %d; tcl0 q %d\n",
+	    ieee80211_state_name[nstate], arg & 0xff,
+	    arg == IEEE80211_FC0_SUBTYPE_DEAUTH ? "deauth received" : arg == IEEE80211_FC0_SUBTYPE_DISASSOC ? "disassoc received" :
+	    arg == -1 ? "local" : "other",
+	    sc->sc_runup_ns ? (unsigned long long)((getnsecuptime() - sc->sc_runup_ns) / 1000000ULL) : 0ULL, ic->ic_deauth_reason,
+	    QWZ_MACARG(ic->ic_bss ? ic->ic_bss->ni_bssid : (const uint8_t *)"\0\0\0\0\0\0"), ic->ic_bss ? (int8_t)ic->ic_bss->ni_rssi : 0,
+	    qwz_is_dead(sc), sc->sc_fw_rx_events, sc->sc_awdl_listening, sc->sc_awdl_quiesce, qwz_awdlprobe,
+	    sc->sc_vif.txmgmt.queued, sc->dp.tx_ring[0].queued);
+	sc->sc_runup_ns = 0;
+}
+
 int
 qwz_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 {
 	struct ifnet *ifp = &ic->ic_if;
 	struct qwz_softc *sc = (struct qwz_softc *)(ifp->if_softc);
 
+	if (ic->ic_state == IEEE80211_S_RUN && nstate != IEEE80211_S_RUN)
+		qwz_runexit_note(sc, nstate, arg);
+
 	/* We may get triggered by received frames during qwz_stop(). */
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags) ||
+	if (QWZ_CRASHED(sc) ||
 	    !(ifp->if_flags & IFF_RUNNING))
 		return 0;
 
@@ -1427,7 +1526,7 @@ qwz_newstate_task(void *arg)
 	enum ieee80211_state ostate = ic->ic_state;
 	int err = 0, s = splnet();
 
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags)) {
+	if (QWZ_CRASHED(sc)) {
 		/* qwz_stop() is waiting for us. */
 		refcnt_rele_wake(&sc->task_refs);
 		splx(s);
@@ -1477,7 +1576,7 @@ qwz_newstate_task(void *arg)
 		}
 
 		/* Die now if qwz_stop() was called while we were sleeping. */
-		if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags)) {
+		if (QWZ_CRASHED(sc)) {
 			refcnt_rele_wake(&sc->task_refs);
 			splx(s);
 			return;
@@ -1523,12 +1622,17 @@ next_scan:
 		break;
 	}
 out:
-	if (!test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags) &&
+	if (!QWZ_CRASHED(sc) &&
 	    (ifp->if_flags & IFF_RUNNING)) {
-		if (err)
+		if (err) {
+			qwz_log("qwz: runexit: state task %s -> %s failed (%d): init_task queued\n", ieee80211_state_name[ostate],
+			    ieee80211_state_name[nstate], err);
 			task_add(systq, &sc->init_task);
-		else
+		} else {
+			if (nstate == IEEE80211_S_RUN)
+				sc->sc_runup_ns = getnsecuptime();
 			sc->sc_newstate(ic, nstate, sc->ns_arg);
+		}
 	}
 	refcnt_rele_wake(&sc->task_refs);
 	splx(s);
@@ -7179,8 +7283,11 @@ qwz_core_fetch_bdf(struct qwz_softc *sc, const u_char **boardfw,
 	ret = qwz_core_fetch_board_data_api_n(sc, boardfw, boardfw_len,
 	    data, len, boardname, ATH12K_BD_IE_BOARD,
 	    ATH12K_BD_IE_BOARD_NAME, ATH12K_BD_IE_BOARD_DATA);
-	if (!ret)
+	if (!ret) {
+		/* M0 (C29): which board-2.bin entry this firmware was given (the DPRINTF failure paths below leave no trace today) */
+		qwz_log("qwz: dossier: board '%s' -> exact, %zu bytes\n", boardname, *boardfw_len);
 		return 0;
+	}
 
 	ret = qwz_core_create_fallback_board_name(sc, fallback_boardname,
 	    sizeof(fallback_boardname));
@@ -7193,11 +7300,14 @@ qwz_core_fetch_bdf(struct qwz_softc *sc, const u_char **boardfw,
 	ret = qwz_core_fetch_board_data_api_n(sc, boardfw, boardfw_len,
 	    data, len, fallback_boardname, ATH12K_BD_IE_BOARD,
 	    ATH12K_BD_IE_BOARD_NAME, ATH12K_BD_IE_BOARD_DATA);
-	if (!ret)
+	if (!ret) {
+		qwz_log("qwz: dossier: board '%s' -> fallback, %zu bytes (exact name '%s' not found)\n", fallback_boardname, *boardfw_len, boardname);
 		return 0;
+	}
 
 	DPRINTF("%s: failed to fetch board data for %s from %s\n",
 	    sc->sc_dev.dv_xname, boardname, ATH12K_BOARD_API2_FILE);
+	qwz_log("qwz: dossier: board '%s' -> none, 0 bytes (fallback '%s' not found either)\n", boardname, fallback_boardname);
 	return ret;
 }
 
@@ -9906,6 +10016,19 @@ qwz_wmi_tlv_services_parser(struct qwz_softc *sc, uint16_t tag, uint16_t len,
 	return 0;
 }
 
+/*
+ * WP4 (M2a), F3: the completion of WMI_OFFCHAN_DATA_TX_SEND (tag WMI_TAG_OFFCHAN_DATA_TX_COMPL_EVENT, 0x282): no ack_rssi, no rate.
+ * fix2 (memory-R2-3): the layout is not in any source this tree has (ath11k's wmi.h has the event id and the tag but no structure). The
+ * parse below therefore requires only the three words every completion has (desc_id, status, pdev_id) and reads ppdu_id when the TLV
+ * carries it: with a 16-byte minimum, a 12-byte TLV would be rejected whole and its pool slot would never complete.
+ */
+struct qwz_offchan_data_tx_compl_event {
+	uint32_t desc_id;
+	uint32_t status;
+	uint32_t pdev_id;
+	uint32_t ppdu_id;
+} __packed;
+void	qwz_offchan_data_tx_compl_event(struct qwz_softc *, struct mbuf *);	/* defined with the lane M pool at the end of this file */
 static const struct wmi_tlv_policy wmi_tlv_policies[] = {
 	[WMI_TAG_ARRAY_BYTE]
 		= { .min_len = 0 },
@@ -9935,6 +10058,8 @@ static const struct wmi_tlv_policy wmi_tlv_policies[] = {
 		= { .min_len = sizeof(struct wmi_mgmt_rx_hdr) },
 	[WMI_TAG_MGMT_TX_COMPL_EVENT]
 		= { .min_len = sizeof(struct wmi_mgmt_tx_compl_event) },
+	[WMI_TAG_OFFCHAN_DATA_TX_COMPL_EVENT]
+		= { .min_len = 3 * sizeof(uint32_t) },	/* desc_id, status, pdev_id: ppdu_id is read only if the TLV has it (fix2, memory-R2-3) */
 	[WMI_TAG_SCAN_EVENT]
 		= { .min_len = sizeof(struct wmi_scan_event) },
 	[WMI_TAG_PEER_STA_KICKOUT_EVENT]
@@ -11088,6 +11213,9 @@ qwz_vdev_stopped_event(struct qwz_softc *sc, struct mbuf *m)
 		return;
 	}
 
+	/* M0 (C27): which vdev stopped; the single vdev_setup_done flag serves start and stop, so a stop reported for another vdev would complete the infra vdev's wait unseen */
+	if (qwz_log_ratelimit(&sc->sc_log_evt, 32, 64))
+		qwz_log("qwz: evt: vdev stopped: vdev %u (infra vdev %u, setup_done was %d)\n", vdev_id, sc->sc_vif.vdev_id, sc->vdev_setup_done);
 	sc->vdev_setup_done = 1;
 	wakeup(&sc->vdev_setup_done);
 
@@ -11683,6 +11811,11 @@ qwz_reg_chan_list_event(struct qwz_softc *sc, struct mbuf *m,
 	}
 
 	qwz_init_channels(sc, reg_info);
+	/* M0 (C29): what the firmware's regulatory event carried (6 GHz rule counts show whether it reports 6 GHz at all) */
+	qwz_log("qwz: dossier: regulatory: cc %.2s dfs %u rules 2g %u 5g %u 6g ap %u client %u ext %d status %d\n",
+	    (const char *)reg_info->alpha2, reg_info->dfs_region, reg_info->num_2ghz_reg_rules, reg_info->num_5ghz_reg_rules,
+	    reg_info->num_6ghz_rules_ap[0], reg_info->num_6ghz_rules_client[0][0], reg_info->is_ext_reg_event ? 1 : 0,
+	    (int)reg_info->status_code);
 #if 0
 	pdev_idx = reg_info->phy_id;
 
@@ -12014,7 +12147,9 @@ qwz_scan_event(struct qwz_softc *sc, struct mbuf *m)
 #ifdef notyet
 	rcu_read_lock();
 #endif
-	if (arvif->vdev_id != scan_ev.vdev_id) {
+	if (arvif->vdev_id != scan_ev.vdev_id &&
+	    !(sc->sc_awdltest_vdev_on &&
+	    scan_ev.vdev_id == sc->sc_awdltest_vdev_id)) {
 		printf("%s: received scan event for unknown vdev\n",
 		    sc->sc_dev.dv_xname);
 #if 0
@@ -12331,7 +12466,8 @@ qwz_mgmt_rx_event(struct qwz_softc *sc, struct mbuf *m)
 
 	wh = mtod(m, struct ieee80211_frame *);
 	/* Passive: smoothed BSS RSSI and the AWDL probe; the frame goes on unchanged. */
-	qwz_rx_observe_mgmt(sc, m, rxi.rxi_rssi, rx_ev.chan_freq, rx_ev.channel);
+	qwz_rx_observe_mgmt(sc, m, rxi.rxi_rssi, rx_ev.chan_freq, rx_ev.channel,
+	    rx_ev.rate);
 	ni = ieee80211_find_rxnode(ic, wh);
 #if 0
 	/* In case of PMF, FW delivers decrypted frames with Protected Bit set.
@@ -12426,6 +12562,11 @@ qwz_pull_mgmt_tx_compl_param_tlv(struct qwz_softc *sc, struct mbuf *m,
 	param->desc_id = ev->desc_id;
 	param->status = ev->status;
 	param->ack_rssi = ev->ack_rssi;
+#ifdef __APPLE__
+	if (sc->sc_awdltest_txmask != 0 || (ev->desc_id >= QWZ_AWDL_DESC_BASE && ev->desc_id < QWZ_AWDL_DESC_BASE + QWZ_AWDL_POOL))	/* M2a (WP3, I1): the TLV length (the port reads 20 bytes) and the dwords beyond them, while an AWDL frame is in flight: one of the M0 lane's (txmask), or, since fix1 (wmi-2, logging L5), a lane M pool slot (desc 0x40 + slot, which txmask never has) */
+		qwz_awdlx_cmpl_tlv(FIELD_GET(WMI_TLV_LEN, ((const struct wmi_tlv *)((const uint8_t *)ev - sizeof(struct wmi_tlv)))->header),
+		    (const uint8_t *)ev);
+#endif
 
 	free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
 	return 0;
@@ -12440,6 +12581,13 @@ qwz_wmi_process_mgmt_tx_comp(struct qwz_softc *sc,
 	struct ifnet *ifp = &ic->ic_if;
 	struct qwz_tx_data *tx_data;
 
+#ifdef __APPLE__
+	if (tx_compl_param->desc_id >= QWZ_AWDL_DESC_BASE &&
+	    tx_compl_param->desc_id < QWZ_AWDL_DESC_BASE + QWZ_AWDL_POOL) {
+		qwz_awdl_slot_complete(sc, tx_compl_param);	/* WP4 (M2a): a lane M pool slot, desc_id 0x40 + slot: no BSS node, no txmgmt slot, before the bound check below */
+		return;
+	}
+#endif
 	if (tx_compl_param->desc_id >= nitems(arvif->txmgmt.data)) {
 		printf("%s: received mgmt tx compl for invalid buf_id: %d\n",
 		    sc->sc_dev.dv_xname, tx_compl_param->desc_id);
@@ -12453,6 +12601,37 @@ qwz_wmi_process_mgmt_tx_comp(struct qwz_softc *sc,
 		return;
 	}
 
+#ifdef __APPLE__
+	if (sc->sc_awdltest_txmask & (1U << tx_compl_param->desc_id)) {
+		/* A debug.qwz.awdltest=5 frame: submit-to-completion time and status. */
+		uint64_t lat = getnsecuptime() -
+		    sc->sc_awdltest_txns[tx_compl_param->desc_id];
+
+		sc->sc_awdltest_txmask &= ~(1U << tx_compl_param->desc_id);
+		qwz_awdlx_cmpl((int)tx_compl_param->desc_id, tx_compl_param->status, (int32_t)tx_compl_param->ack_rssi);	/* M2a (WP3, I1) */
+		if (tx_compl_param->status == 0)
+			sc->sc_awdltest_txok++;
+		else {
+			sc->sc_awdltest_txfail++;
+			sc->sc_awdltest_txlast = tx_compl_param->status;
+		}
+		/* M2a WP5 (awdlclk 8): the action frames (PSF, MIF) that went out feed the mean awdlTxSend adds to phy_tx_time */
+		if (tx_compl_param->status == 0 && mtod(tx_data->m, uint8_t *)[0] == 0xd0)
+			qwz_awdl_lat_note(lat);
+		sc->sc_awdltest_txlat_sum += lat;
+		if (lat < sc->sc_awdltest_txlat_min)
+			sc->sc_awdltest_txlat_min = lat;
+		if (lat > sc->sc_awdltest_txlat_max)
+			sc->sc_awdltest_txlat_max = lat;
+	}
+	if (sc->sc_awdl_pmask & (1U << tx_compl_param->desc_id)) {
+		/* M0 (C24): awdlprobe=1 sent an awdl0 data frame through this slot: its completion status is the answer */
+		sc->sc_awdl_pmask &= ~(1U << tx_compl_param->desc_id);
+		sc->sc_stat[tx_compl_param->status == 0 ? QWZ_STAT_PM_OK : QWZ_STAT_PM_FAIL]++;
+		if (qwz_log_ratelimit(&sc->sc_log_tx, 8, 256))
+			qwz_log("qwz: probe: data frame completion status %u\n", tx_compl_param->status);
+	}
+#endif
 	bus_dmamap_unload(sc->sc_dmat, tx_data->map);
 	m_freem(tx_data->m);
 	tx_data->m = NULL;
@@ -12534,6 +12713,9 @@ qwz_mac_handle_beacon_miss(struct qwz_softc *sc, uint32_t vdev_id)
 	if ((ic->ic_opmode != IEEE80211_M_STA) ||
 	    (ic->ic_state != IEEE80211_S_RUN))
 		return;
+	/* The awdltest vdev has no AP to lose; only the BSS vdev's misses count. */
+	if (vdev_id != sc->sc_vif.vdev_id)
+		return;
 
 	if (ic->ic_mgt_timer == 0) {
 		if (ic->ic_if.if_flags & IFF_DEBUG)
@@ -12565,6 +12747,11 @@ qwz_roam_event(struct qwz_softc *sc, struct mbuf *m)
 
 	DNPRINTF(QWZ_D_WMI, "%s: event roam vdev %u reason 0x%08x rssi %d\n",
 	    __func__, roam_ev.vdev_id, roam_ev.reason, roam_ev.rssi);
+
+	/* M0 (C27): every roam event, before the early return below: beacon loss for the wrong vdev would otherwise leave no trace */
+	if (qwz_log_ratelimit(&sc->sc_log_evt, 16, 32))
+		qwz_log("qwz: evt: roam vdev %u reason 0x%x rssi %d (infra vdev %u)\n", roam_ev.vdev_id, roam_ev.reason, (int)roam_ev.rssi,
+		    sc->sc_vif.vdev_id);
 
 	if (roam_ev.reason >= WMI_ROAM_REASON_MAX)
 		return;
@@ -12663,6 +12850,7 @@ qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 
 	cmd_hdr = mtod(m, struct wmi_cmd_hdr *);
 	id = (enum wmi_tlv_event_id)(FIELD_GET(WMI_CMD_HDR_CMD_ID, (cmd_hdr->cmd_id)));
+	qwz_flight_note(sc, 1, (uint32_t)id);	/* M0 (C26/C27): the flight recorder's event ring */
 
 	m_adj(m, sizeof(struct wmi_cmd_hdr));
 
@@ -12713,14 +12901,16 @@ qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 	case WMI_MGMT_TX_COMPLETION_EVENTID:
 		qwz_mgmt_tx_compl_event(sc, m);
 		break;
+	case WMI_OFFCHAN_DATA_TX_COMPLETION_EVENTID:
+		qwz_offchan_data_tx_compl_event(sc, m);	/* WP4 (M2a), F3 */
+		break;
 	case WMI_SCAN_EVENTID:
 		qwz_scan_event(sc, m);
 		break;
-#if 0
 	case WMI_PEER_STA_KICKOUT_EVENTID:
-		ath12k_peer_sta_kickout_event(ab, skb);
+		/* M0 (C27): log-only; the host never acted on a kickout (it was #if 0 here) and M0 does not either */
+		qwz_evt_note(sc, id, m, "STA_KICKOUT");
 		break;
-#endif
 	case WMI_ROAM_EVENTID:
 		qwz_roam_event(sc, m);
 		break;
@@ -12808,6 +12998,7 @@ qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 		break;
 	default:
 		DPRINTF("%s: unsupported event id 0x%x\n", __func__, id);
+		qwz_evt_note(sc, id, m, "unhandled");	/* M0 (C27): each unhandled id once, with its length */
 		break;
 	}
 
@@ -13507,6 +13698,11 @@ qwz_peer_map_event(struct qwz_softc *sc, uint8_t vdev_id, uint16_t peer_id,
 	struct qwz_vif *arvif = &sc->sc_vif;
 
 	peer = qwz_peer_find_by_addr(sc, mac_addr);
+	/* M0 (C27): every map is noted BEFORE the filter below (does the listen BSSID peer's map ever arrive?) */
+	if (qwz_log_ratelimit(&sc->sc_log_evt, 32, 64))
+		qwz_log("qwz: evt: htt peer map vdev %u peer %u mac " QWZ_MACFMT " ast_hash %u hw_peer_id %u (%s)\n", vdev_id, peer_id,
+		    QWZ_MACARG(mac_addr), ast_hash, hw_peer_id,
+		    peer == NULL ? "NO HOST PEER: ignored" : peer->vdev_id != vdev_id ? "vdev mismatch: ignored" : "host peer");
 	if (peer == NULL || peer->vdev_id != vdev_id)
 		return;
 
@@ -14872,6 +15068,12 @@ qwz_dp_tx_free_txbuf(struct qwz_softc *sc, int msdu_id,
 
 		if (tx_ring->queued > 0)
 			tx_ring->queued--;
+		if (tx_data->flags & QWZ_TXF_AWDL) {	/* M0 (C20): the AWDL in-flight tag goes with the slot */
+			tx_data->flags &= ~QWZ_TXF_AWDL;
+			if (sc->sc_awdl_inflight > 0)
+				sc->sc_awdl_inflight--;
+			sc->sc_stat[QWZ_STAT_AWDL_DONE]++;
+		}
 	}
 
 	if (tx_data->ni) {
@@ -14901,6 +15103,9 @@ qwz_dp_tx_process_htt_tx_complete(struct qwz_softc *sc, void *desc,
 	wbm_status = (enum hal_wbm_htt_tx_comp_status)(FIELD_GET(HTT_TX_WBM_COMP_INFO0_STATUS,
 	    status_desc->info0));
 
+	/* M0 (C19): the histogram of firmware-source completion statuses, slot 7 = anything above 6 */
+	sc->sc_stat[QWZ_STAT_HTT0 + (wbm_status < 7 ? wbm_status : 7)]++;
+
 	switch (wbm_status) {
 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_OK:
 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_DROP:
@@ -14922,9 +15127,18 @@ qwz_dp_tx_process_htt_tx_complete(struct qwz_softc *sc, void *desc,
 		 * use WDS offload functionality.
 		 */
 		break;
+	case HAL_WBM_REL_HTT_TX_COMP_STATUS_VDEVID_MISMATCH:	/* M0 (C19): new enum value, qwzreg.h after MEC_NOTIFY */
 	default:
-		printf("%s: Unknown htt tx status %d\n",
-		    sc->sc_dev.dv_xname, wbm_status);
+		/*
+		 * M0 (C19): the buffer came back from the firmware, so free the
+		 * slot (the mbuf, the DMA map, `queued` and the node reference
+		 * used to leak here). The status is printed as a number: the
+		 * value of VDEVID_MISMATCH is UNVERIFIED.
+		 */
+		if (qwz_log_ratelimit(&sc->sc_log_htt, 8, 256))
+			printf("%s: Unknown htt tx status %d (msdu %u): slot freed\n",
+			    sc->sc_dev.dv_xname, (int)wbm_status, msdu_id);
+		qwz_dp_tx_free_txbuf(sc, (int)msdu_id, tx_ring);
 		break;
 	}
 }
@@ -15013,6 +15227,9 @@ qwz_dp_tx_complete_msdu(struct qwz_softc *sc, struct dp_tx_ring *tx_ring,
 		return;
 	}
 
+	/* M0 (C19): the histogram of TQM release reasons, slot 7 = anything above 6 */
+	sc->sc_stat[QWZ_STAT_TQM0 + (ts->status < 7 ? ts->status : 7)]++;
+
 	if (tx_data->m) {
 		bus_dmamap_sync(sc->sc_dmat, tx_data->map, 0,
 		    tx_data->map->dm_mapsize, BUS_DMASYNC_POSTWRITE);
@@ -15022,11 +15239,18 @@ qwz_dp_tx_complete_msdu(struct qwz_softc *sc, struct dp_tx_ring *tx_ring,
 
 		if (tx_ring->queued > 0)
 			tx_ring->queued--;
+		if (tx_data->flags & QWZ_TXF_AWDL) {	/* M0 (C20): the AWDL in-flight tag goes with the slot */
+			tx_data->flags &= ~QWZ_TXF_AWDL;
+			if (sc->sc_awdl_inflight > 0)
+				sc->sc_awdl_inflight--;
+			sc->sc_stat[QWZ_STAT_AWDL_DONE]++;
+		}
 	}
 
 	if (tx_data->ni == NULL)
 		return;
 
+	qwz_awdl_tx_done_note(sc, tx_data, ts);
 	pkt_type = FIELD_GET(HAL_TX_RATE_STATS_INFO0_PKT_TYPE, ts->rate_stats);
 	mcs = FIELD_GET(HAL_TX_RATE_STATS_INFO0_MCS, ts->rate_stats);
 	if (pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11A ||
@@ -15383,7 +15607,8 @@ qwz_dp_process_rx_err(struct qwz_softc *sc)
 		    sizeof(*link), BUS_DMASYNC_PREREAD);
 
 		release_desc = qwz_hal_srng_src_get_next_entry(sc, release_srng);
-		KASSERT(release_desc != NULL);
+		if (QWZ_RBAD(release_desc == NULL))
+			continue;	/* the link descriptor is not released; the loop goes on */
 		qwz_hal_rx_msdu_link_desc_set(sc, release_desc, reo_desc, action);
 	}
 
@@ -15529,6 +15754,7 @@ qwz_dp_rx_wbm_err(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 	}
 
 	if (drop) {
+		qwz_awdl_rx_err_note(sc, msdu);
 		m_freem(msdu->m);
 		msdu->m = NULL;
 		sc->sc_ic.ic_if.if_ierrors++;
@@ -16185,7 +16411,8 @@ qwz_dp_rx_process_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 	if (mpdu->addr1[4] == 0x84 && mpdu->addr1[5] == 0xe1)
 		return EIO;
 	if (!(mpdu->addr1[0] & 0x01) &&
-	    !IEEE80211_ADDR_EQ(mpdu->addr1, sc->sc_ic.ic_myaddr))
+	    !IEEE80211_ADDR_EQ(mpdu->addr1, sc->sc_ic.ic_myaddr) &&
+	    !qwz_awdl_is_our_addr(sc, mpdu->addr1))
 		return EIO;
 
 	msdu->rx_desc = rx_desc;
@@ -16281,6 +16508,35 @@ qwz_dp_rx_deliver_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu)
 	wh = mtod(msdu->m, struct ieee80211_frame *);
 	/* Passive: smoothed BSS RSSI and the AWDL probe; the frame goes on unchanged. */
 	qwz_rx_observe_data(sc, msdu);
+#ifdef __APPLE__
+	/*
+	 * awdl0's data: a data frame with the AWDL BSSID, or to awdl0's own
+	 * address, goes to awdl0, never to the station.
+	 */
+	if (sc->sc_awdl_data_rx != NULL && M_LEN(msdu->m) >= sizeof(*wh) &&
+	    (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA) {
+		static unsigned odd;
+
+		if (IEEE80211_ADDR_EQ(wh->i_addr3, qwz_awdl_bssid) ||
+		    qwz_awdl_is_our_addr(sc, wh->i_addr1)) {
+			qwz_awdlx_rx_data((const uint8_t *)wh, (size_t)M_LEN(msdu->m), msdu->rxi.rxi_rssi, qwz_awdl_is_our_addr(sc, wh->i_addr1));	/* M2a (WP3, I3) */
+			if (M_LEN(msdu->m) == M_PKTLEN(msdu->m))
+				sc->sc_awdl_data_rx(sc->sc_awdl_data_rx_arg,
+				    (const uint8_t *)wh, M_LEN(msdu->m),
+				    msdu->rxi.rxi_rssi);
+			m_freem(msdu->m);
+			return;
+		}
+		/* From an AWDL peer but addressed otherwise: how do they frame it? */
+		if (odd < 3 && qwz_awdl_is_peer(sc, wh->i_addr2)) {
+			odd++;
+			qwz_log("qwz: awdl: data from peer " QWZ_MACFMT " not for "
+			    "awdl0: fc %02x%02x a1 " QWZ_MACFMT " a3 " QWZ_MACFMT
+			    "\n", QWZ_MACARG(wh->i_addr2), wh->i_fc[0], wh->i_fc[1],
+			    QWZ_MACARG(wh->i_addr1), QWZ_MACARG(wh->i_addr3));
+		}
+	}
+#endif
 	ni = ieee80211_find_rxnode(ic, wh);
 
 #if NBPFILTER > 0
@@ -17359,14 +17615,26 @@ qwz_wmi_cmd_send(struct qwz_pdev_wmi *wmi, struct mbuf *m, uint32_t cmd_id)
 	struct qwz_htc *htc = &sc->htc;
 	struct qwz_htc_ep *ep = &htc->endpoint[wmi->eid];
 
+	/* M0 (C05): a command to a dead firmware costs 0 instead of 3 s (Linux wmi.c:413-440); the mbuf stays the caller's */
+	if (QWZ_CRASHED(sc))
+		return ESHUTDOWN;
+	qwz_flight_note(sc, 0, cmd_id);		/* M0 (C26): the flight recorder's command ring */
+	if (__builtin_expect(sc->sc_inject & QWZ_INJ_WMI_STARVE, 0))	/* inject 2 (C33): credits "stop coming back" */
+		ep->tx_credits = 0;
 	while (!ep->tx_credits) {
+		uint32_t ev0 = sc->sc_fw_rx_events;
+
 		ret = tsleep_nsec(&ep->tx_credits, 0, "qwztxcrd",
 		    SEC_TO_NSEC(3));
+		if (ret == EDEADLK)		/* a refused sleep (workloop thread, outside the gate) is not a timeout: no "tx credits timeout" line, no silence feed (audit round 1) */
+			return EAGAIN;
+		if (ret == ESHUTDOWN)
+			return ESHUTDOWN;
 		if (ret) {
 			printf("%s: tx credits timeout\n",
 			    sc->sc_dev.dv_xname);
-			if (test_bit(ATH12K_FLAG_CRASH_FLUSH,
-			    sc->sc_flags))
+			qwz_note_wait_timeout(sc, "tx credits", ev0);	/* M0 (C07) */
+			if (QWZ_CRASHED(sc))
 				return ESHUTDOWN;
 			else
 				return EAGAIN;
@@ -17421,6 +17689,39 @@ qwz_wmi_pdev_set_param(struct qwz_softc *sc, uint32_t param_id,
 	    __func__, param_id, pdev_id, param_value);
 
 	return 0;
+}
+
+/*
+ * M0 (C33), debug.qwz.inject=6 and 7: WMI_FORCE_FW_HANG (Linux
+ * ath12k_wmi_force_fw_hang_cmd, debugfs simulate_fw_crash). type 1 asserts the
+ * firmware (a real crash: RDDM), type 2 is "not respond detect" (UNVERIFIED on
+ * this firmware). The mbuf is freed on every error path: qwz_wmi_cmd_send
+ * never frees it.
+ */
+int
+qwz_wmi_force_fw_hang(struct qwz_softc *sc, uint32_t type, uint32_t delay_ms)
+{
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[0];
+	struct wmi_force_fw_hang_cmd *cmd;
+	struct mbuf *m;
+	int ret;
+
+	m = qwz_wmi_alloc_mbuf(sizeof(*cmd));
+	if (!m)
+		return ENOMEM;
+
+	cmd = (struct wmi_force_fw_hang_cmd *)(mtod(m, uint8_t *) +
+	    sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr));
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_FORCE_FW_HANG_CMD) |
+	    FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->type = type;
+	cmd->delay_time_ms = delay_ms;
+
+	ret = qwz_wmi_cmd_send(wmi, m, WMI_FORCE_FW_HANG_CMDID);
+	if (ret)
+		m_freem(m);
+
+	return ret;
 }
 
 int
@@ -19463,6 +19764,7 @@ qwz_core_start(struct qwz_softc *sc)
 		return QWZ_EPARKED;
 #endif
 
+	qwz_dossier(sc);	/* M0 (C29): what this firmware reports, once per firmware boot */
 	return 0;
 err_reo_cleanup:
 	qwz_power_down(sc);
@@ -19484,8 +19786,9 @@ void
 qwz_core_stop(struct qwz_softc *sc)
 {
 	if (sc->powered &&
-	    !test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags) &&
-	    !test_bit(ATH12K_FLAG_QMI_FAIL, sc->sc_flags))
+	    !QWZ_CRASHED(sc) &&
+	    !test_bit(ATH12K_FLAG_QMI_FAIL, sc->sc_flags) &&
+	    qwz_pci_link_alive(sc))		/* M0 (C05, S17): one config read; a dead link skips the stop, qwz_pci_power_down then declares DEAD(LINK) */
 		qwz_qmi_firmware_stop(sc);
 
 	qwz_power_down(sc);
@@ -19550,12 +19853,20 @@ err_pdev_debug:
 	return ret;
 }
 
+#ifdef __APPLE__
+static void qwz_awdltest_forget(struct qwz_softc *);
+static void qwz_awdl_peers_clear(struct qwz_softc *, int);
+static void qwz_awdl_node_retire(struct qwz_softc *, struct ieee80211_node *);	/* M0 (C21) */
+static void qwz_awdl_zombies_reap(struct qwz_softc *, int);			/* M0 (C21) */
+#endif
+
 void
 qwz_core_deinit(struct qwz_softc *sc)
 {
 	struct ath12k_hal *hal = &sc->hal;
 	int s = splnet();
 
+	QWZ_CRUMB("deinit:begin");
 #ifdef notyet
 	mutex_lock(&ab->core_lock);
 #endif
@@ -19581,9 +19892,17 @@ qwz_core_deinit(struct qwz_softc *sc)
 	hal->num_shadow_reg_configured = 0;
 
 	sc->fw_initialized = 0;
+#ifdef __APPLE__
+	qwz_awdltest_forget(sc);
+#endif
 	sc->pdevs_active = 0;
 	set_bit(ATH12K_FLAG_QMI_FAIL, sc->sc_flags);
+	qwz_fw_epoch_reset(sc);		/* M0 (C06): what survives a firmware restart; after qwz_vif_purge, which clears neither AWDL mask */
 
+#ifdef __APPLE__
+	qwz_awdl_pool_reap(sc);		/* WP4 (M2a): after qwz_core_stop and qwz_power_down (above), as the BSS ring in qwz_vif_purge: the lane M frames in flight will never complete */
+#endif
+	QWZ_CRUMB("deinit:host-done");
 	splx(s);
 }
 
@@ -21864,6 +22183,9 @@ qwz_ce_recv_process_cb(struct qwz_ce_pipe *pipe)
 		M_SETLEN(m, nbytes);
 		ml_enqueue(&ml, m);
 		ret = 1;
+		/* M0 (C07): "the firmware is alive" (WMI events, HTC credit reports, HTT messages: anything it sent) */
+		if (!(sc->sc_inject & QWZ_INJ_IGNORE_EV))	/* inject 2/7: the window in which the firmware "says nothing" */
+			sc->sc_fw_rx_events++;
 	}
 
 	while ((m = ml_dequeue(&ml))) {
@@ -21944,7 +22266,7 @@ qwz_ce_send(struct qwz_softc *sc, struct mbuf *m, uint8_t pipe_id,
 			qwz_ce_poll_send_completed(sc, pipe->pipe_num);
 	}
 
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags))
+	if (QWZ_CRASHED(sc))
 		return ESHUTDOWN;
 #ifdef notyet
 	spin_lock_bh(&ab->ce.ce_lock);
@@ -22752,7 +23074,7 @@ qwz_mac_vdev_setup_sync(struct qwz_softc *sc)
 #ifdef notyet
 	lockdep_assert_held(&ar->conf_mutex);
 #endif
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags))
+	if (QWZ_CRASHED(sc))
 		return ESHUTDOWN;
 
 	while (!sc->vdev_setup_done) {
@@ -23109,6 +23431,10 @@ qwz_mac_vdev_start_restart(struct qwz_softc *sc, struct qwz_vif *arvif,
 	    __func__, arg.vdev_id, arg.channel.freq,
 	    qwz_wmi_phymode_str(arg.channel.mode));
 
+	/* M0 (C27): the parameter set of every vdev start and restart (the MCC and channel-width suspects) */
+	qwz_log("qwz: evt: vdev %u %s: freq %u cfreq1 %u mode %u passive %u max_power %u dtim %u bcn_intval %u\n", arg.vdev_id,
+	    restart ? "restart" : "start", arg.channel.freq, arg.channel.band_center_freq1, (unsigned int)arg.channel.mode,
+	    (unsigned int)arg.channel.passive, arg.channel.max_power, arg.dtim_period, arg.bcn_intval);
 	sc->vdev_setup_done = 0;
 	ret = qwz_wmi_vdev_start(sc, &arg, pdev_id, restart);
 	if (ret) {
@@ -23534,6 +23860,18 @@ qwz_init_task(void *arg)
 		return;
 	}
 
+	/*
+	 * M0 (C05): do not run the legacy one-shot recovery beside the engine
+	 * (with recover=0 or m0=0 DEAD is never set, so the legacy path is
+	 * unchanged).
+	 */
+	if (qwz_is_dead(sc)) {
+		qwz_log("qwz: life: init_task: firmware DEAD: the engine restarts it, not this task\n");
+		rw_exit(&sc->ioctl_rwl);
+		splx(s);
+		return;
+	}
+
 	if (ifp->if_flags & IFF_RUNNING)
 		qwz_stop(ifp);
 
@@ -23615,6 +23953,10 @@ qwz_mac_scan_finish(struct qwz_softc *sc)
 	lockdep_assert_held(&ar->data_lock);
 #endif
 	ostate = sc->scan.state;
+#ifdef __APPLE__
+	if (ostate != ATH12K_SCAN_IDLE && qwz_awdltx_eff >= 2)	/* WP4 (M2a): a frame with tx_params is RAW on a non-pausable TID: the lane stays closed to those 30 ms after a scan */
+		sc->sc_awdl_pool.scan_end_ns = getnsecuptime();
+#endif
 	switch (ostate) {
 	case ATH12K_SCAN_IDLE:
 		break;
@@ -23723,9 +24065,10 @@ qwz_peer_delete(struct qwz_softc *sc, uint32_t vdev_id, uint8_t pdev_id,
 		    pdev_id);
 		if (ret) {
 			peer->delete_pending = 0;
-			printf("%s: failed to delete peer vdev_id %d addr %s "
-			    "ret %d\n", sc->sc_dev.dv_xname, vdev_id,
-			    ether_sprintf(peer->addr), ret);
+			if (ret != ESHUTDOWN)	/* M0.1 (F3) */
+				printf("%s: failed to delete peer vdev_id %d addr %s "
+				    "ret %d\n", sc->sc_dev.dv_xname, vdev_id,
+				    ether_sprintf(peer->addr), ret);
 			return ret;
 		}
 	}
@@ -23734,8 +24077,9 @@ qwz_peer_delete(struct qwz_softc *sc, uint32_t vdev_id, uint8_t pdev_id,
 		ret = tsleep_nsec(&sc->peer_mapped, 0, "qwzpeer",
 		    SEC_TO_NSEC(3));
 		if (ret) {
-			printf("%s: peer delete unmap timeout\n",
-			    sc->sc_dev.dv_xname);
+			if (ret != ESHUTDOWN)	/* M0.1 (F3) */
+				printf("%s: peer delete unmap timeout\n",
+				    sc->sc_dev.dv_xname);
 			return ret;
 		}
 	}
@@ -23744,16 +24088,18 @@ qwz_peer_delete(struct qwz_softc *sc, uint32_t vdev_id, uint8_t pdev_id,
 		ret = tsleep_nsec(&sc->peer_delete_done, 0, "qwzpeerd",
 		    SEC_TO_NSEC(3));
 		if (ret) {
-			printf("%s: peer delete command timeout\n",
-			    sc->sc_dev.dv_xname);
+			if (ret != ESHUTDOWN)	/* M0.1 (F3) */
+				printf("%s: peer delete command timeout\n",
+				    sc->sc_dev.dv_xname);
 			return ret;
 		}
 	}
 
 	ret = qwz_peer_rx_tid_cleanup(sc, peer);
 	if (ret) {
-		printf("%s: failed to retire peer RX queues: %d\n",
-		    sc->sc_dev.dv_xname, ret);
+		if (ret != ESHUTDOWN)	/* M0.1 (F3) */
+			printf("%s: failed to retire peer RX queues: %d\n",
+			    sc->sc_dev.dv_xname, ret);
 		return ret;
 	}
 
@@ -23774,8 +24120,10 @@ qwz_peer_create(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 
 	if (sc->num_peers >= qwz_core_get_max_peers_per_radio(sc))
 		return ENOBUFS;
-	if (!TAILQ_EMPTY(&sc->peers))
-		return EBUSY;
+	/* One BSS peer per vdev; awdl0's peers live on their own vdev. */
+	TAILQ_FOREACH(peer, &sc->peers, entry)
+		if (peer->vdev_id == param->vdev_id)
+			return EBUSY;
 
 	peer = malloc(sizeof(*peer), M_DEVBUF, M_ZERO | M_NOWAIT);
 	if (peer == NULL)
@@ -23825,7 +24173,7 @@ qwz_dp_tx_send_reo_cmd(struct qwz_softc *sc, struct dp_rx_tid *rx_tid,
 	struct hal_srng *cmd_ring;
 	int cmd_num;
 
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags))
+	if (QWZ_CRASHED(sc))
 		return ESHUTDOWN;
 
 	if (cmd->flag & HAL_REO_CMD_FLG_NEED_STATUS) {
@@ -23962,9 +24310,12 @@ qwz_dp_rx_tid_retire_done(struct qwz_dp *dp, void *ctx,
 	struct dp_rx_tid *rx_tid = (struct dp_rx_tid *)(ctx);
 	struct qwz_rx_tid_retire *retire = &dp->rx_tid_retire[rx_tid->tid];
 
-	KASSERT(retire->data.mem == rx_tid->mem);
-	KASSERT(retire->state == QWZ_RX_TID_DELETE_PENDING ||
-	    retire->state == QWZ_RX_TID_FLUSH_PENDING);
+	if (QWZ_RBAD(retire->data.mem != rx_tid->mem) ||
+	    QWZ_RBAD(retire->state != QWZ_RX_TID_DELETE_PENDING &&
+	    retire->state != QWZ_RX_TID_FLUSH_PENDING)) {
+		wakeup(dp->rx_tid_retire);
+		return;
+	}
 
 	if (status != HAL_REO_CMD_SUCCESS) {
 		retire->state = QWZ_RX_TID_RETIRE_FAILED;
@@ -24000,8 +24351,11 @@ qwz_dp_rx_tid_retire_submit(struct qwz_softc *sc,
 		type = HAL_REO_CMD_UPDATE_RX_QUEUE;
 		retire->state = QWZ_RX_TID_DELETE_PENDING;
 	} else {
-		KASSERT(state == QWZ_RX_TID_FLUSH_READY);
-		KASSERT(offset >= sizeof(struct hal_rx_reo_queue));
+		if (QWZ_RBAD(state != QWZ_RX_TID_FLUSH_READY) ||
+		    QWZ_RBAD(offset < sizeof(struct hal_rx_reo_queue))) {
+			memset(retire, 0, sizeof(*retire));	/* QWZ_RX_TID_REUSABLE is 0; the queue memory of that slot leaks */
+			return EINVAL;
+		}
 		retire->flush_offset -= sizeof(struct hal_rx_reo_queue);
 		paddr += retire->flush_offset;
 		if (retire->flush_offset == 0)
@@ -24077,7 +24431,8 @@ qwz_peer_rx_tid_delete(struct qwz_softc *sc, struct ath12k_peer *peer,
 	if (!rx_tid->active)
 		return;
 
-	KASSERT(retire->state == QWZ_RX_TID_REUSABLE);
+	if (QWZ_RBAD(retire->state != QWZ_RX_TID_REUSABLE))
+		memset(retire, 0, sizeof(*retire));	/* the old queue memory leaks; the slot is reused below */
 	retire->data = *rx_tid;
 	retire->state = QWZ_RX_TID_DELETE_READY;
 	rx_tid->active = 0;
@@ -24618,11 +24973,11 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	void *hal_tcl_desc;
 	uint8_t pool_id;
 	uint8_t hal_ring_id;
-	int ret, msdu_id, off;
+	int ret, msdu_id, off, n;	/* n: M0 (C20), the slot scan */
 	uint32_t ring_selector = 0;
 	uint8_t ring_map = 0;
 
-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags)) {
+	if (QWZ_CRASHED(sc)) {		/* M0 (C05): the transient flag or DEAD */
 		m_freem(m);
 		return ESHUTDOWN;
 	}
@@ -24663,12 +25018,30 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 		return ENOSPC;
 	}
 
+	/*
+	 * M0 (C20): ONE sequential allocator serves infra and AWDL, and it used
+	 * to give up when the slot at `cur` was still occupied: a single slot
+	 * the firmware never completed blackholed all TX once the cursor came
+	 * round to it. Scan forward (bounded by the ring size) for a free slot;
+	 * the completion paths index by the descriptor cookie, so a slot used
+	 * out of order is safe. With the slot at `cur` free (every run without
+	 * a stuck slot) the loop ends at once and nothing changes.
+	 */
 	msdu_id = tx_ring->cur;
-	tx_data = &tx_ring->data[msdu_id];
-	if (tx_data->m != NULL) {
+	for (n = 0; n < (int)sc->hw_params.tx_ring_size; n++) {
+		tx_data = &tx_ring->data[msdu_id];
+		if (tx_data->m == NULL)
+			break;
+		sc->sc_stat[QWZ_STAT_TXWALL]++;
+		msdu_id = (int)(((uint32_t)msdu_id + 1) % sc->hw_params.tx_ring_size);
+	}
+	if (n == (int)sc->hw_params.tx_ring_size) {
+		sc->sc_stat[QWZ_STAT_ENOSPC]++;
 		m_freem(m);
 		return ENOSPC;
 	}
+	tx_data = &tx_ring->data[msdu_id];	/* the free slot the scan stopped at */
+	tx_ring->cur = msdu_id;		/* the publish below advances from the slot actually used */
 
 	ti.desc_id = FIELD_PREP(DP_TX_DESC_ID_MAC_ID, pdev_id) |
 	    FIELD_PREP(DP_TX_DESC_ID_MSDU_ID, msdu_id) |
@@ -24819,8 +25192,20 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 
 	tx_data->m = m;
 	tx_data->ni = ni;
+	tx_data->t_ms = (uint32_t)(getnsecuptime() / 1000000ULL);	/* M0 (C20): submit time, for the slot age of the health line */
+	if (arvif != &sc->sc_vif) {		/* M0 (C20): the AWDL listen vif; the infra path never sets the tag */
+		tx_data->flags |= QWZ_TXF_AWDL;
+		sc->sc_awdl_inflight++;
+		sc->sc_stat[QWZ_STAT_AWDL_TX]++;
+	}
 
 	qwz_hal_tx_cmd_desc_setup(sc, hal_tcl_desc, &ti);
+	if (arvif != &sc->sc_vif || qwz_awdlx.tcl_left[1] != 0) {	/* M2a (WP3, I9): the first AWDL descriptors, and a few infra ones to compare; log only */
+		const struct hal_tcl_data_cmd *tcl = (const struct hal_tcl_data_cmd *)hal_tcl_desc;
+		uint32_t info[5] = { tcl->info0, tcl->info1, tcl->info2, tcl->info3, tcl->info4 };
+
+		qwz_awdlx_tcl(arvif != &sc->sc_vif, msdu_id, ti.vdev_id, ti.bank_id, info, ti.data_len, ti.tid, mtod(m, const uint8_t *), (size_t)M_LEN(m));
+	}
 
 	qwz_hal_srng_access_end(sc, tcl_ring);
 
@@ -24844,9 +25229,10 @@ qwz_mac_station_remove(struct qwz_softc *sc, struct qwz_vif *arvif,
 
 	ret = qwz_peer_delete(sc, arvif->vdev_id, pdev_id, peer);
 	if (ret) {
-		sc->sc_peer_del_fail++;
-		printf("%s: unable to delete BSS peer: %d\n",
-		   sc->sc_dev.dv_xname, ret);
+		sc->sc_peer_del_fail++;		/* counted always: the sleep path's dirty-teardown test reads it */
+		if (ret != ESHUTDOWN)	/* M0.1 (F3) */
+			printf("%s: unable to delete BSS peer: %d\n",
+			   sc->sc_dev.dv_xname, ret);
 		return ret;
 	}
 
@@ -25151,8 +25537,9 @@ qwz_scan_stop(struct qwz_softc *sc)
 
 	ret = qwz_wmi_send_scan_stop_cmd(sc, &arg);
 	if (ret) {
-		printf("%s: failed to stop wmi scan: %d\n",
-		    sc->sc_dev.dv_xname, ret);
+		if (ret != ESHUTDOWN)	/* M0.1 (F3) */
+			printf("%s: failed to stop wmi scan: %d\n",
+			    sc->sc_dev.dv_xname, ret);
 		goto out;
 	}
 
@@ -25160,7 +25547,8 @@ qwz_scan_stop(struct qwz_softc *sc)
 		ret = tsleep_nsec(&sc->scan.state, 0, "qwzscstop",
 		    SEC_TO_NSEC(3));
 		if (ret) {
-			printf("%s: scan stop timeout\n", sc->sc_dev.dv_xname);
+			if (ret != ESHUTDOWN)	/* M0.1 (F3) */
+				printf("%s: scan stop timeout\n", sc->sc_dev.dv_xname);
 			break;
 		}
 	}
@@ -25227,7 +25615,8 @@ qwz_start_scan(struct qwz_softc *sc, struct scan_req_params *arg)
 		ret = tsleep_nsec(&sc->scan.state, 0, "qwzscan",
 		    SEC_TO_NSEC(timeout));
 		if (ret) {
-			printf("%s: scan start timeout\n", sc->sc_dev.dv_xname);
+			if (ret != ESHUTDOWN)	/* M0.1 (F3): at a DEAD instant (ESHUTDOWN) this is not a timeout */
+				printf("%s: scan start timeout\n", sc->sc_dev.dv_xname);
 			qwz_scan_stop(sc);
 			break;
 		}
@@ -25280,6 +25669,11 @@ qwz_scan(struct qwz_softc *sc)
 #endif
 	switch (sc->scan.state) {
 	case ATH12K_SCAN_IDLE:
+		if (sc->sc_awdltest_active) {
+			/* debug.qwz.awdltest owns the scan engine for its listens. */
+			ret = EBUSY;
+			break;
+		}
 		sc->scan.started = 0;
 		sc->scan.completed = 0;
 		sc->scan.state = ATH12K_SCAN_STARTING;
@@ -25408,7 +25802,7 @@ qwz_scan(struct qwz_softc *sc)
 			    sc->sc_dev.dv_xname, ret);
 #ifdef __APPLE__
 			/* The retry comes straight back through init_task: pace it. */
-			tsleep_nsec(&sc->scan.state, 0, "qwzscanbk", SEC_TO_NSEC(1));
+			tsleep_delay_nsec(&sc->scan.state, 0, "qwzscanbk", SEC_TO_NSEC(1));
 #endif
 		}
 #ifdef notyet
@@ -25652,8 +26046,33 @@ qwz_deauth(struct qwz_softc *sc)
 	struct qwz_node *nq = (struct qwz_node *)ic->ic_bss;
 	struct qwz_vif *arvif = &sc->sc_vif;
 	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
-	struct ath12k_peer *peer = TAILQ_FIRST(&sc->peers);
+	/* M0 (C06): the peer on the infra vdev whose address is the BSS node's, not "the first listed peer" */
+	struct ath12k_peer *peer = qwz_peer_find_bss(sc, arvif, ic->ic_bss != NULL ? ic->ic_bss->ni_macaddr : NULL);
 	int ret;
+
+	if (peer != NULL) {
+		/*
+		 * M0 (C06): which peer is about to be deleted, and how many others
+		 * are listed (architecture-map question 3). Once per association:
+		 * qwz_peer_delete sets delete_pending at its first attempt and a
+		 * failed attempt leaves it set, so only the first call for a peer
+		 * sees it clear; retries of a stuck delete are rate limited.
+		 */
+		static unsigned int n_bsspeer_retry;
+
+		if (!peer->delete_pending || qwz_log_ratelimit(&n_bsspeer_retry, 8, 32)) {
+			struct ath12k_peer *p;
+			int others = 0;
+
+			TAILQ_FOREACH(p, &sc->peers, entry) {
+				if (p != peer)
+					others++;
+			}
+			qwz_log("qwz: bss peer " QWZ_MACFMT " id %d vdev %d mapped %d delete_pending %d (ic_bss " QWZ_MACFMT "); %d other peer(s) listed\n",
+			    QWZ_MACARG(peer->addr), peer->peer_id, peer->vdev_id, peer->is_mapped, peer->delete_pending,
+			    QWZ_MACARG(ic->ic_bss != NULL ? ic->ic_bss->ni_macaddr : (const uint8_t *)"\0\0\0\0\0\0"), others);
+		}
+	}
 
 	if (ic->ic_opmode == IEEE80211_M_STA) {
 		ic->ic_bss->ni_txrate = 0;
@@ -26430,7 +26849,7 @@ qwz_ba_task(void *arg)
 	int tid;
 
 	for (tid = 0; tid < IEEE80211_NUM_TID; tid++) {
-		if (test_bit(ATH12K_FLAG_CRASH_FLUSH, sc->sc_flags))
+		if (QWZ_CRASHED(sc))
 			break;
 		if (sc->ba_rx.start_tidmask & (1 << tid)) {
 			struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
@@ -26762,7 +27181,8 @@ qwz_run_stop(struct qwz_softc *sc)
 	struct qwz_vif *arvif = &sc->sc_vif;
 	uint8_t pdev_id = 0; /* TODO: derive pdev ID somehow? */
 	struct qwz_node *nq = (struct qwz_node *)((void *)ic->ic_bss);
-	struct ath12k_peer *peer = TAILQ_FIRST(&sc->peers);
+	/* M0 (C06): the peer on the infra vdev whose address is the BSS node's, not "the first listed peer" */
+	struct ath12k_peer *peer = qwz_peer_find_bss(sc, arvif, ic->ic_bss != NULL ? ic->ic_bss->ni_macaddr : NULL);
 	int ret;
 
 	if (peer != NULL) {
@@ -26926,7 +27346,8 @@ qwz_activate(struct device *self, int act)
 
 	switch (act) {
 	case DVACT_QUIESCE:
-		rw_enter_write(&sc->ioctl_rwl);
+		if (rw_enter_write(&sc->ioctl_rwl) != 0)
+			break;		/* M0 (C02): the lock stayed busy: no stop without it */
 		if (ifp->if_flags & IFF_RUNNING)
 			qwz_stop(ifp);
 		if (sc->fw_initialized)
@@ -26940,7 +27361,8 @@ qwz_activate(struct device *self, int act)
 			    sc->sc_dev.dv_xname);
 		break;
 	case DVACT_WAKEUP:
-		rw_enter_write(&sc->ioctl_rwl);
+		if (rw_enter_write(&sc->ioctl_rwl) != 0)
+			break;		/* M0 (C02): the lock stayed busy: no init without it */
 		if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP) {
 			err = qwz_init(ifp);
 			if (err)
@@ -26953,3 +27375,1763 @@ qwz_activate(struct device *self, int act)
 
 	return 0;
 }
+
+#ifdef __APPLE__
+/*
+ * debug.qwz.awdltest=<n>: does the firmware hand the host AWDL frames in any
+ * mode it offers? In station mode it passes none: the rx-probe counted zero
+ * on channel 149, the access point's channel, with an iPhone's AirDrop sheet
+ * open. Each test listens for a while and reports what the probe counted
+ * meanwhile: AWDL action frames, frames with the AWDL BSSID, and management
+ * frames from other BSSs (whether a promiscuous knob did anything at all,
+ * AWDL or not). The association stays up. Nothing transmits except what a
+ * vdev that joined a BSS sends by itself (tests 4 and 5) and test 5's frames.
+ *
+ *	1  passive listens on 149, 44 and 6 with the scan's promiscuous filter
+ *	2  WMI_PDEV_PARAM_SET_PROMISC_MODE_CMDID on the home channel
+ *	3  a P2P-device vdev listening on 149, plain, then promiscuous
+ *	4  a P2P-client vdev "joined" to the AWDL BSSID on the home channel
+ *	5  4's vdev transmits a copy of a peer's AWDL synchronization frame,
+ *	   10 a second for 30 s, under its own address (a sniffer checks the air)
+ *	9  a station-mode baseline, then 1 to 4 in that order
+ *
+ * Runs under the HAL gate from the sysctl caller's thread; every wait
+ * releases the gate. Returns the number of AWDL frames seen.
+ */
+struct qwz_awdltest_counts {
+	uint32_t mgmt, action, a3, data_a3, fbcn, fother;
+};
+
+static struct qwz_vif qwz_awdltest_vif;	/* the extra vdev of tests 3 and 4 */
+
+static void
+qwz_awdltest_snap(struct qwz_softc *sc, struct qwz_awdltest_counts *c)
+{
+	c->mgmt = sc->sc_probe_mgmt_seen;
+	c->action = sc->sc_awdl_mgmt_action;
+	c->a3 = sc->sc_awdl_mgmt_bssid;
+	c->data_a3 = sc->sc_awdl_data_bssid;
+	c->fbcn = sc->sc_probe_foreign_bcn;
+	c->fother = sc->sc_probe_foreign_other;
+}
+
+static uint32_t
+qwz_awdltest_report(struct qwz_softc *sc, const char *what,
+    const struct qwz_awdltest_counts *b, uint64_t t0)
+{
+	struct qwz_awdltest_counts a;
+	uint32_t awdl, action, a3;
+
+	qwz_awdltest_snap(sc, &a);
+	/* An AWDL action frame also carries the AWDL BSSID: count it once. */
+	action = a.action - b->action;
+	a3 = a.a3 - b->a3;
+	awdl = (action > a3 ? action : a3) + (a.data_a3 - b->data_a3);
+	qwz_log("qwz: awdltest: %s: %llu ms: AWDL action %u, AWDL-BSSID mgmt "
+	    "%u, AWDL-BSSID data %u | mgmt %u, other-BSS beacons %u, other-BSS "
+	    "other mgmt %u => %s\n", what,
+	    (getnsecuptime() - t0) / 1000000ULL, a.action - b->action,
+	    a.a3 - b->a3, a.data_a3 - b->data_a3, a.mgmt - b->mgmt,
+	    a.fbcn - b->fbcn, a.fother - b->fother,
+	    awdl ? "AWDL FRAMES RECEIVED" : "no AWDL frames");
+	qwz_log_publish();
+	return awdl;
+}
+
+static void
+qwz_awdltest_wait(struct qwz_softc *sc, uint32_t ms)
+{
+	uint64_t end = getnsecuptime() + (uint64_t)ms * 1000000ULL;
+
+	/* M0 (C01, C22): a delay, not a firmware wait (tsleep_delay_nsec), and it ends at once when the firmware is DEAD or crashed */
+	while (getnsecuptime() < end && sc->fw_initialized && !QWZ_CRASHED(sc))
+		tsleep_delay_nsec(&sc->sc_awdltest_active, 0, "qwzawdl",
+		    MSEC_TO_NSEC(200));
+}
+
+/* A remain-on-channel: a passive one-channel scan, as ath12k does it. */
+static int
+qwz_awdltest_listen(struct qwz_softc *sc, uint32_t vdev_id, uint32_t freq,
+    uint32_t ms, int promisc)
+{
+	struct scan_req_params *arg;
+	uint64_t end;
+	int ret, i;
+
+	for (i = 0; i < 50 && sc->scan.state != ATH12K_SCAN_IDLE; i++)
+		tsleep_delay_nsec(&sc->scan.state, 0, "qwzawsc", MSEC_TO_NSEC(100));	/* M0 (C01): a delay */
+	if (sc->scan.state != ATH12K_SCAN_IDLE) {
+		qwz_log("qwz: awdltest: a scan is still running (state %d): "
+		    "listen on %u MHz skipped\n", sc->scan.state, freq);
+		return EBUSY;
+	}
+	arg = (struct scan_req_params *)malloc(sizeof(*arg), M_DEVBUF,
+	    M_ZERO | M_NOWAIT);
+	if (arg == NULL)
+		return ENOMEM;
+	arg->chan_list = (uint32_t *)malloc(sizeof(uint32_t), M_DEVBUF,
+	    M_ZERO | M_NOWAIT);
+	if (arg->chan_list == NULL) {
+		free(arg, M_DEVBUF, sizeof(*arg));
+		return ENOMEM;
+	}
+	qwz_wmi_start_scan_init(sc, arg);
+	arg->vdev_id = vdev_id;
+	arg->scan_id = ATH12K_SCAN_ID;
+	arg->num_chan = 1;
+	arg->chan_list[0] = freq;
+	arg->dwell_time_active = ms;
+	arg->dwell_time_passive = ms;
+	arg->max_scan_time = ms + 500;
+	arg->burst_duration = ms;
+	/* The bitfields, not WMI flag values: scan_flags bit 8 is offchan_mgmt_tx. */
+	arg->scan_f_passive = 1;
+	arg->scan_f_promisc_mode = promisc ? 1 : 0;
+
+	sc->scan.started = 0;
+	sc->scan.completed = 0;
+	sc->scan.state = ATH12K_SCAN_STARTING;
+	sc->scan.is_roc = 1;	/* the finish must not call ieee80211_end_scan() */
+	sc->scan.roc_freq = freq;
+	sc->scan.vdev_id = vdev_id;
+	ret = qwz_start_scan(sc, arg);
+	if (ret) {
+		qwz_log("qwz: awdltest: listen on %u MHz (vdev %u%s) did not "
+		    "start: %d\n", freq, vdev_id, promisc ? ", promiscuous" : "",
+		    ret);
+		sc->scan.state = ATH12K_SCAN_IDLE;
+	} else {
+		end = getnsecuptime() + (uint64_t)(ms + 2000) * 1000000ULL;
+		/* M0 (C01, C22): a delay, and it ends at once when the firmware is DEAD or crashed (no fw_initialized term, as before) */
+		while (sc->scan.state != ATH12K_SCAN_IDLE &&
+		    getnsecuptime() < end && !QWZ_CRASHED(sc))
+			tsleep_delay_nsec(&sc->scan.state, 0, "qwzawroc",
+			    MSEC_TO_NSEC(250));
+		if (sc->scan.state != ATH12K_SCAN_IDLE) {
+			qwz_log("qwz: awdltest: listen on %u MHz did not end by "
+			    "itself: stopping it\n", freq);
+			qwz_scan_stop(sc);
+		}
+	}
+	sc->scan.is_roc = 0;
+	free(arg->chan_list, M_DEVBUF, sizeof(uint32_t));
+	free(arg, M_DEVBUF, sizeof(*arg));
+	return ret;
+}
+
+static int
+qwz_awdltest_vdev_create(struct qwz_softc *sc, uint32_t subtype)
+{
+	struct qwz_vif *tv = &qwz_awdltest_vif;
+	struct vdev_create_params p = { 0 };
+	uint8_t mac[IEEE80211_ADDR_LEN];
+	int ret, bit;
+
+	if (sc->num_created_vdevs > TARGET_NUM_VDEVS - 2 ||
+	    sc->free_vdev_map == 0) {
+		qwz_log("qwz: awdltest: no free vdev (created %d, free map "
+		    "0x%x)\n", sc->num_created_vdevs, sc->free_vdev_map);
+		return EBUSY;
+	}
+	bit = ffs(sc->free_vdev_map) - 1;
+	memset(tv, 0, sizeof(*tv));
+	tv->bank_id = -1;
+	tv->vdev_id = bit;
+	tv->vdev_type = WMI_VDEV_TYPE_STA;
+	tv->vdev_subtype = (enum wmi_vdev_subtype)subtype;
+	ret = qwz_mac_setup_vdev_create_params(sc, tv, &sc->pdevs[0], &p);
+	if (ret)
+		return ret;
+	/* A locally administered address next to ours. */
+	IEEE80211_ADDR_COPY(mac, sc->sc_ic.ic_myaddr);
+	mac[0] |= 0x02;
+	mac[5] ^= 0x5a;
+	/*
+	 * M2a WP2 (debug.qwz.awdlpeers bit 4): the listen vdev answers to awdl0's address, which AirportItlwm::awdlCreate recorded (ItlQwz::setAwdlAddress)
+	 * when it made awdl0. The derivation above uses the CURRENT en1 address, which macOS changes with the private-address reconfigure at a join;
+	 * the engine's frames carry awdl0's address as the sender, peers address their data to it, and the radio acknowledges only a vdev's own address.
+	 * With the bit off this only logs a difference.
+	 */
+	if (subtype == (uint32_t)WMI_VDEV_SUBTYPE_P2P_CLIENT) {
+		static unsigned int noted;
+		int valid = __atomic_load_n(&sc->sc_awdl_addr_valid, __ATOMIC_ACQUIRE);
+		int same = valid && IEEE80211_ADDR_EQ(mac, sc->sc_awdl_addr);
+
+		if (valid && (qwz_awdlpeers & QWZ_AWDLP_MAC) != 0) {
+			if (qwz_log_ratelimit(&noted, 16, 16))
+				qwz_log("qwz: awdl: listen vdev address " QWZ_MACFMT " taken from awdl0 (en1-derived " QWZ_MACFMT "%s)\n",
+				    QWZ_MACARG(sc->sc_awdl_addr), QWZ_MACARG(mac),
+				    same ? ", the same" : ", DIFFERENT: the en1 address changed since awdl0 was made");
+			IEEE80211_ADDR_COPY(mac, sc->sc_awdl_addr);
+		} else if (valid && !same) {
+			if (qwz_log_ratelimit(&noted, 16, 16))
+				qwz_log("qwz: awdl: WARNING: the listen vdev takes " QWZ_MACFMT " but awdl0 is " QWZ_MACFMT " (debug.qwz.awdlpeers=4 uses awdl0's)\n",
+				    QWZ_MACARG(mac), QWZ_MACARG(sc->sc_awdl_addr));
+		} else if (!valid && (qwz_awdlpeers & QWZ_AWDLP_MAC) != 0) {
+			if (qwz_log_ratelimit(&noted, 16, 16))
+				qwz_log("qwz: awdl: no awdl0 address recorded (debug.qwz.awdl=1 first): the listen vdev takes the en1-derived " QWZ_MACFMT "\n",
+				    QWZ_MACARG(mac));
+		}
+	}
+	ret = qwz_wmi_vdev_create(sc, mac, &p);
+	if (ret) {
+		qwz_log("qwz: awdltest: vdev %d (subtype %u) create failed: "
+		    "%d\n", bit, subtype, ret);
+		return ret;
+	}
+	IEEE80211_ADDR_COPY(tv->vdev_addr, mac);
+	sc->num_created_vdevs++;
+	sc->allocated_vdev_map |= 1U << bit;
+	sc->free_vdev_map &= ~(1U << bit);
+	sc->sc_awdltest_vdev_id = bit;
+	sc->sc_awdltest_vdev_on = 1;
+	/* Its data TX path (qwz_dp_tx): the TCL metadata and bank, as qwz_mac_op_add_interface. */
+	tv->hal_addr_search_flags = HAL_TX_ADDRX_EN;
+	tv->search_type = HAL_TX_ADDR_SEARCH_DEFAULT;
+	qwz_dp_vdev_tx_attach(sc, &sc->pdevs[0], tv);
+	qwz_log("qwz: awdltest: vdev %d (subtype %u) created, address "
+	    QWZ_MACFMT "\n", bit, subtype, QWZ_MACARG(mac));
+	return 0;
+}
+
+static void
+qwz_awdltest_vdev_delete(struct qwz_softc *sc)
+{
+	int ret;
+
+	if (!sc->sc_awdltest_vdev_on)
+		return;
+	ret = qwz_mac_vdev_delete_wait(sc, &qwz_awdltest_vif);
+	qwz_log("qwz: awdltest: vdev %u delete: %d\n", sc->sc_awdltest_vdev_id,
+	    ret);
+	sc->sc_awdltest_vdev_on = 0;
+}
+
+/*
+ * Tests 4 and 5: a P2P-client vdev "joined" to the AWDL BSSID on the AP's
+ * channel. The firmware then passes AWDL action frames up as frames of its
+ * BSS (test 4: 176 and 149 in 15 s on channel 149, none in any other mode).
+ * Brought up as for an AP: vdev start, peer, vdev up (qwz_newstate_auth).
+ * The peer is created by WMI alone, outside sc->peers: its map and delete
+ * events find no peer there and are ignored, so the AP's peer is untouched.
+ */
+static int qwz_awdltest_started, qwz_awdltest_peer, qwz_awdltest_up;
+
+/* qwz_core_deinit: the firmware's vdevs and peers are gone, so nothing is left to leave. */
+static void
+qwz_awdltest_forget(struct qwz_softc *sc)
+{
+	if (sc->sc_awdl_listening)
+		qwz_log("qwz: awdltest: firmware down: AWDL listen dropped (debug.qwz.awdltest=6 to rejoin)\n");
+	qwz_awdltest_started = qwz_awdltest_peer = qwz_awdltest_up = 0;
+	sc->sc_awdltest_vdev_on = 0;
+	sc->sc_awdl_listening = 0;
+	qwz_awdl_peers_clear(sc, 0);
+	/*
+	 * M0 (C21): qwz_core_deinit calls this LAST, after qwz_dp_free released
+	 * every TX slot's node reference (that order must not change), so no slot
+	 * can still hold a quarantined node: free them all.
+	 */
+	qwz_awdl_zombies_reap(sc, 1);
+}
+
+static void
+qwz_awdltest_leave(struct qwz_softc *sc)
+{
+	struct qwz_vif *tv = &qwz_awdltest_vif;
+	uint8_t pdev_id = sc->pdevs[0].pdev_id;
+
+	if (qwz_awdltest_up && sc->fw_initialized)
+		qwz_log("qwz: awdltest: vdev down: %d\n",
+		    qwz_wmi_vdev_down(sc, tv->vdev_id, pdev_id));
+	qwz_awdltest_up = 0;
+	if (qwz_awdltest_peer && sc->fw_initialized) {
+		qwz_awdltest_wait(sc, 200);
+		qwz_log("qwz: awdltest: peer delete: %d\n",
+		    qwz_wmi_send_peer_delete_cmd(sc, qwz_awdl_bssid, tv->vdev_id,
+		    pdev_id));
+		qwz_awdltest_wait(sc, 1000);
+	}
+	qwz_awdltest_peer = 0;
+	qwz_awdl_peers_clear(sc, 1);
+	if (qwz_awdltest_started && sc->fw_initialized)
+		qwz_log("qwz: awdltest: vdev stop: %d\n",
+		    qwz_mac_vdev_stop(sc, tv, pdev_id));
+	qwz_awdltest_started = 0;
+	if (sc->fw_initialized)
+		qwz_awdltest_vdev_delete(sc);
+}
+
+static int
+qwz_awdltest_join(struct qwz_softc *sc, int test)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct qwz_vif *tv = &qwz_awdltest_vif;
+	struct peer_create_params pp;
+	uint8_t pdev_id = sc->pdevs[0].pdev_id;
+	int ret;
+
+	if (ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL) {
+		qwz_log("qwz: awdltest: %d needs an association (the vdev starts "
+		    "on the AP's channel): skipped\n", test);
+		return ENOTCONN;
+	}
+	ret = qwz_awdltest_vdev_create(sc, WMI_VDEV_SUBTYPE_P2P_CLIENT);
+	if (ret)
+		return ret;
+	ret = qwz_wmi_pdev_set_ps_mode(sc, tv->vdev_id, pdev_id,
+	    WMI_STA_PS_MODE_DISABLED);
+	if (ret == 0)
+		ret = qwz_mac_vdev_start(sc, tv, pdev_id);
+	qwz_log("qwz: awdltest: %d: vdev start on the AP's channel: %d\n", test,
+	    ret);
+	if (ret)
+		goto fail;
+	qwz_awdltest_started = 1;
+	memset(&pp, 0, sizeof(pp));
+	pp.peer_addr = (uint8_t *)qwz_awdl_bssid;
+	pp.peer_type = WMI_PEER_TYPE_DEFAULT;
+	pp.vdev_id = tv->vdev_id;
+	ret = qwz_wmi_send_peer_create_cmd(sc, pdev_id, &pp);
+	qwz_log("qwz: awdltest: %d: peer " QWZ_MACFMT " create: %d\n", test,
+	    QWZ_MACARG(qwz_awdl_bssid), ret);
+	if (ret)
+		goto fail;
+	qwz_awdltest_peer = 1;
+	qwz_awdltest_wait(sc, 500);
+	if (!sc->fw_initialized) {
+		ret = ENXIO;
+		goto fail;
+	}
+	ret = qwz_wmi_vdev_up(sc, tv->vdev_id, pdev_id, 1, qwz_awdl_bssid,
+	    NULL, 0, 0);
+	qwz_log("qwz: awdltest: %d: vdev up, BSSID AWDL: %d\n", test, ret);
+	if (ret)
+		goto fail;
+	qwz_awdltest_up = 1;
+	if (qwz_awdltx_eff >= 2) {		/* WP4 (M2a): the lane's parameters on the listen vdev, after VDEV_UP; a failure is only logged */
+		(void)qwz_awdl_vdev_params(sc, "join");
+		if (!sc->fw_initialized) {	/* a command waited for a credit with the gate released and a teardown ran meanwhile: the listen vdev went with the firmware */
+			ret = ENXIO;
+			goto fail;
+		}
+	}
+	/* Multicast goes out through this peer: authorized like any other. */
+	ret = qwz_wmi_set_peer_param(sc, (uint8_t *)qwz_awdl_bssid, tv->vdev_id,
+	    pdev_id, WMI_PEER_AUTHORIZE, 1);
+	qwz_log("qwz: awdltest: %d: BSSID peer authorize: %d\n", test, ret);
+	if (qwz_awdl_lane_pool())		/* WP4 (M2a): the pool's DMA maps now, in a context that may allocate */
+		(void)qwz_awdl_pool_ensure(sc);
+	return 0;
+fail:
+	qwz_awdltest_leave(sc);
+	return ret;
+}
+
+static int qwz_awdltest_tx(struct qwz_softc *, const uint8_t *, size_t);
+
+/*
+ * awdl0 (AirportWCN7850): one AWDL action frame from the AWDL engine, from
+ * the listen vdev (debug.qwz.awdltest=6), as test 5 sends. Under the HAL gate.
+ */
+int
+qwz_awdl_tx(struct qwz_softc *sc, const uint8_t *frame, size_t len)
+{
+	/* M0 (C22): nothing goes out once a teardown has quiesced AWDL or the firmware is DEAD */
+	if (!sc->fw_initialized || !sc->sc_awdl_listening || sc->sc_awdl_quiesce || QWZ_CRASHED(sc))
+		return ENOTCONN;
+	if (len < 24 || len > MCLBYTES)
+		return EINVAL;
+	if (qwz_awdl_lane_pool())			/* WP4 (M2a): the own slot pool carries lane M */
+		return qwz_awdl_pool_tx(sc, frame, len, 0);
+	return qwz_awdltest_tx(sc, frame, len);
+}
+
+/*
+ * awdl0's data path. Each peer the AWDL engine caches gets a firmware peer
+ * on the listen vdev (so its data frames are acknowledged and delivered)
+ * and a node of its own, outside net80211's table, for qwz_dp_tx: the TX
+ * completion releases it, so it keeps one reference of ours for good.
+ */
+static struct ieee80211_node *
+qwz_awdl_node(struct qwz_softc *sc, const uint8_t *addr)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = qwz_node_alloc(ic);
+
+	if (ni == NULL)
+		return NULL;
+	IEEE80211_ADDR_COPY(ni->ni_macaddr, addr);
+	ni->ni_refcnt = 1;
+	ni->ni_chan = ic->ic_bss != NULL ? ic->ic_bss->ni_chan : ic->ic_ibss_chan;
+	return ni;
+}
+
+/*
+ * M0 (R1-04, C22): qwz_awdl_peer_add keeps `peer`, a pointer into sc->peers, across steps that
+ * sleep with the gate released (the WMI credit wait, the 3 s peer-map wait, the REO and peer-param
+ * commands), and nothing waits for this thread: a teardown can run in between. Call this after EVERY
+ * such step and before the next read of `peer`. Returns 0 to go on, else the errno to return, with
+ * `ni` (and `peer`, when it is still ours to free) already released: the caller returns at once.
+ *
+ * qwz_core_deinit frees every entry of sc->peers (qwz_free_peers) and clears fw_initialized in ONE
+ * gate hold (qwz_dp_free and the qmi stub in between never sleep), and a restart bumps sc_fw_epoch
+ * (qwz_clear_dead, start of every full init) before it sets fw_initialized again. So a thread that
+ * holds the gate and sees fw_initialized == 0 or another epoch knows `peer` is FREED and must not
+ * touch it or sc->peers (the pointer scan below, which never dereferences `peer`, is a second
+ * guard for the day that ordering changes). Otherwise `peer` is still linked: when a teardown or
+ * DEAD has begun but qwz_free_peers has not run (it may never: an interface-only stop, a given-up
+ * engine), unlink and free it here as the timeout path does, so nothing is left in sc->peers.
+ */
+static int
+qwz_awdl_peer_resume(struct qwz_softc *sc, uint32_t epoch, struct ath12k_peer *peer,
+    struct ieee80211_node *ni)
+{
+	struct ath12k_peer *p;
+	int gone = !sc->fw_initialized || sc->sc_fw_epoch != epoch;
+
+	if (!gone) {
+		gone = 1;
+		TAILQ_FOREACH(p, &sc->peers, entry) {
+			if (p == peer) {
+				gone = 0;
+				break;
+			}
+		}
+	}
+	if (!gone && sc->sc_awdl_listening && !sc->sc_awdl_quiesce && !QWZ_CRASHED(sc))
+		return 0;
+	if (!gone) {
+		TAILQ_REMOVE(&sc->peers, peer, entry);
+		sc->num_peers--;
+		free(peer, M_DEVBUF, sizeof(*peer));
+	}
+	free(ni, M_DEVBUF, sizeof(struct qwz_node));
+	return ENOTCONN;
+}
+
+int
+qwz_awdl_peer_add(struct qwz_softc *sc, const uint8_t *addr)
+{
+	struct qwz_vif *tv = &qwz_awdltest_vif;
+	struct peer_create_params pp;
+	struct ath12k_peer *peer;
+	struct ieee80211_node *ni;
+	uint8_t pdev_id = sc->pdevs[0].pdev_id;
+	uint32_t epoch = sc->sc_fw_epoch;
+	int i, ret, stop;
+
+	/* M0 (C22): as qwz_awdl_tx */
+	if (!sc->fw_initialized || !sc->sc_awdl_listening || sc->sc_awdl_quiesce || QWZ_CRASHED(sc))
+		return ENOTCONN;
+	for (i = 0; i < sc->sc_awdl_npeers; i++)
+		if (IEEE80211_ADDR_EQ(sc->sc_awdl_peers[i].addr, addr))
+			return 0;
+	if (sc->sc_awdl_npeers >= QWZ_AWDL_PEERS)
+		return ENOSPC;
+	if (qwz_peer_find_by_addr(sc, addr) != NULL)
+		return EEXIST;	/* the AP, or a peer the firmware still owns */
+	ni = qwz_awdl_node(sc, addr);
+	if (ni == NULL)
+		return ENOMEM;
+	peer = malloc(sizeof(*peer), M_DEVBUF, M_ZERO | M_NOWAIT);
+	if (peer == NULL) {
+		free(ni, M_DEVBUF, sizeof(struct qwz_node));
+		return ENOMEM;
+	}
+	peer->peer_id = HAL_INVALID_PEERID;
+	peer->sec_type = HAL_ENCRYPT_TYPE_OPEN;
+	peer->sec_type_grp = HAL_ENCRYPT_TYPE_OPEN;
+	peer->vdev_id = tv->vdev_id;
+	peer->pdev_id = pdev_id;
+	IEEE80211_ADDR_COPY(peer->addr, addr);
+	TAILQ_INSERT_TAIL(&sc->peers, peer, entry);
+	sc->num_peers++;
+	sc->peer_mapped = 0;
+	/*
+	 * A TDLS peer: a station vdev takes one default peer, its BSS (a second
+	 * one is never mapped), and direct peers as TDLS ones; the firmware is
+	 * configured for 8 of them (num_tdls_conn_table_entries).
+	 */
+	pp.peer_addr = (uint8_t *)addr;
+	pp.peer_type = WMI_PEER_TYPE_TDLS;
+	pp.vdev_id = tv->vdev_id;
+	ret = qwz_wmi_send_peer_create_cmd(sc, pdev_id, &pp);
+	if ((stop = qwz_awdl_peer_resume(sc, epoch, peer, ni)) != 0)
+		return stop;
+	while (ret == 0 && peer->peer_id == HAL_INVALID_PEERID) {
+		ret = tsleep_nsec(&sc->peer_mapped, 0, "qwzawdlp", SEC_TO_NSEC(3));
+		if ((stop = qwz_awdl_peer_resume(sc, epoch, peer, ni)) != 0)
+			return stop;
+	}
+	if (ret) {
+		TAILQ_REMOVE(&sc->peers, peer, entry);
+		sc->num_peers--;
+		free(peer, M_DEVBUF, sizeof(*peer));
+		free(ni, M_DEVBUF, sizeof(struct qwz_node));
+		qwz_log("qwz: awdl: peer " QWZ_MACFMT " create failed: %d\n",
+		    QWZ_MACARG(addr), ret);
+		return ret;
+	}
+	((struct qwz_node *)ni)->peer_id = peer->peer_id;
+	ret = qwz_dp_peer_setup(sc, tv->vdev_id, pdev_id, ni);
+	if ((stop = qwz_awdl_peer_resume(sc, epoch, peer, ni)) != 0)
+		return stop;
+	/* Open link, but the firmware still gates data on the authorization. */
+	i = qwz_wmi_set_peer_param(sc, (uint8_t *)addr, tv->vdev_id, pdev_id,
+	    WMI_PEER_AUTHORIZE, 1);
+	if ((stop = qwz_awdl_peer_resume(sc, epoch, peer, ni)) != 0)
+		return stop;
+	qwz_log("qwz: awdl: peer " QWZ_MACFMT " created on vdev %d, id %d, "
+	    "rx setup %d, authorize %d\n", QWZ_MACARG(addr), tv->vdev_id,
+	    ((struct qwz_node *)ni)->peer_id, ret, i);
+	IEEE80211_ADDR_COPY(sc->sc_awdl_peers[sc->sc_awdl_npeers].addr, addr);
+	sc->sc_awdl_peers[sc->sc_awdl_npeers].ni = ni;
+	sc->sc_awdl_npeers++;
+	return 0;
+}
+
+/*
+ * M0 (C21): an AWDL node (or the multicast one) is freed only when no TX slot
+ * holds a reference to it. qwz_awdl_node starts ni_refcnt at 1, our own base
+ * reference, which is never released; every queued frame adds one
+ * (ieee80211_ref_node in qwz_awdl_data_tx) that its TX completion drops. A
+ * node above 1 is QUARANTINED in sc_awdl_zombie[] instead of freed: the late
+ * completion then only decrements it to 1 and never reaches zero, so no
+ * ni_unref_cb runs (that callback is a use-after-free: ieee80211_release_node
+ * writes the node AFTER it, ieee80211_node.c:2136-2143). Zombies are freed when
+ * their count is back to 1 (every qwz_awdl_peers_clear) and unconditionally in
+ * qwz_awdltest_forget. A full quarantine leaks the node (logged) rather than
+ * freeing it under a live reference.
+ */
+static void
+qwz_awdl_node_retire(struct qwz_softc *sc, struct ieee80211_node *ni)
+{
+	int i;
+
+	if (ni == NULL)
+		return;
+	if (ni->ni_refcnt <= 1) {		/* only our own reference: no TX slot holds it */
+		free(ni, M_DEVBUF, sizeof(struct qwz_node));
+		return;
+	}
+	for (i = 0; i < (int)nitems(sc->sc_awdl_zombie); i++) {
+		if (sc->sc_awdl_zombie[i] == NULL) {
+			sc->sc_awdl_zombie[i] = ni;
+			sc->sc_awdl_nzombie++;
+			qwz_log("qwz: awdl: node " QWZ_MACFMT " still referenced by %u TX slot(s): quarantined (%d)\n",
+			    QWZ_MACARG(ni->ni_macaddr), ni->ni_refcnt - 1, sc->sc_awdl_nzombie);
+			return;
+		}
+	}
+	qwz_log("qwz: awdl: quarantine full: node leaked\n");
+}
+
+static void
+qwz_awdl_zombies_reap(struct qwz_softc *sc, int all)
+{
+	int i;
+
+	for (i = 0; i < (int)nitems(sc->sc_awdl_zombie); i++) {
+		struct ieee80211_node *ni = sc->sc_awdl_zombie[i];
+
+		if (ni != NULL && (all || ni->ni_refcnt <= 1)) {
+			free(ni, M_DEVBUF, sizeof(struct qwz_node));
+			sc->sc_awdl_zombie[i] = NULL;
+			sc->sc_awdl_nzombie--;
+		}
+	}
+}
+
+/* fw: the firmware is up, delete its peers too (the vdev is about to stop). */
+static void
+qwz_awdl_peers_clear(struct qwz_softc *sc, int fw)
+{
+	struct qwz_vif *tv = &qwz_awdltest_vif;
+	struct ath12k_peer *peer;
+	uint8_t pdev_id = sc->pdevs[0].pdev_id;
+	int i;
+
+	qwz_awdl_zombies_reap(sc, 0);		/* M0 (C21): earlier quarantined nodes whose slots have completed since */
+	for (i = 0; i < sc->sc_awdl_npeers; i++) {
+		if (fw && sc->fw_initialized)
+			qwz_wmi_send_peer_delete_cmd(sc, sc->sc_awdl_peers[i].addr,
+			    tv->vdev_id, pdev_id);
+		peer = qwz_peer_find_by_addr(sc, sc->sc_awdl_peers[i].addr);
+		if (peer != NULL) {
+			TAILQ_REMOVE(&sc->peers, peer, entry);
+			sc->num_peers--;
+			free(peer, M_DEVBUF, sizeof(*peer));
+		}
+		qwz_awdl_node_retire(sc, sc->sc_awdl_peers[i].ni);	/* M0 (C21): was free() */
+		sc->sc_awdl_peers[i].ni = NULL;
+	}
+	if (sc->sc_awdl_npeers && fw && sc->fw_initialized)
+		qwz_awdltest_wait(sc, 500);	/* the deletes */
+	sc->sc_awdl_npeers = 0;
+	if (sc->sc_awdl_mcast_ni != NULL) {
+		qwz_awdl_node_retire(sc, sc->sc_awdl_mcast_ni);		/* M0 (C21): was free() */
+		sc->sc_awdl_mcast_ni = NULL;
+	}
+}
+
+/* awdl0's own address: frames to it are awdl0's, never the station's. */
+static int
+qwz_awdl_is_our_addr(struct qwz_softc *sc, const uint8_t *addr)
+{
+	return sc->sc_awdl_listening &&
+	    IEEE80211_ADDR_EQ(addr, qwz_awdltest_vif.vdev_addr);
+}
+
+static int
+qwz_awdl_is_peer(struct qwz_softc *sc, const uint8_t *addr)
+{
+	int i;
+
+	for (i = 0; i < sc->sc_awdl_npeers; i++)
+		if (IEEE80211_ADDR_EQ(sc->sc_awdl_peers[i].addr, addr))
+			return 1;
+	return 0;
+}
+
+/* A dropped RX frame that looks like AWDL: the first few, with the error. */
+static void
+qwz_awdl_rx_err_note(struct qwz_softc *sc, struct qwz_rx_msdu *msdu)
+{
+	static unsigned noted;
+	struct rx_mpdu_start_qcn9274 *mpdu;
+
+	if (!sc->sc_awdl_listening || noted >= 8 || msdu->rx_desc == NULL ||
+	    !sc->hal_rx_ops->rx_desc_get_mpdu_fc_valid(msdu->rx_desc))
+		return;
+	mpdu = &msdu->rx_desc->u.wcn7850.mpdu_start;
+	if (!IEEE80211_ADDR_EQ(mpdu->addr3, qwz_awdl_bssid) &&
+	    !qwz_awdl_is_our_addr(sc, mpdu->addr1) &&
+	    !qwz_awdl_is_peer(sc, mpdu->addr2))
+		return;
+	noted++;
+	qwz_log("qwz: awdl: rx dropped #%u: src %u code %u peer %u a1 "
+	    QWZ_MACFMT " a2 " QWZ_MACFMT " a3 " QWZ_MACFMT "\n", noted,
+	    msdu->err_rel_src, msdu->err_code, msdu->peer_id,
+	    QWZ_MACARG(mpdu->addr1), QWZ_MACARG(mpdu->addr2),
+	    QWZ_MACARG(mpdu->addr3));
+}
+
+/* TX completions of awdl0's frames: whether the air took them. */
+static void
+qwz_awdl_tx_done_note(struct qwz_softc *sc, struct qwz_tx_data *tx_data,
+    struct hal_tx_status *ts)
+{
+	static unsigned done, acked;
+	int i, ours = tx_data->ni == sc->sc_awdl_mcast_ni;
+
+	for (i = 0; !ours && i < sc->sc_awdl_npeers; i++)
+		ours = tx_data->ni == sc->sc_awdl_peers[i].ni;
+	if (!ours)
+		return;
+	done++;
+	if (ts->status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED)
+		acked++;
+	if (done <= 6 || (done & 31) == 0)
+		qwz_log("qwz: awdl: tx done #%u: status %u (acked %u of %u), "
+		    "ack rssi %d\n", done, ts->status, acked, done,
+		    (int8_t)ts->ack_rssi);
+}
+
+/* One AWDL data frame (whole 802.11 frame) from the listen vdev; multicast through the vdev's BSS peer. */
+int
+qwz_awdl_data_tx(struct qwz_softc *sc, const uint8_t *frame, size_t len)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = NULL;
+	struct mbuf *m;
+	int i, ret;
+
+	/* M0 (C22): as qwz_awdl_tx */
+	if (!sc->fw_initialized || !sc->sc_awdl_listening || sc->sc_awdl_quiesce || QWZ_CRASHED(sc))
+		return ENOTCONN;
+	if (len < 26 || len > MCLBYTES)
+		return EINVAL;
+	/*
+	 * M0 (C24): the probe ladder (debug.qwz.awdlprobe, read per frame; 1 to
+	 * 3 sit behind the recovery interlock of the sysctl handler).
+	 */
+	if (qwz_awdlprobe == 0) {			/* the control: awdl0's data frames are counted and dropped */
+		sc->sc_stat[QWZ_STAT_AWDL_DROP]++;
+		return ECANCELED;
+	}
+	if (qwz_awdlprobe == 1) {			/* the proven management path: a status-bearing completion, no TCL */
+		int slot, mret;
+
+		if (qwz_awdl_lane_pool())		/* WP4 (M2a): the own slot pool carries lane M */
+			return qwz_awdl_pool_tx(sc, frame, len, 0);
+		mret = qwz_awdltest_tx(sc, frame, len);
+
+		if (mret == 0) {
+			slot = (sc->sc_vif.txmgmt.cur + (int)nitems(sc->sc_vif.txmgmt.data) - 1) % (int)nitems(sc->sc_vif.txmgmt.data);
+			sc->sc_awdl_pmask |= 1U << slot;
+		}
+		return mret;
+	}
+	/* probes 2 and 3 fall through to the TCL path: the cap below applies */
+	if (IEEE80211_IS_MULTICAST(frame + 4)) {
+		if (sc->sc_awdl_mcast_ni == NULL)
+			sc->sc_awdl_mcast_ni = qwz_awdl_node(sc, qwz_awdl_bssid);
+		ni = sc->sc_awdl_mcast_ni;
+	} else {
+		for (i = 0; i < sc->sc_awdl_npeers; i++)
+			if (IEEE80211_ADDR_EQ(sc->sc_awdl_peers[i].addr, frame + 4))
+				ni = sc->sc_awdl_peers[i].ni;
+	}
+	if (ni == NULL)
+		return ENOENT;
+	/*
+	 * M0 (C20): at most QWZ_AWDL_INFLIGHT_MAX AWDL slots outstanding. The
+	 * test sits BEFORE the mbuf is allocated: the cap fires exactly when AWDL
+	 * TX is stuck, i.e. at frame rate, and nothing here would free the mbuf.
+	 */
+	if (sc->sc_awdl_inflight >= QWZ_AWDL_INFLIGHT_MAX) {
+		sc->sc_stat[QWZ_STAT_AWDL_CAP]++;
+		return ENOBUFS;
+	}
+	m = m_gethdr(M_DONTWAIT, MT_DATA);
+	if (m == NULL)
+		return ENOBUFS;
+	MCLGET(m, M_DONTWAIT);
+	if ((M_FLAGS(m) & M_EXT) == 0) {
+		m_freem(m);
+		return ENOBUFS;
+	}
+	memcpy(mtod(m, void *), frame, len);
+	M_SETLEN(m, len);
+	if (qwz_awdlprobe == 2) {			/* M0 (C24): plain Data over TCL: the 26-byte QoS header becomes 24 bytes */
+		uint8_t *p = mtod(m, uint8_t *);
+
+		p[0] = 0x08;				/* plain Data, subtype 0 */
+		memmove(p + 24, p + 26, len - 26);	/* drops the two QoS-control bytes (24 and 25) */
+		M_SETLEN(m, len - 2);
+	}
+	ieee80211_ref_node(ni);
+	ret = qwz_dp_tx(sc, &qwz_awdltest_vif, sc->pdevs[0].pdev_id, ni, m);
+	if (ret)
+		ieee80211_release_node(ic, ni);
+	return ret;
+}
+
+/*
+ * Test 5: one management frame from the joined vdev, through the BSS vif's
+ * txmgmt slots (the completion handler looks slots up there; the WMI
+ * command only takes the vdev id from the vif it is given). Two slots stay
+ * free for the association's own frames. The slot holds a BSS node
+ * reference, as every management frame does: the completion releases it.
+ */
+static int
+qwz_awdltest_tx(struct qwz_softc *sc, const uint8_t *frame, size_t len)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct qwz_txmgmt_queue *txmgmt = &sc->sc_vif.txmgmt;
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[sc->pdevs[0].pdev_id];
+	struct qwz_tx_data *tx_data;
+	struct mbuf *m;
+	int buf_id, ret;
+
+	if (txmgmt->queued >= (int)nitems(txmgmt->data) - 2 || ic->ic_bss == NULL)
+		return ENOSPC;
+	buf_id = txmgmt->cur;
+	tx_data = &txmgmt->data[buf_id];
+	if (tx_data->m != NULL)
+		return ENOSPC;
+	/*
+	 * fix2 (review round 2: memory-R2-1, dead-R2-3): this lane never sleeps, as the pool does (qwz_awdl_pool_tx). tx_data->m is set only
+	 * after a successful send, so while qwz_wmi_cmd_send waits for a WMI credit (3 s, on any thread but the workloop's; the wait releases
+	 * the gate) the slot holds this call's node reference but looks free: a teardown (qwz_vif_purge) or the workloop's PSF/MIF frame takes
+	 * it and NULLs tx_data->ni, and the unwind or the completion then releases a NULL node (kernel panic). So with no credit, or with
+	 * debug.qwz.inject 2 or 7 armed (they zero the credits inside qwz_wmi_cmd_send), refuse before anything is taken. Credits come back
+	 * only through the interrupt action and the flag is set only under the gate this thread holds, so nothing changes between this
+	 * test and the send. With credits the frames are M0.1's; with none, the output thread and awdltest=5 get EAGAIN at once instead of
+	 * after up to 3 s (the workloop's callers always did: the sleep is refused there).
+	 */
+	if ((unsigned int)wmi->eid >= (unsigned int)ATH12K_HTC_EP_COUNT || sc->htc.endpoint[wmi->eid].tx_credits == 0 ||
+	    (__atomic_load_n(&sc->sc_inject, __ATOMIC_ACQUIRE) & QWZ_INJ_WMI_STARVE) != 0)
+		return EAGAIN;
+	m = m_gethdr(M_DONTWAIT, MT_DATA);
+	if (m == NULL)
+		return ENOBUFS;
+	MCLGET(m, M_DONTWAIT);
+	if ((M_FLAGS(m) & M_EXT) == 0) {
+		m_freem(m);
+		return ENOBUFS;
+	}
+	memcpy(mtod(m, void *), frame, len);
+	M_SETLEN(m, len);
+	ret = bus_dmamap_load_mbuf(sc->sc_dmat, tx_data->map, m,
+	    BUS_DMA_WRITE | BUS_DMA_NOWAIT);
+	if (ret) {
+		m_freem(m);
+		return ret;
+	}
+	tx_data->ni = ieee80211_ref_node(ic->ic_bss);
+	sc->sc_awdltest_txns[buf_id] = getnsecuptime();
+	sc->sc_awdltest_txmask |= 1U << buf_id;
+	qwz_awdlx_sub(buf_id, frame, len);	/* M2a (WP3, I1, I2): class, length, phase, slot and age of this submit */
+	ret = qwz_wmi_mgmt_send(sc, &qwz_awdltest_vif, sc->pdevs[0].pdev_id,
+	    buf_id, m, tx_data);
+	if (ret) {
+		sc->sc_awdltest_txmask &= ~(1U << buf_id);
+		qwz_awdlx_unsub(buf_id);
+		bus_dmamap_unload(sc->sc_dmat, tx_data->map);
+		m_freem(m);
+		ieee80211_release_node(ic, tx_data->ni);
+		tx_data->ni = NULL;
+		return ret;
+	}
+	txmgmt->cur = (txmgmt->cur + 1) % nitems(txmgmt->data);
+	txmgmt->queued++;
+	return 0;
+}
+
+static void
+qwz_awdltest_hexdump(const char *what, const uint8_t *p, size_t len)
+{
+	char line[3 * 16 + 1];
+	size_t off, i;
+	int n;
+
+	for (off = 0; off < len; off += 16) {
+		for (i = 0, n = 0; i < 16 && off + i < len; i++)
+			n += snprintf(line + n, sizeof(line) - n, "%02x ",
+			    p[off + i]);
+		qwz_log("qwz: awdltest: %s %03zx: %s\n", what, off, line);
+	}
+}
+
+int
+qwz_awdl_listen_test(struct qwz_softc *sc, int test)
+{
+	static const struct {
+		uint32_t freq, ms;
+	} listens[] = {
+		{ 5745, 5000 }, { 5745, 5000 },	/* 149: AWDL's 5 GHz social channel */
+		{ 5220, 3000 },			/* 44 */
+		{ 2437, 3000 },			/* 6 */
+	};
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct qwz_vif *tv = &qwz_awdltest_vif;
+	struct qwz_awdltest_counts c;
+	uint8_t pdev_id = sc->pdevs[0].pdev_id;
+	char what[96];
+	uint32_t found = 0;
+	uint64_t t0;
+	int ret, i;
+
+	if (test != 1 && test != 2 && test != 3 && test != 4 && test != 5 &&
+	    test != 6 && test != 7 && test != 8 && test != 9 && test != 10)
+		return -EINVAL;
+	if (!sc->fw_initialized) {
+		qwz_log("qwz: awdltest %d: the firmware is not running\n", test);
+		return -ENXIO;
+	}
+	if (sc->sc_awdltest_active)
+		return -EBUSY;
+	/*
+	 * 6: join as test 4 and stay (awdl0's AWDL engine gets the frames the
+	 * firmware passes); 7: leave. Scans stay allowed meanwhile
+	 * (sc_awdltest_active is not set): the infra interface keeps working.
+	 */
+	if (test == 6) {
+		if (sc->sc_awdl_listening) {
+			/*
+			 * M0 (C22): the listen vdev survives an interface-only disable (ItlQwz::disableGated latches the
+			 * flag, qwz_stop does not call qwz_core_deinit, so qwz_awdltest_forget never runs): an explicit 6
+			 * lifts the latch. Never under a stop, init or power-down (they hold the ioctl lock) and never on a
+			 * DEAD firmware: the caller is told, not given a silent success.
+			 */
+			if (sc->sc_awdl_quiesce) {
+				if (sc->ioctl_rwl.rwl_owner != NULL || QWZ_CRASHED(sc)) {
+					qwz_log("qwz: awdltest 6: AWDL listen is on but quiesced, and a stop, init or power-down is running or the firmware is DEAD: quiesce left set, try again\n");
+					qwz_log_publish();
+					return -EBUSY;
+				}
+				__atomic_store_n(&sc->sc_awdl_quiesce, 0u, __ATOMIC_RELEASE);
+				qwz_log("qwz: awdltest 6: AWDL listen was already on: quiesce lifted\n");
+				__atomic_fetch_add(&sc->sc_awdl_peer_gen, 1u, __ATOMIC_RELAXED);	/* M2a WP2: senders heard while AWDL was quiesced got no firmware peer */
+				qwz_log_publish();
+			}
+			return 0;
+		}
+		/* M0 (C22): a teardown quiesced AWDL; joining again (an association and a running firmware are needed anyway) lifts it */
+		__atomic_store_n(&sc->sc_awdl_quiesce, 0u, __ATOMIC_RELEASE);
+		ret = qwz_awdltest_join(sc, 4);
+		sc->sc_awdl_listening = ret == 0;
+		if (ret == 0)
+			__atomic_fetch_add(&sc->sc_awdl_peer_gen, 1u, __ATOMIC_RELAXED);	/* M2a WP2: a new listen: AirportItlwm's list of heard senders starts again */
+		qwz_log("qwz: awdltest 6: AWDL listen %s (%d), awdlprobe %d\n",
+		    ret == 0 ? "on, until debug.qwz.awdltest=7" : "failed", ret, qwz_awdlprobe);
+		qwz_log_publish();
+		return ret == 0 ? 0 : -ret;
+	}
+	if (test == 8) {			/* WP4 (M2a): the lane's vdev parameters again (awdltx >= 2), without a re-join */
+		static unsigned int logged8;
+		ret = sc->sc_awdl_listening && !sc->sc_awdl_quiesce && qwz_awdltx_eff >= 2 ? qwz_awdl_vdev_params(sc, "awdltest=8") : ENOTCONN;
+		if (qwz_log_ratelimit(&logged8, 64, 16)) {
+			qwz_log("qwz: awdltest 8: lane parameters on the listen vdev: %s (%d)\n",
+			    ret == 0 ? "set" : "not set (needs awdltest=6 and awdltx >= 2)", ret);
+			qwz_log_publish();
+		}
+		return ret == 0 ? 0 : -ret;
+	}
+	if (test == 10) {			/* WP4 (M2a): the requeue test: the next 8 unicast completions of the pool are reported as NO_ACK (host side only; the frames go out as usual) */
+		static unsigned int logged10;
+
+		sc->sc_awdl_pool.force_noack = 8;
+		if (qwz_log_ratelimit(&logged10, 64, 16)) {
+			qwz_log("qwz: awdltest 10: the next 8 unicast completions of the lane are reported as NO_ACK\n");
+			qwz_log_publish();
+		}
+		return 0;
+	}
+	if (test == 7) {
+		if (sc->sc_awdl_listening)
+			qwz_awdltest_leave(sc);
+		sc->sc_awdl_listening = 0;
+		qwz_log("qwz: awdltest 7: AWDL listen off\n");
+		qwz_log_publish();
+		return 0;
+	}
+	if (sc->sc_awdl_listening)
+		return -EBUSY;	/* test 4's vdev is in use */
+	sc->sc_awdltest_active = 1;
+	qwz_log("qwz: awdltest %d: start, state %s, home channel %u, services: "
+	    "RX promisc %d, NAN %d, P2P listen offload %d. Keep an iPhone with "
+	    "the AirDrop share sheet open next to the PC.\n", test,
+	    ieee80211_state_name[ic->ic_state],
+	    ic->ic_bss ? ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan) : 0,
+	    isset(sc->wmi.svc_map, WMI_TLV_SERVICE_RX_PROMISC_ENABLE_SUPPORT) ? 1 : 0,
+	    isset(sc->wmi.svc_map, WMI_TLV_SERVICE_NAN) ? 1 : 0,
+	    isset(sc->wmi.svc_map, WMI_TLV_SERVICE_P2P_LISTEN_OFFLOAD_SUPPORT) ? 1 : 0);
+	qwz_log_publish();
+
+	if (test == 9) {
+		qwz_awdltest_snap(sc, &c);
+		t0 = getnsecuptime();
+		qwz_awdltest_wait(sc, 10000);
+		found += qwz_awdltest_report(sc, "baseline, station mode", &c, t0);
+	}
+
+	if ((test == 1 || test == 9) && sc->fw_initialized) {
+		for (i = 0; i < (int)nitems(listens) && sc->fw_initialized; i++) {
+			qwz_awdltest_snap(sc, &c);
+			t0 = getnsecuptime();
+			ret = qwz_awdltest_listen(sc, sc->sc_vif.vdev_id,
+			    listens[i].freq, listens[i].ms, 1);
+			snprintf(what, sizeof(what), "1: promiscuous listen, BSS "
+			    "vdev, %u MHz (start %d)", listens[i].freq, ret);
+			found += qwz_awdltest_report(sc, what, &c, t0);
+		}
+	}
+
+	if ((test == 2 || test == 9) && sc->fw_initialized) {
+		qwz_awdltest_snap(sc, &c);
+		t0 = getnsecuptime();
+		ret = qwz_wmi_pdev_set_param(sc,
+		    WMI_PDEV_PARAM_SET_PROMISC_MODE_CMDID, 1, pdev_id);
+		qwz_log("qwz: awdltest: pdev promiscuous mode on (param 0x%x): "
+		    "%d\n", (unsigned)WMI_PDEV_PARAM_SET_PROMISC_MODE_CMDID, ret);
+		if (ret == 0) {
+			qwz_awdltest_wait(sc, 15000);
+			snprintf(what, sizeof(what), "2: pdev promiscuous mode, "
+			    "home channel");
+			found += qwz_awdltest_report(sc, what, &c, t0);
+			if (sc->fw_initialized) {
+				ret = qwz_wmi_pdev_set_param(sc,
+				    WMI_PDEV_PARAM_SET_PROMISC_MODE_CMDID, 0,
+				    pdev_id);
+				qwz_log("qwz: awdltest: pdev promiscuous mode "
+				    "off: %d\n", ret);
+			}
+		}
+	}
+
+	if ((test == 3 || test == 9) && sc->fw_initialized &&
+	    qwz_awdltest_vdev_create(sc, WMI_VDEV_SUBTYPE_P2P_DEVICE) == 0) {
+		for (i = 0; i < 2 && sc->fw_initialized; i++) {
+			qwz_awdltest_snap(sc, &c);
+			t0 = getnsecuptime();
+			ret = qwz_awdltest_listen(sc, tv->vdev_id, 5745, 5000, i);
+			snprintf(what, sizeof(what), "3: P2P-device listen, "
+			    "5745 MHz%s (start %d)", i ? ", promiscuous" : "", ret);
+			found += qwz_awdltest_report(sc, what, &c, t0);
+		}
+		if (sc->fw_initialized)
+			qwz_awdltest_vdev_delete(sc);
+	}
+
+	if ((test == 4 || test == 9) && sc->fw_initialized &&
+	    qwz_awdltest_join(sc, 4) == 0) {
+		qwz_awdltest_snap(sc, &c);
+		t0 = getnsecuptime();
+		qwz_awdltest_wait(sc, 15000);
+		found += qwz_awdltest_report(sc, "4: vdev joined to the AWDL BSSID",
+		    &c, t0);
+		qwz_awdltest_leave(sc);
+	}
+
+	if (test == 5 && sc->fw_initialized && qwz_awdltest_join(sc, 5) == 0) {
+		uint8_t frame[sizeof(sc->sc_awdltest_tmpl)];
+		uint32_t sent = 0, skipped = 0, failed = 0, done, us;
+		size_t len;
+		int last_err = 0, pending;
+
+		/* The template: the next synchronization frame (PSF) a peer sends. */
+		sc->sc_awdltest_tmpl_len = 0;
+		sc->sc_awdltest_capture = 1;
+		for (i = 0; i < 30 && sc->sc_awdltest_capture && sc->fw_initialized;
+		    i++)
+			qwz_awdltest_wait(sc, 100);
+		sc->sc_awdltest_capture = 0;
+		len = sc->sc_awdltest_tmpl_len;
+		if (len == 0) {
+			qwz_log("qwz: awdltest: 5: no AWDL synchronization frame "
+			    "in 3 s, nothing to transmit (is the iPhone's share "
+			    "sheet open?)\n");
+		} else {
+			qwz_log("qwz: awdltest: 5: template: PSF from " QWZ_MACFMT
+			    ", %zu bytes\n", QWZ_MACARG(sc->sc_awdltest_tmpl + 10),
+			    len);
+			qwz_awdltest_hexdump("5: template", sc->sc_awdltest_tmpl,
+			    len < 64 ? len : 64);
+			sc->sc_awdltest_txmask = 0;
+			sc->sc_awdltest_txok = sc->sc_awdltest_txfail = 0;
+			sc->sc_awdltest_txlast = 0;
+			sc->sc_awdltest_txlat_sum = sc->sc_awdltest_txlat_max = 0;
+			sc->sc_awdltest_txlat_min = UINT64_MAX;
+			qwz_log("qwz: awdltest: 5: transmitting it as " QWZ_MACFMT
+			    " on %u MHz, 10 per second for 30 s: the sniffer should "
+			    "see frames from this address\n",
+			    QWZ_MACARG(tv->vdev_addr), ic->ic_bss->ni_chan->ic_freq);
+			qwz_log_publish();
+			qwz_awdltest_snap(sc, &c);
+			t0 = getnsecuptime();
+			for (i = 0; i < 300 && sc->fw_initialized; i++) {
+				memcpy(frame, sc->sc_awdltest_tmpl, len);
+				IEEE80211_ADDR_COPY(frame + 10, tv->vdev_addr);
+				frame[22] = frame[23] = 0;	/* sequence: the firmware's */
+				/* phy_tx_time and target_tx_time, microseconds */
+				us = (uint32_t)(getnsecuptime() / 1000ULL);
+				frame[32] = frame[36] = us & 0xff;
+				frame[33] = frame[37] = (us >> 8) & 0xff;
+				frame[34] = frame[38] = (us >> 16) & 0xff;
+				frame[35] = frame[39] = (us >> 24) & 0xff;
+				ret = qwz_awdltest_tx(sc, frame, len);
+				if (ret == ENOSPC)
+					skipped++;
+				else if (ret) {
+					failed++;
+					last_err = ret;
+				} else
+					sent++;
+				qwz_awdltest_wait(sc, 100);
+			}
+			qwz_awdltest_wait(sc, 500);	/* the last completions */
+			done = sc->sc_awdltest_txok + sc->sc_awdltest_txfail;
+			pending = __builtin_popcount(sc->sc_awdltest_txmask);
+			qwz_log("qwz: awdltest: 5: sent %u, skipped %u (slots busy), "
+			    "submit errors %u (last %d) | completed ok %u, failed %u "
+			    "(last status %u), pending %d | submit-to-completion "
+			    "min %llu avg %llu max %llu us\n", sent, skipped, failed,
+			    last_err, sc->sc_awdltest_txok, sc->sc_awdltest_txfail,
+			    sc->sc_awdltest_txlast, pending,
+			    done ? sc->sc_awdltest_txlat_min / 1000ULL : 0,
+			    done ? sc->sc_awdltest_txlat_sum / done / 1000ULL : 0,
+			    sc->sc_awdltest_txlat_max / 1000ULL);
+			found += qwz_awdltest_report(sc, "5: received while "
+			    "transmitting", &c, t0);
+			sc->sc_awdltest_txmask = 0;
+		}
+		qwz_awdltest_leave(sc);
+	}
+
+	if (!sc->fw_initialized) {
+		/* The firmware went down meanwhile: its vdevs went with it. */
+		sc->sc_awdltest_vdev_on = 0;
+		qwz_log("qwz: awdltest %d: the firmware stopped during the test\n",
+		    test);
+	}
+	qwz_log("qwz: awdltest %d: done: %u AWDL frame(s) in all%s\n", test,
+	    found, found ? "" : "; the firmware passed none in any mode tried");
+	sc->sc_awdltest_active = 0;
+	qwz_log_publish();
+	return (int)found;
+}
+
+/*
+ * WP4 (M2a): lane M, the own slot pool (docs/research-airdrop-2026-11-06.md appendix A.1 and A.2; spec-WP4.md).
+ *
+ * When debug.qwz.awdlhyg, awdlgate or the rung in force (qwz_awdltx_eff) is non-zero, the AWDL lane's frames no longer
+ * borrow the BSS vif's 8-slot management ring and its ic_bss node reference: they use QWZ_AWDL_POOL slots of their
+ * own, WMI desc_id QWZ_AWDL_DESC_BASE + slot; QWZ_AWDL_POOL_SYNC of them are kept for PSF and MIF (Data frames take at most
+ * the others: a count, not particular slots).
+ * A slot is freed by its completion or by the teardown (qwz_awdl_pool_reap, after qwz_power_down has reset the chip
+ * or cleared its bus mastering), never by a timeout: the firmware reads the frame from the slot's DMA bounce buffer
+ * after the command, and reusing the buffer early would put another frame on the air under the old completion. The
+ * bounce buffer belongs to the slot's map and stays allocated for the life of the softc.
+ *
+ * Everything here runs under the main gate and never sleeps: a submit that would wait for a WMI credit returns EAGAIN, and so does one
+ * that finds debug.qwz.inject 2 or 7 armed (QWZ_INJ_WMI_STARVE: the injection zeroes the credits inside the sender, and the wait that
+ * follows would release the gate with the frame already in its slot; fix1, review round 1: memory MEM-1 and wmi-1). That is also why a
+ * completion, the reaper and the submit cannot interleave inside one slot's lifetime; the check after the send (qwz_awdl_pool_tx) is the
+ * ownership guard should that ever stop holding.
+ */
+#define QWZ_AWDL_TXP_MC0	0x10104028u	/* Data, group-addressed: 20 dBm, OFDM 12M only, 1 stream, 1 attempt */
+#define QWZ_AWDL_TXP_UC0	0x4011c028u	/* Data, unicast: 20 dBm, OFDM 12, 18, 24M, 1 stream, at most 4 attempts */
+#define QWZ_AWDL_TXP_DATA1	0x00108400u	/* 20 MHz, OFDM preamble, frame_type Data */
+
+struct qwz_wmi_tx_send_params {		/* wmi_tx_send_params: tag WMI_TAG_TX_SEND_PARAMS, 8 bytes of payload */
+	uint32_t tlv_header;
+	uint32_t dword0;
+	uint32_t dword1;
+};
+
+/*
+ * awdl0's Data frame with AirportItlwm's handle for it (ItlQwz::awdlDataTxEx). A frame without a handle is
+ * qwz_awdl_data_tx: the probe ladder and the M0 paths, unchanged. A frame WITH a handle (the gate's) is carried by the pool
+ * (awdlprobe=1 and a pool switch on) or refused with ECANCELED: handing it to the M0 ring or to the TCL path would leave the
+ * gate's entry in flight for good, because the completions of those never reach the gate.
+ */
+int
+qwz_awdl_data_tx_ex(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint32_t cookie)
+{
+	if (cookie == 0)
+		return qwz_awdl_data_tx(sc, frame, len);
+	if (qwz_awdlprobe != 1 || !qwz_awdl_lane_pool())		/* switches were turned off or the probe moved while the gate held frames: refused, the gate drops them and counts them */
+		return ECANCELED;
+	if (!sc->fw_initialized || !sc->sc_awdl_listening || sc->sc_awdl_quiesce || QWZ_CRASHED(sc))
+		return ENOTCONN;
+	if (len < 26 || len > MCLBYTES)
+		return EINVAL;
+	return qwz_awdl_pool_tx(sc, frame, len, cookie);
+}
+
+static const char *const qwz_awdl_cls_name[QWZ_AWDL_CLS_MAX] = { "psf", "mif", "uc", "mc" };
+
+/*
+ * WP3 hooks (qwz_awdlx.h, the evidence layer): every pool submit, completion and flush is recorded under slot
+ * 16 + i. Without WP3 they expand to nothing; with it, only these three bodies change if WP3's names differ.
+ */
+#ifdef QWZ_AWDLX_H
+#define QWZ_AWDL_EV_SUB(i, f, l)	qwz_awdlx_sub(16 + (i), (f), (l))
+#define QWZ_AWDL_EV_UNSUB(i)		qwz_awdlx_unsub(16 + (i))
+#define QWZ_AWDL_EV_CMPL(i, st, ack)	qwz_awdlx_cmpl(16 + (i), (st), (ack))
+#else
+#define QWZ_AWDL_EV_SUB(i, f, l)	((void)0)
+#define QWZ_AWDL_EV_UNSUB(i)		((void)0)
+#define QWZ_AWDL_EV_CMPL(i, st, ack)	((void)0)
+#endif
+
+/* The class of a frame about to be sent: Data (unicast or group-addressed) or the AWDL action frame's subtype. */
+static int
+qwz_awdl_classify(const uint8_t *f, size_t len)
+{
+	if ((f[0] & 0x0c) == 0x08)
+		return IEEE80211_IS_MULTICAST(f + 4) ? QWZ_AWDL_CLS_MC : QWZ_AWDL_CLS_UC;
+	if (len >= 31 && f[24] == 0x7f && f[28] == 0x08 && f[30] == 3)
+		return QWZ_AWDL_CLS_MIF;
+	return QWZ_AWDL_CLS_PSF;		/* PSF (subtype 0) and any other AWDL action frame */
+}
+
+/* A refused submit: counted by class and reason (0 no room, 1 no WMI credit, 2 lane closed for tx_params, 3 other), logged at a limited rate. WP3: feed I10 here. */
+static int
+qwz_awdl_refuse(struct qwz_softc *sc, int cls, int why, int err)
+{
+	struct qwz_awdl_pool *pool = &sc->sc_awdl_pool;
+
+	pool->ref[cls][why]++;
+	if (qwz_log_ratelimit(&pool->log_ref, 8, 128))
+		qwz_log("qwz: awdlp: submit refused: %s frame, %s, errno %d (inflight %d/%d, data %d)\n", qwz_awdl_cls_name[cls],
+		    why == 0 ? "no room" : why == 1 ? "no WMI credit" : why == 2 ? "lane closed for tx_params" : "other",
+		    err, pool->inflight, QWZ_AWDL_POOL, pool->inflight_data);
+	return err;
+}
+
+/* The 12-bit sequence counter of a transmitter address: the next number. The first number is taken from the clock. */
+static uint16_t
+qwz_awdl_seq_next(struct qwz_awdl_pool *pool, const uint8_t *ta)
+{
+	int i, victim = 1;
+	uint16_t n;
+
+	for (i = 0; i < (int)nitems(pool->seq); i++) {
+		if (pool->seq[i].used && IEEE80211_ADDR_EQ(pool->seq[i].ta, ta)) {
+			n = pool->seq[i].next;
+			pool->seq[i].next = (n + 1) & 0xfff;
+			return n;
+		}
+		if (!pool->seq[i].used && victim == 1)
+			victim = i;
+	}
+	pool->seq[victim].used = 1;
+	IEEE80211_ADDR_COPY(pool->seq[victim].ta, ta);
+	n = (uint16_t)((getnsecuptime() >> 10) & 0xfff);
+	pool->seq[victim].next = (n + 1) & 0xfff;
+	return n;
+}
+
+/* The wire format of a frame: 0 the plain management command (as M0.1), 1 with the tx_params TLV, 2 as OFFCHAN_DATA_TX; the tx_params dwords. */
+static int
+qwz_awdl_fmt(struct qwz_softc *sc, int cls, uint32_t *d0, uint32_t *d1)
+{
+	if (qwz_awdltx_eff < 2 || (cls != QWZ_AWDL_CLS_UC && cls != QWZ_AWDL_CLS_MC))
+		return 0;
+	*d0 = cls == QWZ_AWDL_CLS_MC ? QWZ_AWDL_TXP_MC0 : QWZ_AWDL_TXP_UC0;
+	*d1 = QWZ_AWDL_TXP_DATA1;
+	if (*d0 == 0 || *d1 == 0)		/* never zero dwords with the flag set: power 0 might mean 0 dBm */
+		return 0;
+	if (qwz_awdltx_eff >= 3) {
+		if (isset(sc->wmi.svc_map, WMI_TLV_SERVICE_OFFCHAN_TX_WMI) &&
+		    isset(sc->wmi.svc_map, WMI_TLV_SERVICE_OFFCHAN_DATA_TID_SUPPORT))
+			return 2;
+		if (qwz_log_ratelimit(&sc->sc_awdl_pool.log_svc, 1, 1000000))
+			qwz_log("qwz: awdlp: awdltx 3: the firmware does not advertise both OFFCHAN_TX_WMI and OFFCHAN_DATA_TID_SUPPORT: Data goes as format 1\n");
+	}
+	return 1;
+}
+
+/*
+ * The management command of a pool frame, as qwz_wmi_mgmt_send builds it (32-byte fixed part, chanfreq 0, the first
+ * 64 bytes inline, the whole frame by reference) plus, for fmt 1 and 2, the tx_params TLV after the byte array, and
+ * for fmt 2 the OFFCHAN_DATA_TX_SEND command and tag. The frame mbuf stays the caller's on every error.
+ */
+static int
+qwz_wmi_awdl_send(struct qwz_softc *sc, uint32_t vdev_id, uint8_t pdev_id, uint32_t desc_id, uint64_t paddr,
+    struct mbuf *frame, int fmt, uint32_t d0, uint32_t d1)
+{
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[pdev_id];
+	struct wmi_mgmt_send_cmd *cmd;
+	struct wmi_tlv *frame_tlv;
+	struct qwz_wmi_tx_send_params *tp;
+	struct mbuf *m;
+	uint32_t buf_len, buf_len_aligned;
+	int ret, len;
+
+	buf_len = M_PKTLEN(frame) < WMI_MGMT_SEND_DOWNLD_LEN ? M_PKTLEN(frame) : WMI_MGMT_SEND_DOWNLD_LEN;
+	buf_len_aligned = roundup(buf_len, sizeof(uint32_t));
+	len = sizeof(*cmd) + sizeof(*frame_tlv) + buf_len_aligned + (fmt ? sizeof(*tp) : 0);
+	m = qwz_wmi_alloc_mbuf(len);
+	if (m == NULL)
+		return ENOMEM;
+	cmd = (struct wmi_mgmt_send_cmd *)(mtod(m, uint8_t *) + sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr));
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, fmt == 2 ? WMI_TAG_OFFCHAN_DATA_TX_SEND_CMD : WMI_TAG_MGMT_TX_SEND_CMD) |
+	    FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->vdev_id = vdev_id;
+	cmd->desc_id = desc_id;
+	cmd->chanfreq = 0;
+	cmd->paddr_lo = paddr & 0xffffffff;
+	cmd->paddr_hi = paddr >> 32;
+	cmd->frame_len = M_PKTLEN(frame);
+	cmd->buf_len = buf_len;
+	cmd->tx_params_valid = fmt != 0;
+	frame_tlv = (struct wmi_tlv *)(mtod(m, uint8_t *) + sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr) +
+	    sizeof(*cmd));
+	frame_tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_BYTE) | FIELD_PREP(WMI_TLV_LEN, buf_len_aligned);
+	memcpy(frame_tlv->value, mtod(frame, void *), buf_len);
+	if (fmt) {
+		tp = (struct qwz_wmi_tx_send_params *)(frame_tlv->value + buf_len_aligned);
+		tp->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_TX_SEND_PARAMS) | FIELD_PREP(WMI_TLV_LEN, sizeof(*tp) - TLV_HDR_SIZE);
+		tp->dword0 = d0;
+		tp->dword1 = d1;
+	}
+	ret = qwz_wmi_cmd_send(wmi, m, fmt == 2 ? WMI_OFFCHAN_DATA_TX_SEND_CMDID : WMI_MGMT_TX_SEND_CMDID);
+	if (ret) {
+		m_freem(m);
+		return ret;
+	}
+	return 0;
+}
+
+/* The 16 DMA maps, once; the bounce buffer of each is attached now (a load of an empty mbuf) so the hot path allocates nothing. */
+int
+qwz_awdl_pool_ensure(struct qwz_softc *sc)
+{
+	struct qwz_awdl_pool *pool = &sc->sc_awdl_pool;
+	struct mbuf *m;
+	int i, ret;
+
+	if (pool->ready)
+		return 0;
+	for (i = 0; i < QWZ_AWDL_POOL; i++) {
+		ret = bus_dmamap_create(sc->sc_dmat, MCLBYTES, 1, MCLBYTES, 0, BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW,
+		    &pool->slot[i].map);
+		if (ret == 0) {
+			m = m_gethdr(M_DONTWAIT, MT_DATA);
+			if (m != NULL) {
+				if (bus_dmamap_load_mbuf(sc->sc_dmat, pool->slot[i].map, m, BUS_DMA_WRITE | BUS_DMA_NOWAIT) == 0)
+					bus_dmamap_unload(sc->sc_dmat, pool->slot[i].map);
+				m_freem(m);
+			}
+			continue;
+		}
+		if (qwz_log_ratelimit(&pool->log_ens, 4, 64))		/* retried by every submit while it fails */
+			qwz_log("qwz: awdlp: pool: DMA map %d: error %d: no pool\n", i, ret);
+		qwz_awdl_pool_destroy(sc);
+		return ret;
+	}
+	pool->ready = 1;
+	qwz_log("qwz: awdlp: pool ready: %d slots, WMI desc 0x%x to 0x%x, %d kept for PSF and MIF (Data takes at most %d), hyg %d tx %d gate %d\n",
+	    QWZ_AWDL_POOL, QWZ_AWDL_DESC_BASE, QWZ_AWDL_DESC_BASE + QWZ_AWDL_POOL - 1, QWZ_AWDL_POOL_SYNC,
+	    QWZ_AWDL_POOL - QWZ_AWDL_POOL_SYNC, qwz_awdlhyg, qwz_awdltx_eff, qwz_awdlgate);
+	return 0;
+}
+
+/* qwz_pci_detach, before qwz_detach: the maps go with the softc (they live from the first use to here, across teardowns). Frames still held (none can be, after the teardown) are freed first. */
+void
+qwz_awdl_pool_destroy(struct qwz_softc *sc)
+{
+	struct qwz_awdl_pool *pool = &sc->sc_awdl_pool;
+	int i;
+
+	for (i = 0; i < QWZ_AWDL_POOL; i++) {
+		struct qwz_awdl_slot *s = &pool->slot[i];
+
+		if (s->m != NULL) {
+			bus_dmamap_unload(sc->sc_dmat, s->map);
+			m_freem(s->m);
+			s->m = NULL;
+		}
+		if (s->map != NULL) {
+			bus_dmamap_destroy(sc->sc_dmat, s->map);
+			s->map = NULL;
+		}
+	}
+	pool->inflight = pool->inflight_data = 0;
+	pool->ready = 0;
+}
+
+/*
+ * One frame for the listen vdev through the pool. Under the main gate; never sleeps: it refuses with EAGAIN, before a slot is taken, when no
+ * WMI credit is available or debug.qwz.inject 2 or 7 has armed the starvation (the sender would wait for a credit with the gate released).
+ * `cookie` is AirportItlwm's handle for the frame (its gate entry), 0 for the rest. Returns 0 or an errno: ENOSPC no room for this
+ * class, EAGAIN no WMI credit or the lane is closed for tx_params, ENOTCONN no association, the listen vdev is down (a leave is running) or
+ * a teardown reaped the frame during the send (nothing is touched then: the reaper owns the mbuf), ENOBUFS memory or DMA.
+ */
+int
+qwz_awdl_pool_tx(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint32_t cookie)
+{
+	struct qwz_awdl_pool *pool = &sc->sc_awdl_pool;
+	struct qwz_awdl_slot *s;
+	struct qwz_vif *tv = &qwz_awdltest_vif;
+	struct ieee80211com *ic = &sc->sc_ic;
+	uint8_t pdev_id = sc->pdevs[0].pdev_id;
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[pdev_id];
+	struct mbuf *m;
+	uint8_t *p;
+	uint32_t d0 = 0, d1 = 0;
+	uint64_t now = getnsecuptime();
+	uint16_t seq = 0, dur, sctl;
+	uint8_t b1, b24, b25, b28, b30;
+	uint32_t epoch0;
+	int i, cls, fmt, ret;
+
+	if (len < 24 || len > MCLBYTES)
+		return EINVAL;
+	cls = qwz_awdl_classify(frame, len);
+	if (QWZ_CRASHED(sc) || ic->ic_bss == NULL || !qwz_awdltest_up)	/* fix2 (wmi-R2-1): awdltest=7 clears the "up" flag right after VDEV_DOWN but sc_awdl_listening only when the leave returns, about 1.7 s later, with the peer, vdev stop and vdev delete in between; the callers test the listen flag, which a join sets only after VDEV_UP, so no legitimate frame sees 0 here. awdlGateRelease flushes the held frames on this ENOTCONN */
+		return qwz_awdl_refuse(sc, cls, 3, ENOTCONN);
+	if (!pool->ready && qwz_awdl_pool_ensure(sc) != 0)
+		return qwz_awdl_refuse(sc, cls, 3, ENOBUFS);
+	if (cls >= QWZ_AWDL_CLS_UC && pool->inflight_data >= QWZ_AWDL_POOL - QWZ_AWDL_POOL_SYNC)
+		return qwz_awdl_refuse(sc, cls, 0, ENOSPC);
+	for (i = 0; i < QWZ_AWDL_POOL; i++)
+		if (pool->slot[i].m == NULL)
+			break;
+	if (i == QWZ_AWDL_POOL)
+		return qwz_awdl_refuse(sc, cls, 0, ENOSPC);
+	if ((unsigned int)wmi->eid >= (unsigned int)ATH12K_HTC_EP_COUNT || sc->htc.endpoint[wmi->eid].tx_credits == 0 ||
+	    (__atomic_load_n(&sc->sc_inject, __ATOMIC_ACQUIRE) & QWZ_INJ_WMI_STARVE) != 0)	/* fix1 (MEM-1, wmi-1): debug.qwz.inject 2 and 7 zero the credits INSIDE qwz_wmi_cmd_send, and the 3 s wait that follows releases the gate with this frame already in its slot (a teardown could reap it meanwhile); the flag is set only under the gate, so nothing changes between this test and the send */
+		return qwz_awdl_refuse(sc, cls, 1, EAGAIN);
+	fmt = qwz_awdl_fmt(sc, cls, &d0, &d1);
+	if (fmt && (ic->ic_state != IEEE80211_S_RUN || sc->scan.state != ATH12K_SCAN_IDLE ||
+	    now - pool->scan_end_ns < 30000000ULL))		/* a frame with tx_params is RAW on a non-pausable TID: not while the infra vdev scans, nor 30 ms after */
+		return qwz_awdl_refuse(sc, cls, 2, EAGAIN);
+	m = m_gethdr(M_DONTWAIT, MT_DATA);
+	if (m == NULL)
+		return qwz_awdl_refuse(sc, cls, 3, ENOBUFS);
+	MCLGET(m, M_DONTWAIT);
+	if ((M_FLAGS(m) & M_EXT) == 0) {
+		m_freem(m);
+		return qwz_awdl_refuse(sc, cls, 3, ENOBUFS);
+	}
+	memcpy(mtod(m, void *), frame, len);
+	M_SETLEN(m, len);
+	p = mtod(m, uint8_t *);
+	if (qwz_awdlhyg) {
+		p[2] = p[3] = 0;				/* duration 0 */
+		if (cls >= QWZ_AWDL_CLS_UC && len >= 26 && (p[0] & 0x8c) == 0x88)
+			p[24] = p[25] = 0;			/* QoS control of a QoS Data frame (type data, subtype bit 3): TID 0, normal ack policy, no A-MSDU. Never an action frame (0xd0): its bytes 24 and 25 are the category 0x7f and the first OUI byte */
+		if (!(p[1] & 0x08)) {				/* a new frame: the next number of its transmitter address, fragment 0 */
+			seq = qwz_awdl_seq_next(pool, p + 10);
+			p[22] = (uint8_t)((seq & 0xf) << 4);
+			p[23] = (uint8_t)(seq >> 4);
+		} else						/* a retransmission keeps the number it had */
+			seq = (uint16_t)((p[22] >> 4) | (p[23] << 4));
+	}
+	s = &pool->slot[i];
+	ret = bus_dmamap_load_mbuf(sc->sc_dmat, s->map, m, BUS_DMA_WRITE | BUS_DMA_NOWAIT);
+	if (ret) {
+		m_freem(m);
+		return qwz_awdl_refuse(sc, cls, 3, ret);
+	}
+	s->m = m;
+	s->t_ns = now;
+	s->cookie = cookie;
+	s->epoch = epoch0 = sc->sc_fw_epoch;
+	s->len = (uint16_t)len;
+	s->seq = seq;
+	s->cls = (uint8_t)cls;
+	s->fmt = (uint8_t)fmt;
+	s->stuck = 0;
+	pool->inflight++;
+	if (cls >= QWZ_AWDL_CLS_UC)
+		pool->inflight_data++;
+	QWZ_AWDL_EV_SUB(i, p, len);
+	/* what the 'tx' line prints, read now: after the send the mbuf belongs to the slot and its completion frees it */
+	b1 = p[1];
+	dur = (uint16_t)(p[2] | (p[3] << 8));
+	sctl = (uint16_t)(p[22] | (p[23] << 8));
+	b24 = len > 24 ? p[24] : 0;
+	b25 = len > 25 ? p[25] : 0;
+	b28 = len > 28 ? p[28] : 0;
+	b30 = len > 30 ? p[30] : 0;
+	ret = qwz_wmi_awdl_send(sc, tv->vdev_id, pdev_id, QWZ_AWDL_DESC_BASE + i, s->map->dm_segs[0].ds_addr, m, fmt, d0, d1);
+	if (!pool->ready || s->m != m || sc->sc_fw_epoch != epoch0) {	/* fix1 (MEM-1, wmi-1): the gate was released inside the send (a credit wait) and a teardown ran: qwz_awdl_pool_reap has freed this mbuf, unloaded the map and zeroed the counters, and the evidence layer has flushed the slot; the unwind below would free it a second time. Unreachable while the starvation test above holds; kept as the ownership check. The local epoch, not s->epoch: a later frame in the same slot would carry the new one */
+		return qwz_awdl_refuse(sc, cls, 3, ENOTCONN);
+	}
+	if (ret) {
+		QWZ_AWDL_EV_UNSUB(i);
+		s->m = NULL;
+		pool->inflight--;
+		if (cls >= QWZ_AWDL_CLS_UC)
+			pool->inflight_data--;
+		bus_dmamap_unload(sc->sc_dmat, s->map);
+		m_freem(m);
+		return qwz_awdl_refuse(sc, cls, 3, ret == ESHUTDOWN ? ENOTCONN : ret);
+	}
+	pool->sub[cls]++;
+	pool->fmtn[fmt]++;
+	if (qwz_log_ratelimit(&pool->log_tx[cls], 8, 256)) {	/* per class, so that PSF and MIF are shown whatever the data rate is */
+		if (cls <= QWZ_AWDL_CLS_MIF)	/* a sync frame: hygiene must leave the category (7f), the OUI type (08) and the subtype alone, and dur is 0 and sc is seq << 4 with it on */
+			qwz_log("qwz: awdlp: tx %s slot %d desc 0x%x seq %u fmt %d len %zu cookie 0x%x%s | dur %04x sc %04x cat %02x type %02x sub %02x\n",
+			    qwz_awdl_cls_name[cls], i, QWZ_AWDL_DESC_BASE + i, seq, fmt, len, cookie, (b1 & 0x08) ? " (retry)" : "",
+			    dur, sctl, b24, b28, b30);
+		else
+			qwz_log("qwz: awdlp: tx %s slot %d desc 0x%x seq %u fmt %d len %zu cookie 0x%x%s | dur %04x sc %04x qos %02x%02x\n",
+			    qwz_awdl_cls_name[cls], i, QWZ_AWDL_DESC_BASE + i, seq, fmt, len, cookie, (b1 & 0x08) ? " (retry)" : "",
+			    dur, sctl, b24, b25);
+	}
+	if (fmt && pool->fmtn[fmt] <= 4)
+		qwz_log("qwz: awdlp: tx_params %s: dword0 0x%08x dword1 0x%08x, %s\n", qwz_awdl_cls_name[cls], d0, d1,
+		    fmt == 2 ? "as OFFCHAN_DATA_TX_SEND" : "in MGMT_TX_SEND");
+	return 0;
+}
+
+/*
+ * The completion of a pool slot (qwz_wmi_process_mgmt_tx_comp calls this for desc_id 0x40 + slot, before its own
+ * bound check): the slot is freed here and nowhere else, then AirportItlwm is told (a Data frame, or any frame with a
+ * cookie) so that it can requeue and re-signal outputStart. Three DISCARD or INSPECT completions in a row within 1 s
+ * lower the rung to F0.
+ */
+void
+qwz_awdl_slot_complete(struct qwz_softc *sc, const struct wmi_mgmt_tx_compl_event *c)
+{
+	struct qwz_awdl_pool *pool = &sc->sc_awdl_pool;
+	struct qwz_awdl_slot *s;
+	struct qwz_awdl_txdone d;
+	qwz_awdl_txdone_fn fn;
+	uint64_t now = getnsecuptime();
+	uint32_t status = c->status;
+	int i = (int)(c->desc_id - QWZ_AWDL_DESC_BASE), cls;
+
+	s = &pool->slot[i];
+	if (s->m == NULL) {
+		pool->stray++;
+		QWZ_AWDL_EV_CMPL(i, status, (int32_t)c->ack_rssi);	/* WP3 counts it as an orphan */
+		if (qwz_log_ratelimit(&pool->log_stray, 4, 64))
+			qwz_log("qwz: awdlp: completion for desc 0x%x with no frame in flight (status %u)\n", c->desc_id, status);
+		return;
+	}
+	cls = s->cls;
+	if (status == QWZ_AWDL_ST_OK && cls == QWZ_AWDL_CLS_UC && pool->force_noack > 0) {	/* debug.qwz.awdltest=10: the requeue test */
+		pool->force_noack--;
+		pool->injected++;
+		status = QWZ_AWDL_ST_NOACK;
+	}
+	d.cookie = s->cookie;
+	d.epoch = s->epoch;
+	d.status = status;
+	d.seq = s->seq;
+	d.lat_us = (uint32_t)((now - s->t_ns) / 1000);
+	d.ack_rssi = (int32_t)c->ack_rssi;
+	d.cls = (uint32_t)cls;
+	if (status == QWZ_AWDL_ST_OK && (cls == QWZ_AWDL_CLS_PSF || cls == QWZ_AWDL_CLS_MIF))
+		qwz_awdl_lat_note(now - s->t_ns);	/* M2a WP5 (awdlclk 8): the pool carries the engine's frames whenever awdlhyg, awdlgate or awdltx is on; the same mean as the M0 lane's, which qwz_wmi_process_mgmt_tx_comp feeds */
+	QWZ_AWDL_EV_CMPL(i, status, d.ack_rssi);
+	bus_dmamap_unload(sc->sc_dmat, s->map);
+	m_freem(s->m);
+	s->m = NULL;
+	pool->inflight--;
+	if (cls >= QWZ_AWDL_CLS_UC) {
+		pool->inflight_data--;
+		sc->sc_stat[status == 0 ? QWZ_STAT_PM_OK : QWZ_STAT_PM_FAIL]++;	/* the 21 percent of the M0 record keeps its meaning */
+	}
+	pool->cmp[cls][status < 4 ? status : 4]++;
+	if (qwz_log_ratelimit(&pool->log_cmp, 16, 256) || (status != 0 && qwz_log_ratelimit(&pool->log_cmp_bad, 16, 32)))
+		qwz_log("qwz: awdlp: done %s slot %d status %u ack_rssi %d lat %u us seq %u cookie 0x%x\n", qwz_awdl_cls_name[cls], i,
+		    status, d.ack_rssi, d.lat_us, d.seq, d.cookie);
+	if (status == QWZ_AWDL_ST_DISCARD || status == QWZ_AWDL_ST_INSPECT) {
+		if (pool->disc_run == 0 || now - pool->disc_first_ns > 1000000000ULL) {
+			pool->disc_run = 1;
+			pool->disc_first_ns = now;
+		} else if (++pool->disc_run >= 3 && qwz_awdltx_eff > 0) {
+			qwz_log("qwz: awdlp: preset F%d -> F0: %u completions in a row with status DISCARD or INSPECT within 1 s\n", qwz_awdltx_eff,
+			    pool->disc_run);
+			qwz_awdltx_eff = 0;
+			pool->disc_run = 0;
+			pool->degraded++;
+		}
+	} else
+		pool->disc_run = 0;
+	fn = __atomic_load_n(&pool->done_fn, __ATOMIC_ACQUIRE);
+	if (fn != NULL && (d.cookie != 0 || cls >= QWZ_AWDL_CLS_UC))
+		fn(pool->done_arg, &d);
+}
+
+/*
+ * qwz_core_deinit, right after qwz_vif_purge (so after qwz_core_stop and qwz_power_down: the chip is reset, or in the
+ * dead and no-link cases its bus mastering is cleared and the DMA hold keeps every freed DMA block allocated): the
+ * frames still in flight will never complete. Their mbufs are freed and the slots become free; the maps keep their
+ * bounce buffers (the firmware, if one survived, can only read old bytes). No frame can enter a slot again before a
+ * full init and an awdltest=6, which come after the late reset has verified the chip (if_qwz_pci.c, qwz_pci_power_up).
+ * A DEAD with frames in flight that used a tx_params or OFFCHAN format lowers the rung by one for the rest of the boot.
+ */
+void
+qwz_awdl_pool_reap(struct qwz_softc *sc)
+{
+	struct qwz_awdl_pool *pool = &sc->sc_awdl_pool;
+	int i, n = 0, nd = 0, nf = 0, dead;
+
+	if (!pool->ready)
+		return;
+	dead = qwz_is_dead(sc) || QWZ_CRASHED(sc);
+	for (i = 0; i < QWZ_AWDL_POOL; i++) {
+		struct qwz_awdl_slot *s = &pool->slot[i];
+
+		if (s->m == NULL)
+			continue;
+		bus_dmamap_unload(sc->sc_dmat, s->map);
+		m_freem(s->m);
+		s->m = NULL;
+		n++;
+		if (s->cls >= QWZ_AWDL_CLS_UC)
+			nd++;
+		if (s->fmt)
+			nf++;
+	}
+	pool->inflight = pool->inflight_data = 0;
+	pool->disc_run = 0;
+	if (n == 0)
+		return;
+	pool->reaped += n;
+	qwz_log("qwz: awdlp: teardown with %d frame(s) in flight (%d Data, %d with a preset): freed, no completion will come (firmware dead %d)\n",
+	    n, nd, nf, dead);
+	if (dead && nf > 0 && qwz_awdltx_eff >= 2) {
+		qwz_log("qwz: awdlp: preset F%d -> F%d for the rest of this boot: the firmware died with preset frames in flight\n",
+		    qwz_awdltx_eff, qwz_awdltx_eff - 1);
+		qwz_awdltx_eff--;
+		pool->degraded++;
+	}
+}
+
+/* A gate-free snapshot for AirportItlwm's pacing (plain loads). */
+void
+qwz_awdl_lane_info(struct qwz_softc *sc, struct qwz_awdl_lane *li)
+{
+	struct qwz_awdl_pool *pool = &sc->sc_awdl_pool;
+	int freeslots = QWZ_AWDL_POOL - pool->inflight;
+	int room = QWZ_AWDL_POOL - QWZ_AWDL_POOL_SYNC - pool->inflight_data;
+
+	li->state = (!sc->fw_initialized || !sc->sc_awdl_listening || sc->sc_awdl_quiesce || QWZ_CRASHED(sc)) ?
+	    QWZ_AWDL_LANE_DOWN : QWZ_AWDL_LANE_OPEN;
+	li->epoch = sc->sc_fw_epoch;
+	if (freeslots < 0)
+		freeslots = 0;
+	if (room > freeslots)
+		room = freeslots;
+	li->free_slots = (uint32_t)freeslots;
+	li->data_room = room > 0 ? (uint32_t)room : 0;
+	li->eff_tx = (uint32_t)qwz_awdltx_eff;
+}
+
+/*
+ * The health sampler (under the gate): the pool's state, the completion tables, and the leak watchdog (a slot is reported, never freed).
+ * fix1 (logging L3): printed when a counter, the pool's occupancy or a switch moved since the last print, and at least once a minute (the
+ * ages are not part of the signature), as awdlGateLog does; the prefix is 'qwz: awdlp: health', so that the guide's 'qwz: health: awdl'
+ * filters keep selecting the awdl[...] line of M0.1 alone.
+ */
+void
+qwz_awdl_pool_log(struct qwz_softc *sc)
+{
+	struct qwz_awdl_pool *pool = &sc->sc_awdl_pool;
+	uint64_t now = getnsecuptime();
+	uint32_t old = 0, stuck = 0, sig;
+	int i, c, k, any = 0;
+
+	if (!pool->ready)
+		return;
+	for (i = 0; i < QWZ_AWDL_POOL; i++) {
+		struct qwz_awdl_slot *s = &pool->slot[i];
+		uint32_t age;
+
+		if (s->m == NULL)
+			continue;
+		age = (uint32_t)((now - s->t_ns) / 1000000ULL);
+		if (age > old)
+			old = age;
+		if (age >= QWZ_AWDL_STUCK_MS) {
+			stuck++;
+			if (!s->stuck) {
+				s->stuck = 1;
+				qwz_log("qwz: awdlp: slot %d (%s, desc 0x%x, seq %u) has been in flight for %u ms with no completion: held until the teardown\n",
+				    i, qwz_awdl_cls_name[s->cls], QWZ_AWDL_DESC_BASE + i, s->seq, age);
+			}
+		}
+	}
+	for (c = 0; c < QWZ_AWDL_CLS_MAX; c++)
+		any |= pool->sub[c] != 0;
+	sig = ((uint32_t)pool->inflight * 31 + (uint32_t)pool->inflight_data) * 31 + stuck;
+	sig = ((sig * 31 + pool->reaped) * 31 + pool->stray) * 31 + pool->degraded;
+	sig = sig * 31 + pool->injected;
+	for (c = 0; c < QWZ_AWDL_CLS_MAX; c++) {
+		sig = sig * 31 + pool->sub[c];
+		for (k = 0; k < 5; k++)
+			sig = sig * 31 + pool->cmp[c][k];
+		for (k = 0; k < 4; k++)
+			sig = sig * 31 + pool->ref[c][k];
+	}
+	for (k = 0; k < 3; k++)
+		sig = sig * 31 + pool->fmtn[k];
+	sig = sig * 31 + (uint32_t)(qwz_awdlhyg + 4 * qwz_awdltx + 16 * qwz_awdltx_eff + 64 * qwz_awdlgate + 256 * qwz_awdltxopt +
+	    1024 * (sc->scan.state != ATH12K_SCAN_IDLE));
+	if (pool->log_ns != 0 && sig == pool->log_sig && now - pool->log_ns < 60000000000ULL)
+		return;
+	pool->log_sig = sig;
+	pool->log_ns = now;
+	qwz_log("qwz: awdlp: health[pool=%d/%d data=%d old=%ums stuck=%u reap=%u stray=%u seq=%03x] cfg[hyg=%d tx=%d/%d gate=%d opt=%d scan=%d]\n",
+	    pool->inflight, QWZ_AWDL_POOL, pool->inflight_data, old, stuck, pool->reaped, pool->stray,
+	    pool->seq[0].used ? pool->seq[0].next : 0, qwz_awdlhyg, qwz_awdltx, qwz_awdltx_eff, qwz_awdlgate, qwz_awdltxopt,
+	    sc->scan.state != ATH12K_SCAN_IDLE);
+	if (!any)
+		return;
+	qwz_log("qwz: awdlp: health st[psf=%u/%u/%u/%u/%u mif=%u/%u/%u/%u/%u uc=%u/%u/%u/%u/%u mc=%u/%u/%u/%u/%u]\n",
+	    pool->cmp[0][0], pool->cmp[0][1], pool->cmp[0][2], pool->cmp[0][3], pool->cmp[0][4],
+	    pool->cmp[1][0], pool->cmp[1][1], pool->cmp[1][2], pool->cmp[1][3], pool->cmp[1][4],
+	    pool->cmp[2][0], pool->cmp[2][1], pool->cmp[2][2], pool->cmp[2][3], pool->cmp[2][4],
+	    pool->cmp[3][0], pool->cmp[3][1], pool->cmp[3][2], pool->cmp[3][3], pool->cmp[3][4]);
+	qwz_log("qwz: awdlp: health sub[psf=%u mif=%u uc=%u mc=%u] ref[uc=%u/%u/%u/%u mc=%u/%u/%u/%u sync=%u] fmt[%u/%u/%u] inj=%u deg=%u\n",
+	    pool->sub[0], pool->sub[1], pool->sub[2], pool->sub[3],
+	    pool->ref[2][0], pool->ref[2][1], pool->ref[2][2], pool->ref[2][3],
+	    pool->ref[3][0], pool->ref[3][1], pool->ref[3][2], pool->ref[3][3],
+	    pool->ref[0][0] + pool->ref[0][1] + pool->ref[0][2] + pool->ref[0][3] +
+	    pool->ref[1][0] + pool->ref[1][1] + pool->ref[1][2] + pool->ref[1][3],
+	    pool->fmtn[0], pool->fmtn[1], pool->fmtn[2], pool->injected, pool->degraded);
+}
+
+/*
+ * The listen vdev's parameters may have gone while a command waited for a WMI credit with the gate released (a teardown, a
+ * DEAD, a quiesce, another firmware epoch, awdltest=7): M0's rule (C17, C22, qwz_awdl_peer_resume), look again before every command.
+ */
+static int
+qwz_awdl_vp_gone(struct qwz_softc *sc, uint32_t epoch)
+{
+	return !sc->fw_initialized || QWZ_CRASHED(sc) || sc->sc_awdl_quiesce || sc->sc_fw_epoch != epoch || !qwz_awdltest_up;
+}
+
+/*
+ * awdltx >= 2: the listen vdev's parameters, after VDEV_UP (qwz_awdltest_join) or on demand (debug.qwz.awdltest=8).
+ * MGMT_RATE is OFDM 12 Mbit/s (the engine's minimum rate; OWL sends at 12); the infra vdev gets 6 Mbit/s. The optional
+ * ones come from debug.qwz.awdltxopt: NON_AGG_SW_RETRY_TH 4, and the beacon-miss counts raised so that the
+ * BSSID that never beacons stops producing a BEACON_MISS roam event every 6.1 s. A parameter stays set until the
+ * vdev is deleted (awdltest=7). ENOTCONN when the vdev is not up or went away meanwhile (see qwz_awdl_vp_gone).
+ */
+int
+qwz_awdl_vdev_params(struct qwz_softc *sc, const char *why)
+{
+	static unsigned int vp_calls;	/* fix2 (wmi-R2-2): the lines below (up to three per call) are limited per call: the first 32 calls, then every 16th */
+	struct qwz_vif *tv = &qwz_awdltest_vif;
+	uint8_t pdev_id = sc->pdevs[0].pdev_id;
+	uint32_t epoch = sc->sc_fw_epoch;
+	int ret, first = 0;
+	int logit = qwz_log_ratelimit(&vp_calls, 32, 16);
+
+	if (qwz_awdl_vp_gone(sc, epoch))
+		return ENOTCONN;
+	ret = qwz_wmi_vdev_set_param_cmd(sc, tv->vdev_id, pdev_id, WMI_VDEV_PARAM_MGMT_RATE,
+	    ATH12K_HW_RATE_CODE(ATH12K_HW_RATE_OFDM_12M, 0, WMI_RATE_PREAMBLE_OFDM));
+	if (logit)
+		qwz_log("qwz: awdlp: %s: vdev %u MGMT_RATE 0x%08x (OFDM 12 Mbit/s): %d\n", why, tv->vdev_id,
+		    (unsigned)ATH12K_HW_RATE_CODE(ATH12K_HW_RATE_OFDM_12M, 0, WMI_RATE_PREAMBLE_OFDM), ret);
+	first = ret;
+	if (qwz_awdltxopt & 1) {
+		if (qwz_awdl_vp_gone(sc, epoch))
+			return ENOTCONN;
+		ret = qwz_wmi_vdev_set_param_cmd(sc, tv->vdev_id, pdev_id, WMI_VDEV_PARAM_NON_AGG_SW_RETRY_TH, 4);
+		if (logit)
+			qwz_log("qwz: awdlp: %s: vdev %u NON_AGG_SW_RETRY_TH 4: %d\n", why, tv->vdev_id, ret);
+		if (first == 0)
+			first = ret;
+	}
+	if (qwz_awdltxopt & 2) {
+		static const uint32_t bm[3] = { WMI_VDEV_PARAM_BMISS_COUNT_MAX, WMI_VDEV_PARAM_BMISS_FIRST_BCNT, WMI_VDEV_PARAM_BMISS_FINAL_BCNT };
+		int rb[3] = { 0, 0, 0 }, k;
+
+		for (k = 0; k < 3; k++) {
+			if (qwz_awdl_vp_gone(sc, epoch))
+				return ENOTCONN;
+			rb[k] = qwz_wmi_vdev_set_param_cmd(sc, tv->vdev_id, pdev_id, bm[k], 255);
+		}
+		if (logit)
+			qwz_log("qwz: awdlp: %s: vdev %u BMISS_COUNT_MAX/FIRST_BCNT/FINAL_BCNT 255: %d/%d/%d\n", why, tv->vdev_id, rb[0], rb[1], rb[2]);
+		if (first == 0)
+			first = rb[0] ? rb[0] : rb[1] ? rb[1] : rb[2];
+	}
+	return first;
+}
+
+/*
+ * WP4 (M2a), F3: the completion of a Data frame sent as WMI_OFFCHAN_DATA_TX_SEND. It carries no ack_rssi, so the
+ * gate's A.2 (c) never opens on it; the pool slot is freed exactly as for a 0x7006 completion.
+ */
+void
+qwz_offchan_data_tx_compl_event(struct qwz_softc *sc, struct mbuf *m)
+{
+	const void **tb;
+	const struct qwz_offchan_data_tx_compl_event *ev;
+	struct wmi_mgmt_tx_compl_event c = { 0 };
+
+	tb = qwz_wmi_tlv_parse_alloc(sc, mtod(m, void *), M_PKTLEN(m));
+	if (tb == NULL)
+		return;
+	ev = (const struct qwz_offchan_data_tx_compl_event *)(tb[WMI_TAG_OFFCHAN_DATA_TX_COMPL_EVENT]);
+	if (ev == NULL) {
+		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+		return;
+	}
+	c.desc_id = ev->desc_id;
+	c.status = ev->status;
+	c.pdev_id = ev->pdev_id;
+	/* fix2 (memory-R2-3): the TLV's own length is in the header word before its value, as qwz_pull_mgmt_tx_compl_param_tlv reads it; the policy guarantees 12 bytes */
+	if (FIELD_GET(WMI_TLV_LEN, ((const struct wmi_tlv *)((const uint8_t *)ev - sizeof(struct wmi_tlv)))->header) >= sizeof(*ev))
+		c.ppdu_id = ev->ppdu_id;
+	free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+	if (c.desc_id >= QWZ_AWDL_DESC_BASE && c.desc_id < QWZ_AWDL_DESC_BASE + QWZ_AWDL_POOL)
+		qwz_awdl_slot_complete(sc, &c);
+}
+#endif /* __APPLE__ */

@@ -157,7 +157,7 @@ public:
     virtual IOReturn getCURRENT_NETWORK(apple80211_scan_result *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn getRSSI_BOUNDS(apple80211_rssi_bounds_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getPOWER_DEBUG_INFO(apple80211_power_debug_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-    virtual IOReturn getHT_CAPABILITY(apple80211_ht_capability *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn getHT_CAPABILITY(apple80211_ht_capability *) AIRPORT_SKYWALK_OVERRIDE;	/* the chip's HT IE: AWDL's TLV 7 */
     virtual IOReturn getLINK_CHANGED_EVENT_DATA(apple80211_link_changed_event_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn getEXTENDED_STATS(apple80211_extended_stats *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getBEACON_PERIOD(apple80211_beacon_period_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -169,7 +169,7 @@ public:
 #else
     virtual IOReturn getCHANNELS_INFO(apple80211_channels_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
 #endif
-    virtual IOReturn getVHT_CAPABILITY(apple80211_vht_capability *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn getVHT_CAPABILITY(apple80211_vht_capability *) AIRPORT_SKYWALK_OVERRIDE;	/* the chip's VHT IE: AWDL's TLV 0x11 */
     virtual IOReturn getBGSCAN_CACHE_RESULTS(apple80211_bgscan_cached_network_data_list *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getROAM_PROFILE(apple80211_roam_profile_band_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getCHIP_COUNTER_STATS(apple80211_chip_stats *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -431,6 +431,8 @@ private:
     static IOReturn wclCountryUpdateGated(OSObject *, void *, void *, void *, void *);
     static IOReturn stopWCLGated(OSObject *, void *, void *, void *, void *);
     void deferWCLCountryUpdate();
+    /* F2: the kernel link-quality metric of en1 (setLQM): 100 while the link is up, -2 when it goes down; WCL.cpp */
+    void reportLqm(int quality, const char *reason);
     static void wclJoinTimeout(OSObject *, IOTimerEventSource *);
     IOReturn beginWCLScan(apple80211ScanRequest *);
     void clearWCLPMKSA();

@@ -77,6 +77,19 @@ public:
     virtual bool dataStalled(bool *healthy) { if (healthy) *healthy = false; return false; }
     virtual void requestBusReset() {}
     
+    /* M0 (C18): fault state and engine plumbing */
+    virtual void setFaultHandler(void (*cb)(void *, uint32_t), void *arg) { (void)cb; (void)arg; }
+    virtual bool faultPending(uint32_t *reason) { if (reason) *reason = 0; return false; }
+    virtual void declareDead(uint32_t reason, const char *detail) { (void)reason; (void)detail; }
+    virtual const char *deadName() { return "-"; }
+    virtual bool healthSnapshot(bool print) { (void)print; return true; }	/* false: the gate was busy */
+    virtual bool linkAlive() { return true; }
+    virtual void releaseWaiters() {}							/* wake every firmware waiter again (the sentinel, while DEAD) */
+    virtual void awdlQuiesce(bool on) { (void)on; }
+    virtual void noteRecovered(uint32_t reason) { (void)reason; }
+    virtual bool recoveryOpen(uint32_t *reason, uint32_t *episode, uint64_t *sinceMs) { if (reason) *reason = 0; if (episode) *episode = 0; if (sinceMs) *sinceMs = 0; return false; }	/* M2a WP0: a recovery episode is open (QWZ_LIFE_RECOVERY: set by DEAD, cleared only by noteRecovered): the reason and number of the DEAD that opened it, ms since it; any thread, no gate, no wait */
+    virtual void setEngineState(const char *state, uint32_t fails, bool givenUp) { (void)state; (void)fails; (void)givenUp; }
+
     virtual struct ieee80211com *get80211Controller() = 0;
     
 #ifdef AIRPORT_WCL

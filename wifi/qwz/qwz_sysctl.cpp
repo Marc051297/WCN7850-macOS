@@ -5,6 +5,7 @@
  */
 #include "qwz_sysctl.h"
 #include "qwz_log.h"
+#include "qwz_life.h"
 
 #include <sys/types.h>
 #include <sys/errno.h>
@@ -20,8 +21,36 @@ extern int qwz_stage_sysctl;	/* qwz_compat.cpp */
  */
 int qwz_he_sysctl = 1;
 
+/*
+ * M0 runtime knobs (docs/m0-spec.md section 4.5, C32), declared in qwz_life.h.
+ * The defaults leave the infrastructure behaviour exactly as in awdldata8.
+ * They are exposed as debug.qwz.m0, deadaware, mmioguard, bme, softassert,
+ * recover, silent, awdlprobe, awdlforce, capsae, inject_arg and proven (the
+ * last is read-only: ItlQwz::noteRecovered sets qwz_recovery_proven).
+ */
+int qwz_m0_on = 1, qwz_dead_aware = 1, qwz_mmio_guard = 1, qwz_bme = 1, qwz_softassert = 1, qwz_recover = 1,
+    qwz_silent = 1, qwz_awdlprobe = 0, qwz_awdlforce = 0, qwz_capsae = 0, qwz_inject_arg = 0, qwz_recovery_proven = 0,
+    qwz_late_settle = 2000,		/* M0.1 (F1): debug.qwz.latesettle, ms of pause before the force wake and before the MHI reset of the late reset (none before the SoC reset) */
+    qwz_late_mode = 0;		/* H1: debug.qwz.latemode, 0 the reviewed M0.1 sequence, 1 a blind SoC reset (posted writes only) before the first BAR read */
+volatile int qwz_pm_pending = 0;	/* HF-1, HF-3: see qwz_life.h; not a sysctl */
+
+int qwz_awdltruth = 0, qwz_awdlclk = 0;	/* M2a WP5: see qwz_life.h; 0 and 0 is M0.1 on the air */
+volatile unsigned int qwz_awdl_lat_us = 0;	/* M2a WP5 (awdlclk 8): see qwz_life.h */
+/* WP4 (M2a): lane M hardening, see qwz_awdl.h */
+int qwz_awdlhyg = 0, qwz_awdltx = 0, qwz_awdltx_eff = 0, qwz_awdlgate = 0, qwz_awdltxopt = 0;
+int qwz_awdlpeers = 0;	/* M2a WP2: debug.qwz.awdlpeers (QWZ_AWDLP_*), declared in qwz_life.h */
+
 static qwz_sysctl_start_fn qwz_sysctl_start_cb;
 static void *qwz_sysctl_start_arg;
+static qwz_sysctl_awdl_fn qwz_sysctl_awdl_cb;
+static void *qwz_sysctl_awdl_arg;
+static qwz_sysctl_awdltest_fn qwz_sysctl_awdltest_cb;
+static void *qwz_sysctl_awdltest_arg;
+static qwz_sysctl_inject_fn qwz_sysctl_inject_cb;	/* debug.qwz.inject (C33): ItlQwz::injectEntry */
+static void *qwz_sysctl_inject_arg;
+static qwz_sysctl_m0_fn qwz_sysctl_m0_cb;		/* debug.qwz.state, recover=2, health=1 (C34): AirportItlwm::m0Sysctl */
+static void *qwz_sysctl_m0_arg;
+static int qwz_awdltest_last = -1;	/* debug.qwz.awdltest read-back */
 static int qwz_logfile_on;	/* debug.qwz.logfile: file sink kept open */
 static bool qwz_sysctl_registered;
 
@@ -44,6 +73,65 @@ qwz_sysctl_start(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_re
 }
 
 static int
+qwz_sysctl_awdltest(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int v = qwz_awdltest_last;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (qwz_sysctl_awdltest_cb == NULL)
+		return ENXIO;	/* no chip attached */
+	qwz_log("qwz: sysctl debug.qwz.awdltest=%d received\n", v);
+	v = qwz_sysctl_awdltest_cb(qwz_sysctl_awdltest_arg, v);
+	qwz_awdltest_last = v;
+	return v < 0 ? -v : 0;
+}
+
+static int
+qwz_sysctl_awdl(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int v = 0;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (qwz_sysctl_awdl_cb == NULL)
+		return ENXIO;	/* QwzMac.kext, or no controller yet */
+	qwz_log("qwz: sysctl debug.qwz.awdl=%d received\n", v);
+	return qwz_sysctl_awdl_cb(qwz_sysctl_awdl_arg, v);
+}
+
+void
+qwz_sysctl_set_awdl(qwz_sysctl_awdl_fn fn, void *arg)
+{
+	qwz_sysctl_awdl_cb = fn;
+	qwz_sysctl_awdl_arg = arg;
+}
+
+void
+qwz_sysctl_set_awdltest(qwz_sysctl_awdltest_fn fn, void *arg)
+{
+	qwz_sysctl_awdltest_cb = fn;
+	qwz_sysctl_awdltest_arg = arg;
+}
+
+/* M0 (C32): same pattern as qwz_sysctl_set_awdltest; the callback stays NULL in QwzMac.kext and the nodes answer ENXIO */
+void
+qwz_sysctl_set_inject(qwz_sysctl_inject_fn fn, void *arg)
+{
+	qwz_sysctl_inject_cb = fn;
+	qwz_sysctl_inject_arg = arg;
+}
+
+void
+qwz_sysctl_set_m0(qwz_sysctl_m0_fn fn, void *arg)
+{
+	qwz_sysctl_m0_cb = fn;
+	qwz_sysctl_m0_arg = arg;
+}
+
+static int
 qwz_sysctl_publish(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
 {
 	int v = 0;
@@ -63,17 +151,281 @@ qwz_sysctl_logfile(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_
 
 	if (err || req->newptr == USER_ADDR_NULL)
 		return err;
-	if (v && !qwz_logfile_on) {
-		qwz_log_file_begin();
-		qwz_log("qwz: ==== file log on (sysctl) ====\n");
-	} else if (!v && qwz_logfile_on) {
+	/*
+	 * M0 (C32): a non-zero write is refused. The synchronous VNOP_WRITE per
+	 * log line from kernel context froze this machine (qwz_log.cpp); the ring
+	 * (QwzMacLog) is the only sink. Writing 0 keeps working. debug.qwz.start's
+	 * own bring-up file sink (QwzMac.kext) is untouched: it never goes
+	 * through this node.
+	 */
+	if (v) {
+		qwz_log("qwz: sysctl debug.qwz.logfile refused: a synchronous file write from kernel context froze this machine\n");
+		return EPERM;
+	}
+	if (qwz_logfile_on) {
 		qwz_log("qwz: ==== file log off (sysctl) ====\n");
 		qwz_log_file_end();
 	}
-	qwz_logfile_on = v ? 1 : 0;
+	qwz_logfile_on = 0;
 	return 0;
 }
 
+/*
+ * M0 handlers (docs/m0-spec.md C32 to C34). Each copies its callback and
+ * argument to locals once, so a set(NULL, NULL) from a detach or stop cannot
+ * turn the NULL test and the call into two different reads.
+ */
+
+/* debug.qwz.state (read-only): the engine and fault state line, composed by AirportItlwm::m0Sysctl */
+static int
+qwz_sysctl_state(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	qwz_sysctl_m0_fn fn = qwz_sysctl_m0_cb;
+	void *arg = qwz_sysctl_m0_arg;
+	char buf[160];
+	int err;
+
+	if (fn == NULL)
+		return ENXIO;	/* QwzMac.kext, or the Airport controller has not started */
+	buf[0] = 0;
+	err = fn(arg, QWZ_M0_STATE, 0, buf, sizeof(buf));
+	if (err)
+		return err;
+	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+}
+
+/* debug.qwz.recover: 0 legacy crash handling, 1 armed; a write of 2 re-arms the engine (C34) */
+static int
+qwz_sysctl_recover(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	qwz_sysctl_m0_fn fn;
+	void *arg;
+	int v = qwz_recover;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v == 2) {
+		fn = qwz_sysctl_m0_cb;
+		arg = qwz_sysctl_m0_arg;
+		if (fn == NULL)
+			return ENXIO;
+		qwz_log("qwz: sysctl debug.qwz.recover=2 received\n");
+		return fn(arg, QWZ_M0_RECOVER, 2, NULL, 0);
+	}
+	if (v != 0 && v != 1)
+		return EINVAL;
+	qwz_log("qwz: sysctl debug.qwz.recover=%d (was %d; 0 legacy crash handling, 1 armed)\n", v, qwz_recover);
+	qwz_recover = v;
+	return 0;
+}
+
+/* debug.qwz.health=1: log one health line now (C34) */
+static int
+qwz_sysctl_health(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	qwz_sysctl_m0_fn fn;
+	void *arg;
+	int v = 0;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v != 1)
+		return EINVAL;
+	fn = qwz_sysctl_m0_cb;
+	arg = qwz_sysctl_m0_arg;
+	if (fn == NULL)
+		return ENXIO;
+	qwz_log("qwz: sysctl debug.qwz.health=1 received\n");
+	return fn(arg, QWZ_M0_HEALTH, 1, NULL, 0);
+}
+
+/*
+ * debug.qwz.inject=<mode>: the fault-injection harness (C33). The argument is
+ * debug.qwz.inject_arg. ItlQwz::injectEntry mirrors awdlTestEntry for its own
+ * refusals (a negative errno), qwz_inject returns a positive one: the sign is
+ * normalised here, so the shell always sees an errno.
+ */
+static int
+qwz_sysctl_inject(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	qwz_sysctl_inject_fn fn;
+	void *arg;
+	int v = 0;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	fn = qwz_sysctl_inject_cb;
+	arg = qwz_sysctl_inject_arg;
+	if (fn == NULL || arg == NULL)
+		return ENXIO;	/* QwzMac.kext, or no chip attached; arg too: qwz_sysctl_set_inject stores the two in turn, so a load racing it can pair a live fn with a NULL arg */
+	qwz_log("qwz: sysctl debug.qwz.inject=%d received (inject_arg %d)\n", v, qwz_inject_arg);
+	v = fn(arg, v, qwz_inject_arg);
+	return v < 0 ? -v : v;
+}
+
+/* debug.qwz.awdlprobe: the AWDL data-TX probe 0 to 3 with the recovery interlock (the handler text of C24) */
+static int
+qwz_sysctl_awdlprobe(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int v = qwz_awdlprobe;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v < 0 || v > 3)
+		return EINVAL;
+	if (v >= 1 && !qwz_recovery_proven && !qwz_awdlforce) {
+		qwz_log("qwz: probe: awdlprobe=%d refused: recovery has not been proven by a real crash in this boot (debug.qwz.inject=6, then wait for \"recovery proven\")\n", v);
+		return EPERM;
+	}
+	qwz_awdlprobe = v;
+	qwz_log("qwz: probe: awdlprobe=%d (0 control, 1 mgmt path, 2 TCL plain Data, 3 TCL QoS as awdldata8)\n", v);
+	return 0;
+}
+
+/*
+ * M2a WP2: debug.qwz.awdlpeers (a bit mask, qwz_life.h). A write is checked against the known bits and logged with the old value, so the
+ * ring says which arm of an A/B run a later line belongs to. A plain int: every reader tests one bit per use.
+ */
+static int
+qwz_sysctl_awdlpeers(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	static unsigned int logged;
+	int v = qwz_awdlpeers;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v < 0 || (v & ~QWZ_AWDLP_ALL) != 0)
+		return EINVAL;
+	if (qwz_log_ratelimit(&logged, 64, 16))
+		qwz_log("qwz: sysctl debug.qwz.awdlpeers=%d received (was %d; bit 1 reset the heard-sender list at each listen, 2 honour the peer cache op, 4 the listen vdev takes awdl0's address)\n",
+		    v, qwz_awdlpeers);
+	qwz_awdlpeers = v;
+	return 0;
+}
+
+/*
+ * WP4 (M2a): debug.qwz.awdlhyg, awdltx, awdlgate and awdltxopt, the lane M hardening of qwz_awdl.h. A write is logged (the first 64
+ * per knob, then every 16th, as debug.qwz.awdlpeers). awdltx 2 and 3 put new commands on the air, so they sit behind the same
+ * recovery interlock as awdlprobe 1 to 3; a write of awdltx also sets the rung in force (debug.qwz.awdltxeff, read-only), which a
+ * failure lowers at run time.
+ */
+static int
+qwz_sysctl_awdlhyg(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	static unsigned int logged;
+	int v = qwz_awdlhyg;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v < 0 || v > 1)
+		return EINVAL;
+	if (qwz_log_ratelimit(&logged, 64, 16))
+		qwz_log("qwz: awdlp: sysctl debug.qwz.awdlhyg=%d (was %d): %s\n", v, qwz_awdlhyg,
+		    v ? "own slot pool, 12-bit sequence numbers, the retry bit on a requeue, duration 0, QoS TID 0, pacing in outputStart" : "off");
+	qwz_awdlhyg = v;
+	return 0;
+}
+
+static int
+qwz_sysctl_awdltx(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	static unsigned int logged, refused;
+	int v = qwz_awdltx;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v < 0 || v > QWZ_AWDL_TX_MAX)
+		return EINVAL;
+	if (v >= 2 && !qwz_recovery_proven && !qwz_awdlforce) {
+		if (qwz_log_ratelimit(&refused, 64, 16))
+			qwz_log("qwz: awdlp: awdltx=%d refused: recovery has not been proven by a real crash in this boot (debug.qwz.inject=6, then wait for \"recovery proven\")\n", v);
+		return EPERM;
+	}
+	if (qwz_log_ratelimit(&logged, 64, 16))
+		qwz_log("qwz: awdlp: sysctl debug.qwz.awdltx=%d (was %d, in force %d): %s\n", v, qwz_awdltx, qwz_awdltx_eff,
+		    v == 0 ? "the M0.1 lane" : v == 1 ? "F1, the own slot pool" : v == 2 ? "F2, + MGMT_RATE 12 Mbit/s (awdltest=8 or a re-join sets it) and the tx_params presets for Data" : "F3, + Data as OFFCHAN_DATA_TX_SEND");
+	qwz_awdltx = qwz_awdltx_eff = v;
+	return 0;
+}
+
+static int
+qwz_sysctl_awdlgate(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	static unsigned int logged;
+	int v = qwz_awdlgate;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v < 0 || v > 2)
+		return EINVAL;
+	if (qwz_log_ratelimit(&logged, 64, 16))
+		qwz_log("qwz: awdlp: sysctl debug.qwz.awdlgate=%d (was %d): %s\n", v, qwz_awdlgate,
+		    v == 0 ? "off" : v == 1 ? "peer-activity gate and requeue" : "+ the shared-slot test");
+	qwz_awdlgate = v;
+	return 0;
+}
+
+static int
+qwz_sysctl_awdltxopt(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	static unsigned int logged;
+	int v = qwz_awdltxopt;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v < 0 || v > 3)
+		return EINVAL;
+	if (qwz_log_ratelimit(&logged, 64, 16))
+		qwz_log("qwz: awdlp: sysctl debug.qwz.awdltxopt=%d (was %d): 1 NON_AGG_SW_RETRY_TH 4, 2 BMISS counts raised; applied with awdltx >= 2 at the next join or awdltest=8\n", v, qwz_awdltxopt);
+	qwz_awdltxopt = v;
+	return 0;
+}
+/*
+ * M2a WP5: debug.qwz.awdltruth and debug.qwz.awdlclk. Plain switches the Wi-Fi kext reads on the next frame it builds
+ * (the AWDL kext cannot see them), so there is no callback: the handlers validate and log.
+ */
+static int
+qwz_sysctl_awdltruth(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	static unsigned int logged;
+	int v = qwz_awdltruth;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v < 0 || v > 3)
+		return EINVAL;
+	qwz_awdltruth = v;
+	if (qwz_log_ratelimit(&logged, 64, 16))
+		qwz_log("qwz: sysctl debug.qwz.awdltruth=%d received (0 a peer's TLVs copied, 1 every slot 149, 2 the engine's sequence projected to 149, 3 the followed peer's sequence, usable slots only)\n", v);
+	return 0;
+}
+
+static int
+qwz_sysctl_awdlclk(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	static unsigned int logged;
+	int v = qwz_awdlclk;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v < 0 || (v & ~0x1f) != 0)
+		return EINVAL;
+	qwz_awdlclk = v;
+	if (qwz_log_ratelimit(&logged, 64, 16))
+		qwz_log("qwz: sysctl debug.qwz.awdlclk=0x%x received (1 AW sequence posted modulo 65536, 2 realign to the best heard peer every 20 s while master, 4 tx_counter rounded, 8 phy_tx_time stamped with the measured delay, 16 PSF as a follower every 440 TU)\n", v);
+	return 0;
+}
 SYSCTL_NODE(_debug, OID_AUTO, qwz, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "QwzMac");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, start, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, qwz_sysctl_start, "I", "write 1 to run the bring-up");
@@ -82,9 +434,64 @@ SYSCTL_INT(_debug_qwz, OID_AUTO, stage, CTLFLAG_RW | CTLFLAG_LOCKED,
 SYSCTL_PROC(_debug_qwz, OID_AUTO, publish, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, qwz_sysctl_publish, "I", "write 1 to republish the log ring as QwzMacLog");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, logfile, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-    0, 0, qwz_sysctl_logfile, "I", "1: every log line also goes to " QWZ_LOG_FILE);
+    0, 0, qwz_sysctl_logfile, "I", "M0: a non-zero write is refused (EPERM), the synchronous file sink froze this machine; 0 is accepted");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdl, "I", "1: create awdl0 (AirportWCN7850, once per boot), 2: its link up, 3: down; 20, 22, 26: M2a test of a peer cache add, delete, update op for a fixed test address");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdltest, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdltest, "I", "write n to run AWDL test n (1-5, 9 = 1-4); reads the AWDL frames counted");
 SYSCTL_INT(_debug_qwz, OID_AUTO, he, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_he_sysctl, 0, "0: no 802.11ax for the next association (needs itlwm_he=1 to be on at all)");
+/* M0 (C32 to C34): the runtime switches of docs/m0-spec.md section 4.5 and the entry points of the harness */
+SYSCTL_INT(_debug_qwz, OID_AUTO, m0, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_m0_on, 0, "0: the sentinel stops enforcing, DEAD is never declared (legacy RDDM path), the watchdog skip is off");
+SYSCTL_INT(_debug_qwz, OID_AUTO, deadaware, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_dead_aware, 0, "0: tsleep ignores DEAD");
+SYSCTL_INT(_debug_qwz, OID_AUTO, mmioguard, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_mmio_guard, 0, "0: BAR reads and writes ignore the MMIO block");
+SYSCTL_INT(_debug_qwz, OID_AUTO, bme, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_bme, 0, "0: no bus-master clear after a dead power-down, no command-bit re-assert at power-up");
+SYSCTL_INT(_debug_qwz, OID_AUTO, softassert, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_softassert, 0, "0: soft asserts panic like KASSERT");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, recover, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_recover, "I", "0 legacy, 1 armed, write 2 re-arms");
+SYSCTL_INT(_debug_qwz, OID_AUTO, silent, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_silent, 0, "silent firmware and persistent SYS_ERR: 0 off, 1 shadow (logs would-declare), 2 armed");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdlprobe, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdlprobe, "I", "AWDL data TX probe: 0 control, 1 mgmt path, 2 TCL plain Data, 3 TCL QoS; 1 to 3 need a proven recovery");
+SYSCTL_INT(_debug_qwz, OID_AUTO, awdlforce, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_awdlforce, 0, "1: allow AWDL probes 1 to 3 and inject 7 without the recovery interlock (unsafe)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, capsae, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_capsae, 0, "getCARD_CAPABILITIES SAE experiment 0 to 3; reset to 0 after each cell");
+SYSCTL_INT(_debug_qwz, OID_AUTO, inject_arg, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_inject_arg, 0, "argument of the next debug.qwz.inject");
+SYSCTL_INT(_debug_qwz, OID_AUTO, proven, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &qwz_recovery_proven, 0, "1: a real crash (RDDM) was recovered in this boot (read-only)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, latesettle, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_late_settle, 0, "M0.1: ms of pause before the force wake and before the MHI reset of the late reset after a no-link teardown (the 1 Hz stream window gets the crumb first; the SoC reset has no pause); 0: no pauses; at most 3000 per pause (2000 with latemode 1), larger values are used as the limit; a pause ends at once on DEAD or a pending system sleep or stop");
+SYSCTL_INT(_debug_qwz, OID_AUTO, latemode, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_late_mode, 0, "H1: late reset after a no-link teardown: 0 reads first (M0.1), 1 blind SoC reset first (posted writes, no read), then the same verification");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdlpeers, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdlpeers, "I", "M2a: AWDL peer hygiene bit mask, 0 = M0.1: 1 reset the heard-sender list at each listen start, 2 honour setPEER_CACHE_CONTROL ops (a delete creates no firmware peer), 4 the listen vdev takes awdl0's address");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdlhyg, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdlhyg, "I", "WP4: lane M hygiene and pacing: 0 off (M0.1), 1 own slot pool, sequence numbers, retry bit, pacing in outputStart (awdl0 Data needs awdlprobe=1)");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdltx, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdltx, "I", "WP4: lane M preset: 0 M0.1, 1 own slot pool, 2 + MGMT_RATE 12 Mbit/s and tx_params presets, 3 + Data as OFFCHAN_DATA_TX_SEND; 2 and 3 need a proven recovery");
+SYSCTL_INT(_debug_qwz, OID_AUTO, awdltxeff, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &qwz_awdltx_eff, 0, "WP4: the lane M preset in force (awdltx, lowered by a failure; read-only)");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdlgate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdlgate, "I", "WP4: lane M gate and requeue: 0 off, 1 peer-activity gate, 2 + shared-slot test (awdl0 Data needs awdlprobe=1)");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdltxopt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdltxopt, "I", "WP4: with awdltx >= 2, mask: 1 NON_AGG_SW_RETRY_TH 4, 2 BMISS counts raised");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdltruth, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdltruth, "I", "M2a: AWDL sync TLVs on the air: 0 a peer's copied (M0.1), 1 149 in every slot, 2 the engine's sequence projected to 149, 3 the followed peer's sequence, usable slots only");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, awdlclk, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_awdlclk, "I", "M2a: AWDL clock policy, bit mask: 1 AW sequence posted modulo 65536, 2 realign to the best heard peer every 20 s while master, 4 round tx_counter, 8 phy_tx_time + measured delay, 16 PSF as a follower every 440 TU");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, inject, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_inject, "I", "fault injection, modes 0 to 7 (argument: debug.qwz.inject_arg)");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_state, "A", "engine and fault state");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, health, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_health, "I", "write 1 to log one health line now");
 #ifdef QWZ_DEBUG
 extern uint32_t qwz_debug;	/* qwz.c: QWZ_D_* mask from qwzvar.h */
 SYSCTL_UINT(_debug_qwz, OID_AUTO, debug, CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -104,6 +511,36 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_publish);
 	sysctl_register_oid(&sysctl__debug_qwz_logfile);
 	sysctl_register_oid(&sysctl__debug_qwz_he);
+	sysctl_register_oid(&sysctl__debug_qwz_awdltest);
+	sysctl_register_oid(&sysctl__debug_qwz_awdl);
+	/* M0 (C32) */
+	sysctl_register_oid(&sysctl__debug_qwz_m0);
+	sysctl_register_oid(&sysctl__debug_qwz_deadaware);
+	sysctl_register_oid(&sysctl__debug_qwz_mmioguard);
+	sysctl_register_oid(&sysctl__debug_qwz_bme);
+	sysctl_register_oid(&sysctl__debug_qwz_softassert);
+	sysctl_register_oid(&sysctl__debug_qwz_recover);
+	sysctl_register_oid(&sysctl__debug_qwz_silent);
+	sysctl_register_oid(&sysctl__debug_qwz_awdlprobe);
+	sysctl_register_oid(&sysctl__debug_qwz_awdlforce);
+	sysctl_register_oid(&sysctl__debug_qwz_capsae);
+	sysctl_register_oid(&sysctl__debug_qwz_inject_arg);
+	sysctl_register_oid(&sysctl__debug_qwz_proven);
+	sysctl_register_oid(&sysctl__debug_qwz_latesettle);
+	sysctl_register_oid(&sysctl__debug_qwz_latemode);
+	/* WP4 (M2a) */
+	sysctl_register_oid(&sysctl__debug_qwz_awdlhyg);
+	sysctl_register_oid(&sysctl__debug_qwz_awdltx);
+	sysctl_register_oid(&sysctl__debug_qwz_awdltxeff);
+	sysctl_register_oid(&sysctl__debug_qwz_awdlgate);
+	sysctl_register_oid(&sysctl__debug_qwz_awdltxopt);
+	/* M2a WP2 */
+	sysctl_register_oid(&sysctl__debug_qwz_awdlpeers);
+	sysctl_register_oid(&sysctl__debug_qwz_awdltruth);
+	sysctl_register_oid(&sysctl__debug_qwz_awdlclk);
+	sysctl_register_oid(&sysctl__debug_qwz_inject);
+	sysctl_register_oid(&sysctl__debug_qwz_state);
+	sysctl_register_oid(&sysctl__debug_qwz_health);
 #ifdef QWZ_DEBUG
 	sysctl_register_oid(&sysctl__debug_qwz_debug);
 #endif
@@ -120,6 +557,35 @@ qwz_sysctl_unregister(void)
 #ifdef QWZ_DEBUG
 	sysctl_unregister_oid(&sysctl__debug_qwz_debug);
 #endif
+	/* M0 (C32), in the reverse order of the registration */
+	sysctl_unregister_oid(&sysctl__debug_qwz_health);
+	sysctl_unregister_oid(&sysctl__debug_qwz_state);
+	sysctl_unregister_oid(&sysctl__debug_qwz_inject);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdlclk);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdltruth);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdlpeers);
+	/* WP4 (M2a), registered after latemode, so unregistered before it */
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdltxopt);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdlgate);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdltxeff);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdltx);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdlhyg);
+	sysctl_unregister_oid(&sysctl__debug_qwz_latemode);
+	sysctl_unregister_oid(&sysctl__debug_qwz_latesettle);
+	sysctl_unregister_oid(&sysctl__debug_qwz_proven);
+	sysctl_unregister_oid(&sysctl__debug_qwz_inject_arg);
+	sysctl_unregister_oid(&sysctl__debug_qwz_capsae);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdlforce);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdlprobe);
+	sysctl_unregister_oid(&sysctl__debug_qwz_silent);
+	sysctl_unregister_oid(&sysctl__debug_qwz_recover);
+	sysctl_unregister_oid(&sysctl__debug_qwz_softassert);
+	sysctl_unregister_oid(&sysctl__debug_qwz_bme);
+	sysctl_unregister_oid(&sysctl__debug_qwz_mmioguard);
+	sysctl_unregister_oid(&sysctl__debug_qwz_deadaware);
+	sysctl_unregister_oid(&sysctl__debug_qwz_m0);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdl);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdltest);
 	sysctl_unregister_oid(&sysctl__debug_qwz_he);
 	sysctl_unregister_oid(&sysctl__debug_qwz_logfile);
 	sysctl_unregister_oid(&sysctl__debug_qwz_publish);
