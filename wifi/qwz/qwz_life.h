@@ -29,6 +29,15 @@ extern int qwz_m0_on, qwz_dead_aware, qwz_mmio_guard, qwz_bme, qwz_softassert, q
     qwz_awdlprobe, qwz_awdlforce, qwz_capsae, qwz_inject_arg, qwz_recovery_proven, qwz_late_settle, qwz_late_mode;
 /* S1 (hotspot Wi-Fi, docs/research-hotspot-wifi-2026-11-07.md): debug.qwz.cap73, default 1: getCARD_CAPABILITIES sets bit 73 (capabilities[9] 0x02); 0 = the old blob. Defined in qwz_sysctl.cpp */
 extern int qwz_cap73;
+/* K1 (docs/awdl-polish-plan-2026-11-07.md, W1 and W3), all default 0 = the build before K1; plain globals read at call time, defined in qwz_sysctl.cpp.
+ * debug.qwz.monnocred 1: the user-space frame write answers ENOSPC (not EAGAIN) while both WMI credits are in flight and ENXIO while the firmware is down, crashed or a sleep is pending;
+ * debug.qwz.monqmax N > 0: DATA and CONTROL frames from user space get ENOSPC once N frames are queued in the capture TX ring (management frames keep all 63 slots);
+ * debug.qwz.monparams 1: MGMT_RATE OFDM 12 Mbit/s on the cell vdev after it is up, 2: also MGMT_RETRY_LIMIT 3 and NON_AGG_SW_RETRY_TH 4 */
+extern int qwz_monnocred;
+extern unsigned int qwz_monqmax;
+extern int qwz_monparams;
+/* K1 (W2c): debug.qwz.scanraw, default 0: 1 = log the non-zero words of the scan request tail for the first three non-plain scan requests, 2 = also for the first three plain launched ones. Defined in qwz_sysctl.cpp, read in airport/WCL/WCL.cpp */
+extern int qwz_scanraw;
 /* WP4 (M2a): lane M hardening (qwz_awdl.h), all default 0 = M0.1 behaviour. qwz_awdltx_eff is the rung in force: the configured qwz_awdltx, lowered at run time (three DISCARD or INSPECT completions in a row, or a DEAD with preset frames in flight) */
 extern int qwz_awdlhyg, qwz_awdltx, qwz_awdltx_eff, qwz_awdlgate, qwz_awdltxopt;
 #ifndef QWZ_AWDL_TX_MAX

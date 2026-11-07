@@ -326,6 +326,73 @@ qwz_evt_note(struct qwz_softc *sc, uint32_t id, struct mbuf *m, const char *what
 }
 
 /*
+ * K1 W2a: the hardware-mode facts, log only. Which modes the firmware offers,
+ * each phy's pdev id, bands and chain masks, how many pdevs the driver
+ * counted, the mode index it asked for and the payload of the set-mode
+ * response. One block per firmware boot, about ten lines; nothing here
+ * changes state or feeds a decision.
+ */
+static const char *
+qwz_hwmode_name(uint32_t id)
+{
+	switch (id) {
+	case 0: return "SINGLE";
+	case 1: return "DBS";
+	case 2: return "SBS_PASSIVE";
+	case 3: return "SBS";
+	case 4: return "DBS_SBS";
+	case 5: return "DBS_OR_SBS";
+	default: return "?";
+	}
+}
+
+static void
+qwz_dossier_hwmode(struct qwz_softc *sc)
+{
+	unsigned int i;
+
+	qwz_log("qwz: dossier: hwmode summary: offered %u (kept %u) phys %u (kept %u) preferred %d asked %d%s single_pdev_only %d target_pdevs %d num_radios %d\n",
+	    sc->hwm_nmodes_total, (unsigned int)sc->hwm_nmodes, sc->hwm_nphys_total, (unsigned int)sc->hwm_nphys,
+	    (int)sc->wmi.preferred_hw_mode, sc->hwm_asked, sc->hwm_asked_set ? "" : " (never asked)",
+	    (int)sc->hw_params.single_pdev_only, (int)sc->target_pdev_count, sc->num_radios);
+	for (i = 0; i < sc->hwm_nmodes; i++)
+		qwz_log("qwz: dossier: hwmode mode %u: id %u (%s) cfg_type %u phy_id_map 0x%x\n", i,
+		    sc->hwm_modes[i].hw_mode_id, qwz_hwmode_name(sc->hwm_modes[i].hw_mode_id),
+		    sc->hwm_modes[i].cfg_type, sc->hwm_modes[i].phy_id_map);
+	for (i = 0; i < sc->hwm_nphys; i++)
+		qwz_log("qwz: dossier: hwmode phy %u: hw_mode_id %u pdev_id %u phy_id %u lmac %u bands 0x%x chains 2g tx 0x%x rx 0x%x 5g tx 0x%x rx 0x%x\n", i,
+		    sc->hwm_phys[i].hw_mode_id, sc->hwm_phys[i].pdev_id, sc->hwm_phys[i].phy_id, sc->hwm_phys[i].lmac_id,
+		    sc->hwm_phys[i].bands, sc->hwm_phys[i].tx2g, sc->hwm_phys[i].rx2g, sc->hwm_phys[i].tx5g, sc->hwm_phys[i].rx5g);
+	for (i = 0; i < sc->target_pdev_count && i < MAX_RADIOS; i++)
+		qwz_log("qwz: dossier: hwmode target pdev %u: pdev_id %u bands 0x%x\n", i,
+		    sc->target_pdev_ids[i].pdev_id, (unsigned int)sc->target_pdev_ids[i].supported_bands);
+	if (!sc->hwm_resp_seen) {
+		qwz_log("qwz: dossier: hwmode resp: none seen (the driver sets a mode only when single_pdev_only)\n");
+		return;
+	}
+	qwz_log("qwz: dossier: hwmode resp: seen %d len %u tlvs %u event %s vdev-mac entries found %u raw %08x %08x %08x %08x %08x %08x\n",
+	    sc->hwm_resp_seen, sc->hwm_resp_len, sc->hwm_resp_ntlv, sc->hwm_resp_have_ev ? "yes" : "no",
+	    (unsigned int)sc->hwm_resp_nent,
+	    sc->hwm_resp_raw[0], sc->hwm_resp_raw[1], sc->hwm_resp_raw[2], sc->hwm_resp_raw[3], sc->hwm_resp_raw[4], sc->hwm_resp_raw[5]);
+	if (sc->hwm_resp_have_ev) {
+		if (sc->hwm_resp_ev_tlen >= 12)
+			qwz_log("qwz: dossier: hwmode resp w0=%u w1=%u w2=%u (tlen %u; ath11k order: status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
+			    sc->hwm_resp_w0, sc->hwm_resp_w1, sc->hwm_resp_w2, sc->hwm_resp_ev_tlen);
+		else if (sc->hwm_resp_ev_tlen >= 8)
+			qwz_log("qwz: dossier: hwmode resp w0=%u w1=%u (w2 absent) (tlen %u; ath11k order: status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
+			    sc->hwm_resp_w0, sc->hwm_resp_w1, sc->hwm_resp_ev_tlen);
+		else if (sc->hwm_resp_ev_tlen >= 4)
+			qwz_log("qwz: dossier: hwmode resp w0=%u (w1, w2 absent) (tlen %u; ath11k order: status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
+			    sc->hwm_resp_w0, sc->hwm_resp_ev_tlen);
+		else
+			qwz_log("qwz: dossier: hwmode resp event TLV empty (tlen %u)\n", sc->hwm_resp_ev_tlen);
+	}
+	for (i = 0; i < sc->hwm_resp_nent; i++)
+		qwz_log("qwz: dossier: hwmode resp entry %u: vdev %u -> pdev %u\n", i,
+		    sc->hwm_resp_ent[i].vdev_id, sc->hwm_resp_ent[i].pdev_id);
+}
+
+/*
  * C29: what THIS module's firmware reports, once per firmware boot (called
  * from qwz_core_start, after WMI service ready). Read-only: nothing here
  * changes state, except that each firmware boot starts a fresh budget of
@@ -379,4 +446,5 @@ qwz_dossier(struct qwz_softc *sc)
 	    isset(sc->wmi.svc_map, 289) ? 1 : 0,
 	    isset(sc->wmi.svc_map, 205) ? 1 : 0,
 	    isset(sc->wmi.svc_map, 212) ? 1 : 0);
+	qwz_dossier_hwmode(sc);	/* K1 W2a: hardware-mode facts (log only) */
 }

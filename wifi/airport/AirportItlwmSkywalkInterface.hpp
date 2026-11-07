@@ -300,7 +300,10 @@ public:
     virtual IOReturn setSTA_DISASSOCIATE(apple80211_sta_disassoc_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setSTA_DEAUTH(apple80211_sta_disassoc_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setRSN_CONF(apple80211_rsn_conf_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+#if 0	/* K1 (W2c): this inline stub is kept as it was; the out-of-line declaration below replaces it so the first bytes of the IOC 85 blob can be logged (same answer: Unsupported) */
     virtual IOReturn setIE(apple80211_ie_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+#endif
+    virtual IOReturn setIE(apple80211_ie_data *) AIRPORT_SKYWALK_OVERRIDE;	// K1 (W2c): AirportItlwmSkywalkInterface.cpp
     virtual IOReturn setWOW_TEST(apple80211_wow_test_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setSCANCACHE_CLEAR(void *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *) AIRPORT_SKYWALK_OVERRIDE;

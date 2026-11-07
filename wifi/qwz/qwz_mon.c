@@ -27,6 +27,7 @@ int	qwz_wmi_vdev_up(struct qwz_softc *, uint32_t, uint32_t, uint32_t, const uint
 int	qwz_wmi_vdev_down(struct qwz_softc *, uint32_t, uint8_t);
 int	qwz_wmi_vdev_stop(struct qwz_softc *, uint8_t, uint8_t);
 int	qwz_wmi_vdev_set_param_cmd(struct qwz_softc *, uint32_t, uint8_t, uint32_t, uint32_t);
+int	qwz_wmi_pdev_set_param(struct qwz_softc *, uint32_t, uint32_t, uint8_t);	/* K1 (W3) */
 int	qwz_mac_vdev_setup_sync(struct qwz_softc *);
 int	qwz_mac_setup_vdev_create_params(struct qwz_softc *, struct qwz_vif *, struct qwz_pdev *, struct vdev_create_params *);
 int	qwz_mac_op_update_vif_offload(struct qwz_softc *, struct qwz_pdev *, struct qwz_vif *);
@@ -170,6 +171,26 @@ qwz_mon_is_psf(const uint8_t *f, size_t len)
 #define QWZ_MON_FW_SILENT(r)	((r) == EAGAIN || (r) == ETIMEDOUT || (r) == ESHUTDOWN)
 
 /*
+ * K1 (W1): the two halves of qwz_mon_tx_blocked below, so that the user-space write (qwz_mon_tx_bytes, debug.qwz.monnocred) can answer each exactly:
+ * qwz_mon_fw_unavail is "the firmware cannot be used": crashed or DEAD, not initialised, a sleep pending (ENXIO);
+ * qwz_mon_no_credit is "no WMI credit right now": the endpoint's credits are all in flight or the starve injection is on (ENOSPC). Same tests, same operands.
+ */
+static int
+qwz_mon_fw_unavail(struct qwz_softc *sc)
+{
+	return QWZ_CRASHED(sc) || !sc->fw_initialized || __atomic_load_n(&qwz_pm_pending, __ATOMIC_ACQUIRE) != 0;
+}
+
+static int
+qwz_mon_no_credit(struct qwz_softc *sc)
+{
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[sc->pdevs[0].pdev_id];
+
+	return (unsigned int)wmi->eid >= (unsigned int)ATH12K_HTC_EP_COUNT || sc->htc.endpoint[wmi->eid].tx_credits == 0 ||
+	    (__atomic_load_n(&sc->sc_inject, __ATOMIC_ACQUIRE) & QWZ_INJ_WMI_STARVE) != 0;
+}
+
+/*
  * merge glue (D4): OUR credit pre-check, the predicate of qwz_awdltest_tx's fix2 (qwz.c). qwz_wmi_cmd_send waits up to 3 s for a WMI credit with
  * the gate released, and the capture path must never sleep that way: a teardown could run meanwhile. Nonzero: refuse at once with EAGAIN.
  */
@@ -187,6 +208,79 @@ qwz_mon_tx_blocked(struct qwz_softc *sc)
 }
 
 /*
+ * K1 W2b: evidence helpers for the 'qwz: mon: lat:' line. They only read the clock and fill sc->mon_lat; nothing here changes what is sent.
+ */
+static void
+qwz_mon_lat_push(uint32_t *a, uint32_t *n, uint32_t *lost, uint32_t cap, uint64_t ns)
+{
+	uint64_t us = ns / 1000ULL;
+
+	if (*n >= cap) {
+		(*lost)++;
+		return;
+	}
+	a[(*n)++] = us > 0xffffffffULL ? 0xffffffffU : (uint32_t)us;
+}
+
+static void
+qwz_mon_lat_stamp(struct qwz_softc *sc, int slot)
+{
+	if (slot >= 0 && slot < (int)nitems(sc->mon_lat.tx_ns))
+		sc->mon_lat.tx_ns[slot] = getnsecuptime();
+}
+
+void
+qwz_mon_lat_credit(struct qwz_softc *sc, int eid, int credits, int what)
+{
+	uint64_t now;
+
+	if (sc == NULL || !sc->mon_active || credits <= 0 || eid != (int)sc->wmi.wmi[sc->pdevs[0].pdev_id].eid)
+		return;
+	now = getnsecuptime();
+	if (what == 0) {
+		if (sc->mon_lat.cr_out == 0)
+			sc->mon_lat.cr_stamp = now;
+		sc->mon_lat.cr_out += (uint32_t)credits;
+	} else if (sc->mon_lat.cr_out > 0) {
+		if (what == 1) {
+			sc->mon_lat.cr_reports++;
+			qwz_mon_lat_push(sc->mon_lat.cr, &sc->mon_lat.ncr, &sc->mon_lat.cr_lost, nitems(sc->mon_lat.cr), now - sc->mon_lat.cr_stamp);
+		}
+		sc->mon_lat.cr_out = sc->mon_lat.cr_out > (uint32_t)credits ? sc->mon_lat.cr_out - (uint32_t)credits : 0;
+		sc->mon_lat.cr_stamp = now;
+	}
+}
+
+void
+qwz_mon_lat_rxring(struct qwz_softc *sc, int ring, int n)
+{
+	if (sc != NULL && sc->mon_active && ring >= 0 && ring < 4 && n > 0)
+		sc->mon_lat.rxring[ring] += (uint32_t)n;
+}
+
+/* p50, p90 and max of the first n samples (sorted in place, shell sort); all zero for n == 0 */
+static void
+qwz_mon_lat_pct(uint32_t *a, uint32_t n, uint32_t *p50, uint32_t *p90, uint32_t *max)
+{
+	uint32_t gap, i, j, t;
+
+	*p50 = *p90 = *max = 0;
+	if (n == 0)
+		return;
+	for (gap = n / 2; gap > 0; gap /= 2) {
+		for (i = gap; i < n; i++) {
+			t = a[i];
+			for (j = i; j >= gap && a[j - gap] > t; j -= gap)
+				a[j] = a[j - gap];
+			a[j] = t;
+		}
+	}
+	*p50 = a[n / 2];
+	*p90 = a[(n * 9) / 10 < n ? (n * 9) / 10 : n - 1];
+	*max = a[n - 1];
+}
+
+/*
  * Replay the kept PSF as ours: sender = the capture vdev's MAC, so the
  * hardware recognises the ACK; BSSID unchanged; new sequence number.
  */
@@ -197,6 +291,7 @@ qwz_mon_tx_copy(struct qwz_softc *sc, const uint8_t *dst)
 	struct mbuf *m;
 	uint8_t *p;
 	int ret;
+	int slot_lat;	/* K1 W2b */
 
 	if (qwz_mon_tx_blocked(sc))	/* merge glue (D4) */
 		return EAGAIN;
@@ -220,6 +315,7 @@ qwz_mon_tx_copy(struct qwz_softc *sc, const uint8_t *dst)
 	p[23] = (uint8_t)(mon_tx_seq >> 4);
 	mon_tx_seq = (mon_tx_seq + 1) & 0x0fff;
 
+	slot_lat = vif->txmgmt.cur;	/* K1 W2b */
 	ret = qwz_mac_mgmt_tx_wmi(sc, vif, sc->pdevs[0].pdev_id, NULL, m);
 	if (ret) {
 		if (ret != ENOBUFS)	/* ENOBUFS: the mbuf was already freed */
@@ -227,6 +323,9 @@ qwz_mon_tx_copy(struct qwz_softc *sc, const uint8_t *dst)
 		sc->mon_stats.tx_fail++;
 		return ret;
 	}
+	qwz_mon_lat_stamp(sc, slot_lat);	/* K1 W2b: completion latency starts here */
+	sc->mon_lat.tx_bytes += mon_psf_len;
+	sc->mon_lat.tx_frames++;
 	sc->mon_stats.tx_sent++;
 	mon_last_tx_ns = getnsecuptime();
 	return 0;
@@ -263,6 +362,11 @@ qwz_mon_tx_compl(struct qwz_softc *sc, struct wmi_mgmt_tx_compl_event *ev)
 	td = &q->data[ev->desc_id];
 	if (td->m == NULL || sc->sc_vif.txmgmt.data[ev->desc_id].m != NULL)
 		return 0;
+	if (sc->mon_lat.tx_ns[ev->desc_id] != 0 && ev->desc_id < nitems(sc->mon_lat.tx_ns)) {	/* K1 W2b: completion latency */
+		qwz_mon_lat_push(sc->mon_lat.cl, &sc->mon_lat.ncl, &sc->mon_lat.cl_lost, nitems(sc->mon_lat.cl),
+		    getnsecuptime() - sc->mon_lat.tx_ns[ev->desc_id]);
+		sc->mon_lat.tx_ns[ev->desc_id] = 0;
+	}
 	bus_dmamap_unload(sc->sc_dmat, td->map);
 	m_freem(td->m);
 	td->m = NULL;
@@ -302,12 +406,27 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 	struct mbuf *m;
 	int slot, ret;
 
+	/* K1 (W1), debug.qwz.monnocred: XNU re-runs a sysctl handler while it returns EAGAIN, so EAGAIN here spins inside the kernel; answer exactly instead (the checks below stay for monnocred 0) */
+	if (qwz_monnocred) {
+		if (qwz_mon_fw_unavail(sc))
+			return ENXIO;
+		if (qwz_mon_no_credit(sc)) {
+			sc->mon_stats.ufr_nocred++;
+			return ENOSPC;
+		}
+	}
 	if (qwz_mon_tx_blocked(sc))	/* merge glue (D4) */
 		return EAGAIN;
 	if (!sc->mon_active || !vif->is_up || !qwz_mon_have_maps(sc))
 		return ENXIO;
 	if (len < 10 || len > QWZ_MONTX_MAXFRAME)
 		return EINVAL;
+	/* K1 (W1), debug.qwz.monqmax: DATA and CONTROL frames (kind 2, 3) stop at N queued; management frames (kind 1, PSF/MIF sync) keep all 63 slots */
+	if (qwz_monqmax != 0 && kind != 1 &&
+	    (unsigned int)vif->txmgmt.queued >= (qwz_monqmax > 63U ? 63U : qwz_monqmax)) {
+		sc->mon_stats.ufr_qmax++;
+		return ENOSPC;
+	}
 	if (vif->txmgmt.queued >= (int)nitems(vif->txmgmt.data) - 1)
 		return ENOSPC;
 	m = m_gethdr(M_DONTWAIT, MT_DATA);
@@ -331,6 +450,9 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 		return ret;
 	}
 	sc->mon_tx_kind[slot] = kind;
+	qwz_mon_lat_stamp(sc, slot);	/* K1 W2b */
+	sc->mon_lat.tx_bytes += len;
+	sc->mon_lat.tx_frames++;
 	return 0;
 }
 
@@ -588,6 +710,10 @@ moncap_put(const uint8_t *frame, size_t len, uint16_t flags, uint8_t decap,
 	struct qwz_moncap_hdr hdr;
 	size_t rec = sizeof(hdr) + ((len + 3) & ~(size_t)3), need = rec;
 
+	if (qwz_mon_sc != NULL) {	/* K1 W2b: bytes received through the cell (every frame that reaches the capture path) */
+		qwz_mon_sc->mon_lat.rx_bytes += len;
+		qwz_mon_sc->mon_lat.rx_frames++;
+	}
 	if (moncap_ring == NULL)
 		return;
 	IOLockLock(moncap_lock);
@@ -810,6 +936,7 @@ qwz_mon_pop_mpdu(struct qwz_softc *sc, struct hal_reo_entrance_ring *ent,
 			flags |= QWZ_MONCAP_F_DROPCLASS;
 	}
 	sc->mon_stats.entries++;
+	sc->mon_lat.rxring[4]++;	/* K1 W2b: entries reaped from the cell's RXDMA error ring */
 	if (qwz_mon_flags & QWZ_MON_F_VERBOSE)
 		printf("qwz: mon: entry paddr 0x%llx cookie 0x%x msdus %u push %u ecode %u\n",
 		    (unsigned long long)paddr, cookie, msdu_cnt, push, ecode);
@@ -963,17 +1090,42 @@ qwz_mon_reap(void *arg)
 		    sc->mon_stats.badcookie, sc->mon_stats.nolink, sc->mon_stats.duplink,
 		    sc->mon_stats.linkret_fail, moncap_dropped);
 		if (sc->mon_stats.ufr_sent || sc->mon_stats.ufr_full || sc->mon_stats.ufr_fail)
-			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u\n",
+			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u; nocred %u qmax %u\n",
 			    sc->mon_stats.ufr_sent, sc->mon_stats.ufr_full, sc->mon_stats.ufr_fail,
 			    sc->mon_stats.ufr_mgmt_ok, sc->mon_stats.ufr_mgmt_bad,
 			    sc->mon_stats.ufr_data_ok, sc->mon_stats.ufr_data_bad,
-			    sc->mon_stats.ufr_ctrl_ok, sc->mon_stats.ufr_ctrl_bad);
+			    sc->mon_stats.ufr_ctrl_ok, sc->mon_stats.ufr_ctrl_bad,
+			    sc->mon_stats.ufr_nocred, sc->mon_stats.ufr_qmax);
 		if (sc->mon_stats.rx_psf || sc->mon_stats.tx_sent)
 			printf("qwz: mon: tx: psf heard %u, sent %u fail %u, compl ok %u discard %u inspect %u noack %u other %u, last ack rssi %d, mode 0x%x\n",
 			    sc->mon_stats.rx_psf, sc->mon_stats.tx_sent, sc->mon_stats.tx_fail,
 			    sc->mon_stats.tx_ok, sc->mon_stats.tx_discard, sc->mon_stats.tx_inspect,
 			    sc->mon_stats.tx_noack, sc->mon_stats.tx_other,
 			    sc->mon_stats.last_ack_rssi, qwz_mon_tx_mode);
+		{	/* K1 W2b: the one new line per 5 s; the latency windows restart here */
+			uint32_t cp50, cp90, cmax, rp50, rp90, rmax;
+
+			qwz_mon_lat_pct(sc->mon_lat.cl, sc->mon_lat.ncl, &cp50, &cp90, &cmax);
+			qwz_mon_lat_pct(sc->mon_lat.cr, sc->mon_lat.ncr, &rp50, &rp90, &rmax);
+			printf("qwz: mon: lat: rx %llu B/%u fr (total %llu B) tx %llu B/%u fr (total %llu B); reap reo %u/%u/%u/%u err0 %u; "
+			    "compl us n %u lost %u p50 %u p90 %u max %u; credit us n %u lost %u p50 %u p90 %u max %u out %u\n",
+			    (unsigned long long)(sc->mon_lat.rx_bytes - sc->mon_lat.rx_bytes_l), sc->mon_lat.rx_frames - sc->mon_lat.rx_frames_l,
+			    (unsigned long long)sc->mon_lat.rx_bytes,
+			    (unsigned long long)(sc->mon_lat.tx_bytes - sc->mon_lat.tx_bytes_l), sc->mon_lat.tx_frames - sc->mon_lat.tx_frames_l,
+			    (unsigned long long)sc->mon_lat.tx_bytes,
+			    sc->mon_lat.rxring[0] - sc->mon_lat.rxring_l[0], sc->mon_lat.rxring[1] - sc->mon_lat.rxring_l[1],
+			    sc->mon_lat.rxring[2] - sc->mon_lat.rxring_l[2], sc->mon_lat.rxring[3] - sc->mon_lat.rxring_l[3],
+			    sc->mon_lat.rxring[4] - sc->mon_lat.rxring_l[4],
+			    sc->mon_lat.ncl, sc->mon_lat.cl_lost, cp50, cp90, cmax,
+			    sc->mon_lat.ncr, sc->mon_lat.cr_lost, rp50, rp90, rmax, sc->mon_lat.cr_out);
+			sc->mon_lat.rx_bytes_l = sc->mon_lat.rx_bytes;
+			sc->mon_lat.tx_bytes_l = sc->mon_lat.tx_bytes;
+			sc->mon_lat.rx_frames_l = sc->mon_lat.rx_frames;
+			sc->mon_lat.tx_frames_l = sc->mon_lat.tx_frames;
+			memcpy(sc->mon_lat.rxring_l, sc->mon_lat.rxring, sizeof(sc->mon_lat.rxring_l));
+			sc->mon_lat.ncl = sc->mon_lat.cl_lost = 0;
+			sc->mon_lat.ncr = sc->mon_lat.cr_lost = 0;
+		}
 	}
 	timeout_add_msec(&sc->mon_cell_timer, n ? 2 : 10);
 }
@@ -1148,6 +1300,43 @@ qwz_mon_sender_peer(struct qwz_softc *sc, const uint8_t *addr, int add)
 	}
 }
 
+/*
+ * K1 (W3), debug.qwz.monparams: right after the cell vdev is up. 1: MGMT_RATE OFDM 12 Mbit/s (the rate code of qwz_awdl_vdev_params, lane M's listen vdev);
+ * 2: also WMI_PDEV_PARAM_MGMT_RETRY_LIMIT 3 and WMI_VDEV_PARAM_NON_AGG_SW_RETRY_TH 4. Each set logs one "qwz: mon: params:" line; a failure logs and
+ * continues, the cell start is never aborted. The firmware restarts after every cell (mon_fw_dirty), so nothing leaks into the station.
+ */
+static void
+qwz_mon_cell_params(struct qwz_softc *sc)
+{
+	struct qwz_vif *vif = &sc->sc_monvif;
+	uint8_t pdev_id = sc->pdevs[0].pdev_id;
+	uint32_t rate = ATH12K_HW_RATE_CODE(ATH12K_HW_RATE_OFDM_12M, 0, WMI_RATE_PREAMBLE_OFDM);
+	int mode = qwz_monparams, ret;
+
+	if (mode <= 0)
+		return;
+	if (qwz_mon_fw_unavail(sc)) {
+		printf("qwz: mon: params: skipped, firmware unavailable (monparams %d)\n", mode);
+		return;
+	}
+	ret = qwz_wmi_vdev_set_param_cmd(sc, vif->vdev_id, pdev_id, WMI_VDEV_PARAM_MGMT_RATE, rate);
+	printf("qwz: mon: params: vdev %u MGMT_RATE 0x%08x (OFDM 12 Mbit/s): %d\n", vif->vdev_id, (unsigned)rate, ret);
+	if (mode < 2)
+		return;
+	if (qwz_mon_fw_unavail(sc)) {
+		printf("qwz: mon: params: skipped the rest, firmware unavailable\n");
+		return;
+	}
+	ret = qwz_wmi_pdev_set_param(sc, WMI_PDEV_PARAM_MGMT_RETRY_LIMIT, 3, pdev_id);
+	printf("qwz: mon: params: pdev %u MGMT_RETRY_LIMIT 3: %d\n", pdev_id, ret);
+	if (qwz_mon_fw_unavail(sc)) {
+		printf("qwz: mon: params: skipped NON_AGG_SW_RETRY_TH, firmware unavailable\n");
+		return;
+	}
+	ret = qwz_wmi_vdev_set_param_cmd(sc, vif->vdev_id, pdev_id, WMI_VDEV_PARAM_NON_AGG_SW_RETRY_TH, 4);
+	printf("qwz: mon: params: vdev %u NON_AGG_SW_RETRY_TH 4: %d\n", vif->vdev_id, ret);
+}
+
 static int
 qwz_mon_vdev_start(struct qwz_softc *sc, int chan, uint32_t freq)
 {
@@ -1211,6 +1400,7 @@ qwz_mon_vdev_start(struct qwz_softc *sc, int chan, uint32_t freq)
 		printf("qwz: mon: vdev %d up on channel %d (%u MHz), bssid %s\n", vif->vdev_id,
 		    chan, freq, ether_sprintf((u_char *)bssid));
 	}
+	qwz_mon_cell_params(sc);	/* K1 (W3): debug.qwz.monparams, 0 = nothing */
 	return 0;
 }
 
@@ -1380,6 +1570,7 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 		return EBUSY;
 	}
 	memset(&sc->mon_stats, 0, sizeof(sc->mon_stats));
+	memset(&sc->mon_lat, 0, sizeof(sc->mon_lat));	/* K1 W2b */
 	sc->mon_chan = chan;
 	sc->mon_freq = freq;
 	sc->mon_bssid_set = qwz_mon_parse_mac(qwz_mon_bssid_str, sc->mon_bssid);

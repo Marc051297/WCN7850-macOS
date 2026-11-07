@@ -1156,6 +1156,28 @@ setSCANCACHE_CLEAR(void *req)
     return kIOReturnSuccess;
 }
 
+/*
+ * K1 (W2c): IOC 85 (APPLE80211_IOC_IE), the blob airportd sends at every auto-join. The answer is what the inline stub gave (Unsupported); the first 16 bytes
+ * of the blob (version, frame_type_flags, add, signature_len) are logged for the first three calls per boot. The IE bytes after them are not printed.
+ */
+IOReturn AirportItlwmSkywalkInterface::
+setIE(struct apple80211_ie_data *data)
+{
+    static unsigned int ieBlobs;
+
+    if (data) {
+        unsigned int n = __atomic_add_fetch(&ieBlobs, 1u, __ATOMIC_RELAXED);
+        if (n <= 3) {
+            const uint8_t *b = reinterpret_cast<const uint8_t *>(data);
+            char hex[3 * 16 + 1];
+            for (unsigned i = 0; i < 16; ++i)
+                snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x%s", b[i], i < 15 ? " " : "");
+            qwz_log("airport: ioctl 85 (IE) blob #%u: first 16 bytes %s (ie_len %u)\n", n, hex, unsigned(data->ie_len));
+        }
+    }
+    return kIOReturnUnsupported;
+}
+
 IOReturn AirportItlwmSkywalkInterface::
 setDEAUTH(struct apple80211_deauth_data *da)
 {

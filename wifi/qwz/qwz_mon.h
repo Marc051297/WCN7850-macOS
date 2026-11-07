@@ -129,6 +129,10 @@ struct mbuf;
 void	qwz_mon_capture_mgmt_mbuf(struct qwz_softc *, struct mbuf *, int rssi, uint32_t rate_kbps);
 /* qwz_dp_rx_process_received_packets(): an 802.11 frame off the REO path while capturing. */
 void	qwz_mon_capture_reo_mbuf(struct qwz_softc *, struct mbuf *);
+/* K1 W2b: evidence hooks, no effect on any decision. what: 0 a WMI credit consumed (htc send), 1 a credit report arrived, 2 a consumed credit was given back unused. */
+void	qwz_mon_lat_credit(struct qwz_softc *, int eid, int credits, int what);
+/* K1 W2b: ring 0..3 = REO destination ring, n buffers reaped. */
+void	qwz_mon_lat_rxring(struct qwz_softc *, int ring, int n);
 
 /*
  * M1, transmitting: debug.qwz.montx. The last PSF heard (any peer) is kept

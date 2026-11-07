@@ -16,6 +16,7 @@
 #include <net80211/ieee80211_priv.h>
 #include <crypto/sha1.h>
 #include "qwz_log.h"
+#include "qwz_life.h"	/* K1 (W2c): qwz_scanraw */
 #define QWZLOG(fmt, ...)	qwz_log("qwz: " fmt "\n", ##__VA_ARGS__)
 extern "C" int qwz_mon_holding(struct ieee80211com *);	// qwz/qwz_mon.h (M3 hold)
 
@@ -264,6 +265,36 @@ static void wclScanHex(char *out, size_t outSize, const uint8_t *data, size_t le
 }
 #endif
 
+// K1 (W2c): the non-zero 32-bit words of [from, to) of the scan request as 'offset=value' pairs, at most 20 words to a line and 3 lines per region
+// (the rest is counted). Used by debug.qwz.scanraw in every build. The words may hold SSID text: redact before sharing.
+static void wclScanRawWords(unsigned int seq, const uint8_t *p, size_t from, size_t to)
+{
+    char line[20 * 16 + 1];
+    size_t pos = 0;
+    unsigned int inLine = 0, lines = 0, extra = 0, nonzero = 0;
+
+    for (size_t off = from; off + 4 <= to; off += 4) {
+        uint32_t w = AirportWCL::read32(p + off);
+        if (!w)
+            continue;
+        ++nonzero;
+        if (lines >= 3) {
+            ++extra;
+            continue;
+        }
+        pos += size_t(snprintf(line + pos, sizeof(line) - pos, " %zx=%08x", off, w));
+        if (++inLine == 20) {
+            qwz_log("airport: WCL scan raw #%u: [0x%zx,0x%zx)%s\n", seq, from, to, line);
+            pos = 0;
+            inLine = 0;
+            ++lines;
+        }
+    }
+    if (inLine)
+        qwz_log("airport: WCL scan raw #%u: [0x%zx,0x%zx)%s\n", seq, from, to, line);
+    qwz_log("airport: WCL scan raw #%u: [0x%zx,0x%zx) %u non-zero words, %u not listed\n", seq, from, to, nonzero, extra);
+}
+
 static void logWCLScanRequest(const void *request, const AirportWCL::ScanRequest *scan, const WCLScanLogState &st,
                               const char *outcome, const char *detail)
 {
@@ -312,6 +343,18 @@ static void logWCLScanRequest(const void *request, const AirportWCL::ScanRequest
         qwz_log("airport: WCL scan raw #%u: +0x1318 %s\n", seq, hex);
     }
 #endif
+    {
+        // K1 (W2c): debug.qwz.scanraw, every build, default 0. 1: the first three non-plain requests (a list, a primary SSID or a non-launch outcome);
+        // 2: also the first three plain launched ones. The tail is +0x44..+0x58 (after the type word) and +0x1318..+0x1598 (the list and what follows it).
+        static unsigned int rawNonPlain, rawPlain;
+        int mode = qwz_scanraw;
+        bool plain = launched && !list && !(scan && scan->ssidLength);
+        if (p && mode >= 1 && (!plain || mode >= 2) &&
+            __atomic_add_fetch(plain ? &rawPlain : &rawNonPlain, 1u, __ATOMIC_RELAXED) <= 3) {
+            wclScanRawWords(seq, p, 0x44, 0x58);
+            wclScanRawWords(seq, p, 0x1318, 0x1598);
+        }
+    }
 }
 
 IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *request)
@@ -350,6 +393,12 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     if (!(ic->ic_if.if_flags & IFF_RUNNING))
         return kIOReturnNotReady;
     if (qwz_mon_holding(ic)) {
+        {
+            // K1 (W2c): S2 line for the scans answered empty at once during the hold; its own counter, first 24 then every 8th
+            static unsigned int holdScans;
+            if (qwz_log_ratelimit(&holdScans, 24, 8))
+                scanLog("hold", "monhold: answered empty at once");
+        }
         // M3 hold: the radio is the AWDL cell; every scan finds nothing.
         scanPending = true;
         finishWCLScan(kIOReturnSuccess);
@@ -1201,6 +1250,14 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             break;
         case IEEE80211_EVT_STA_ASSOC_DONE:
+            {
+                // K1 (W2c): ic_assoc_status at the end of every association attempt (0 = success, otherwise the AP's status code, 0xffff = no answer)
+                static unsigned int assocEnds;
+                if (qwz_log_ratelimit(&assocEnds, 200, 20))
+                    qwz_log("airport: wcl: event STA_ASSOC_DONE ic_assoc_status 0x%x joinPending %d assocNotified %d state %s chan %d\n", unsigned(ic->ic_assoc_status),
+                            joinPending, assocNotified, ieee80211_state_name[ic->ic_state],
+                            ic->ic_bss && ic->ic_bss->ni_chan ? ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan) : -1);
+            }
             if (joinPending && !assocNotified) {
                 AirportWCL::AssociationEvent event = {};
                 event.status = ic->ic_assoc_status;

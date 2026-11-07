@@ -10639,6 +10639,15 @@ qwz_wmi_tlv_hw_mode_caps(struct qwz_softc *sc, uint16_t len,
 		return ret;
 	}
 
+	sc->hwm_nmodes = 0;	/* K1 W2a: record the offered modes for the dossier (read-only) */
+	sc->hwm_nmodes_total = svc_rdy_ext->n_hw_mode_caps;
+	for (i = 0; i < svc_rdy_ext->n_hw_mode_caps && i < nitems(sc->hwm_modes); i++) {
+		sc->hwm_modes[i].hw_mode_id = svc_rdy_ext->hw_mode_caps[i].hw_mode_id;
+		sc->hwm_modes[i].phy_id_map = svc_rdy_ext->hw_mode_caps[i].phy_id_map;
+		sc->hwm_modes[i].cfg_type = svc_rdy_ext->hw_mode_caps[i].hw_mode_config_type;
+		sc->hwm_nmodes = i + 1;
+	}
+
 	i = 0;
 	while (i < svc_rdy_ext->n_hw_mode_caps) {
 		hw_mode_caps = &svc_rdy_ext->hw_mode_caps[i];
@@ -10685,6 +10694,27 @@ qwz_wmi_tlv_mac_phy_caps_parse(struct qwz_softc *sc, uint16_t tag, uint16_t len,
 
 	memcpy(svc_rdy_ext->mac_phy_caps + svc_rdy_ext->n_mac_phy_caps,
 	    ptr, len);
+	{	/* K1 W2a: record each phy's facts for the dossier (read-only) */
+		const struct wmi_mac_phy_capabilities *mp =
+		    svc_rdy_ext->mac_phy_caps + svc_rdy_ext->n_mac_phy_caps;
+		uint32_t k = svc_rdy_ext->n_mac_phy_caps;
+
+		if (k == 0)
+			sc->hwm_nphys = 0;
+		sc->hwm_nphys_total = k + 1;
+		if (k < nitems(sc->hwm_phys)) {
+			sc->hwm_phys[k].hw_mode_id = mp->hw_mode_id;
+			sc->hwm_phys[k].pdev_id = mp->pdev_id;
+			sc->hwm_phys[k].phy_id = mp->phy_id;
+			sc->hwm_phys[k].bands = mp->supported_bands;
+			sc->hwm_phys[k].lmac_id = mp->lmac_id;
+			sc->hwm_phys[k].tx2g = mp->tx_chain_mask_2g;
+			sc->hwm_phys[k].rx2g = mp->rx_chain_mask_2g;
+			sc->hwm_phys[k].tx5g = mp->tx_chain_mask_5g;
+			sc->hwm_phys[k].rx5g = mp->rx_chain_mask_5g;
+			sc->hwm_nphys = k + 1;
+		}
+	}
 	svc_rdy_ext->n_mac_phy_caps++;
 	return 0;
 }
@@ -12989,6 +13019,72 @@ qwz_vdev_install_key_compl_event(struct qwz_softc *sc, struct mbuf *m)
 	wakeup(&sc->install_key_done);
 }
 
+/*
+ * K1 W2a: record the payload of the WMI_PDEV_SET_HW_MODE response (status and
+ * the vdev-to-mac mapping if the event carries it). A plain walk over the
+ * TLVs with every length checked; it allocates nothing, prints nothing and
+ * never fails: the caller goes on exactly as before.
+ */
+static void
+qwz_hwmode_resp_note(struct qwz_softc *sc, struct mbuf *m)
+{
+	const uint8_t *p, *end;
+	uint32_t len, k;
+
+	if (m == NULL)
+		return;
+	p = mtod(m, const uint8_t *);
+	len = M_LEN(m) > 0 ? (uint32_t)M_LEN(m) : 0;
+	end = p + len;
+	sc->hwm_resp_seen++;
+	sc->hwm_resp_len = len;
+	sc->hwm_resp_ntlv = 0;
+	sc->hwm_resp_have_ev = 0;
+	sc->hwm_resp_ev_tlen = 0;
+	sc->hwm_resp_w0 = sc->hwm_resp_w1 = sc->hwm_resp_w2 = 0;
+	sc->hwm_resp_nent = 0;
+	for (k = 0; k < nitems(sc->hwm_resp_raw); k++) {
+		uint32_t w = 0;
+
+		if (4 * (k + 1) <= len)
+			memcpy(&w, p + 4 * k, sizeof(w));
+		sc->hwm_resp_raw[k] = w;
+	}
+	while ((size_t)(end - p) >= sizeof(struct wmi_tlv)) {
+		uint32_t hdr, tlen, tag;
+		const uint8_t *body;
+
+		memcpy(&hdr, p, sizeof(hdr));
+		tag = FIELD_GET(WMI_TLV_TAG, hdr);
+		tlen = FIELD_GET(WMI_TLV_LEN, hdr);
+		body = p + sizeof(struct wmi_tlv);
+		if (tlen > (size_t)(end - body))
+			break;
+		sc->hwm_resp_ntlv++;
+		if (tag == WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_EVENT && !sc->hwm_resp_have_ev) {
+			/* words are kept neutral (w0..w2): ath11k and ath12k sources disagree on the order; nothing acts on them */
+			sc->hwm_resp_ev_tlen = tlen;
+			if (tlen >= 4)
+				memcpy(&sc->hwm_resp_w0, body, 4);
+			if (tlen >= 8)
+				memcpy(&sc->hwm_resp_w1, body + 4, 4);
+			if (tlen >= 12)
+				memcpy(&sc->hwm_resp_w2, body + 8, 4);
+			sc->hwm_resp_have_ev = 1;
+		} else if (tag == WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_VDEV_MAC_ENTRY && tlen >= 8 &&
+		    sc->hwm_resp_nent < nitems(sc->hwm_resp_ent)) {
+			memcpy(&sc->hwm_resp_ent[sc->hwm_resp_nent].vdev_id, body, 4);
+			memcpy(&sc->hwm_resp_ent[sc->hwm_resp_nent].pdev_id, body + 4, 4);
+			sc->hwm_resp_nent++;
+		}
+		/* an array-of-struct TLV holds the entries; step into it, step over anything else */
+		if (tag == WMI_TAG_ARRAY_STRUCT)
+			p = body;
+		else
+			p = body + tlen;
+	}
+}
+
 void
 qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 {
@@ -13137,6 +13233,7 @@ qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 		DPRINTF("%s: 0x%x: update fw mem dump\n", __func__, id);
 		break;
 	case WMI_PDEV_SET_HW_MODE_RESP_EVENTID:
+		qwz_hwmode_resp_note(sc, m);	/* K1 W2a: keep the payload for the dossier; changes nothing below */
 		sc->wmi.hw_mode_ready = 1;
 		wakeup(&sc->wmi.hw_mode_ready);
 		break;
@@ -13400,6 +13497,7 @@ qwz_htc_send(struct qwz_htc *htc, enum ath12k_htc_ep_id eid, struct mbuf *m)
 			return EAGAIN;
 		}
 		ep->tx_credits -= credits;
+		qwz_mon_lat_credit(sc, eid, credits, 0);	/* K1 W2b: evidence only */
 		DNPRINTF(QWZ_D_HTC, "%s: ep %d credits consumed %d total %d\n",
 		    __func__, eid, credits, ep->tx_credits);
 #ifdef notyet
@@ -13452,6 +13550,7 @@ err_credits:
 		spin_lock_bh(&htc->tx_lock);
 #endif
 		ep->tx_credits += credits;
+		qwz_mon_lat_credit(sc, eid, credits, 2);	/* K1 W2b: evidence only */
 		DNPRINTF(QWZ_D_HTC, "%s: ep %d credits reverted %d total %d\n",
 		    __func__, eid, credits, ep->tx_credits);
 #ifdef notyet
@@ -16865,6 +16964,7 @@ try_again:
 		/* WCN7850 is single-radio */
 		mac_id = 0;
 		num_buffs_reaped[mac_id]++;
+		qwz_mon_lat_rxring(sc, ring_id, 1);	/* K1 W2b: evidence only */
 
 		TAILQ_INSERT_TAIL(&rx_desc_used_list, desc_info, entry);
 
@@ -19232,6 +19332,8 @@ qwz_wmi_set_hw_mode(struct qwz_softc *sc,
 
 	cmd->pdev_id = WMI_PDEV_ID_SOC;
 	cmd->hw_mode_index = mode;
+	sc->hwm_asked = (int)mode;	/* K1 W2a: the dossier prints which index the driver asked for */
+	sc->hwm_asked_set = 1;
 
 	ret = qwz_wmi_cmd_send(&wmi->wmi[0], m, WMI_PDEV_SET_HW_MODE_CMDID);
 	if (ret) {
@@ -21412,6 +21514,7 @@ qwz_htc_process_credit_report(struct qwz_htc *htc,
 
 		ep = &htc->endpoint[report->eid];
 		ep->tx_credits += report->credits;
+		qwz_mon_lat_credit(sc, report->eid, report->credits, 1);	/* K1 W2b: evidence only */
 
 		if (ep->ep_ops.ep_tx_credits) {
 #ifdef notyet

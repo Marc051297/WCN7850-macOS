@@ -2273,6 +2273,45 @@ struct qwz_softc {
 		uint32_t pdev_id;
 	} target_pdev_ids[MAX_RADIOS];
 	uint8_t target_pdev_count;
+	/*
+	 * K1 W2a: hardware-mode facts, filled while the firmware's extended
+	 * service-ready event and the set-hw-mode response are parsed and
+	 * printed by qwz_dossier as 'dossier: hwmode' lines. Nothing reads them
+	 * for a decision.
+	 */
+	struct {
+		uint32_t hw_mode_id;
+		uint32_t phy_id_map;
+		uint32_t cfg_type;
+	} hwm_modes[8];
+	uint8_t hwm_nmodes;
+	uint32_t hwm_nmodes_total;		/* modes the firmware offers (may exceed the 8 kept) */
+	struct {
+		uint32_t hw_mode_id;
+		uint32_t pdev_id;
+		uint32_t phy_id;
+		uint32_t bands;
+		uint32_t lmac_id;
+		uint32_t tx2g, rx2g, tx5g, rx5g;
+	} hwm_phys[8];
+	uint8_t hwm_nphys;
+	uint32_t hwm_nphys_total;
+	int hwm_asked;				/* mode id the driver asked for ... */
+	int hwm_asked_set;			/* ... valid only when this is non-zero */
+	int hwm_resp_seen;			/* PDEV_SET_HW_MODE response arrived (counts) */
+	uint32_t hwm_resp_len;
+	uint32_t hwm_resp_ntlv;
+	uint32_t hwm_resp_w0;			/* first three event words, order unconfirmed (informational only) */
+	uint32_t hwm_resp_w1;
+	uint32_t hwm_resp_w2;
+	uint32_t hwm_resp_ev_tlen;		/* length of the event TLV body */
+	int hwm_resp_have_ev;			/* the fixed-param TLV was found */
+	uint8_t hwm_resp_nent;
+	struct {
+		uint32_t vdev_id;
+		uint32_t pdev_id;
+	} hwm_resp_ent[4];
+	uint32_t hwm_resp_raw[6];		/* first 24 payload bytes */
 	uint32_t pdevs_active;
 	int pdevs_macaddr_valid;
 	struct ath12k_hal_reg_capabilities_ext hal_reg_cap[MAX_RADIOS];
@@ -2319,9 +2358,31 @@ struct qwz_softc {
 		/* Frames handed in from userspace (M2), by 802.11 type. */
 		uint32_t ufr_sent, ufr_full, ufr_fail;
 		uint32_t ufr_mgmt_ok, ufr_mgmt_bad, ufr_data_ok, ufr_data_bad, ufr_ctrl_ok, ufr_ctrl_bad;
+		uint32_t ufr_nocred, ufr_qmax;	/* K1 (W1): refused early with ENOSPC by monnocred (no credit) and by monqmax; both are also counted in ufr_full */
 		uint32_t badcookie, nolink, duplink, linkret_fail;
 		uint64_t last_log;
 	} mon_stats;
+
+	/*
+	 * K1 W2b: the cell's evidence counters, printed once per 5 s as the 'qwz: mon: lat:' line (qwz_mon.c). Reset when a cell starts. Latency samples are
+	 * kept in microseconds for the current 5 s window only (the arrays are emptied at each print); samples that do not fit are counted in *_lost.
+	 */
+	struct {
+		uint64_t tx_ns[64];		/* per management-transmit slot: when it was handed to the firmware, 0 = no sample */
+		uint64_t rx_bytes, tx_bytes;	/* since the cell started */
+		uint64_t rx_bytes_l, tx_bytes_l;	/* values at the previous print */
+		uint32_t rx_frames, tx_frames;
+		uint32_t rx_frames_l, tx_frames_l;
+		uint32_t rxring[5];		/* reaps: [0..3] REO destination ring buffers, [4] the cell's RXDMA error ring (mpdus) */
+		uint32_t rxring_l[5];
+		uint32_t cl[256];		/* management-transmit completion latency, us */
+		uint32_t ncl, cl_lost;
+		uint32_t cr[256];		/* credit-return latency (WMI send to next credit report), us */
+		uint32_t ncr, cr_lost;
+		uint64_t cr_stamp;		/* when the oldest unreported WMI send happened */
+		uint32_t cr_out;		/* WMI credits sent and not yet reported */
+		uint32_t cr_reports;		/* credit reports seen for the WMI endpoint */
+	} mon_lat;
 
 	/* Provided by attachment driver: */
 	struct qwz_ops			ops;

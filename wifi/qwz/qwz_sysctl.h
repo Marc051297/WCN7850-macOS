@@ -20,6 +20,14 @@
  *                         inject_arg = int switches; proven = int, read-only
  *   debug.qwz.cap73       S1: getCARD_CAPABILITIES bit 73 (capabilities[9] 0x02, SSID-list scans), default 1; 0 = the old blob; a Wi-Fi
  *                         toggle or reboot applies it
+ *   debug.qwz.monnocred   K1 (W1): 1 = the user-space frame write (montxframe) answers ENOSPC, not EAGAIN, while both WMI credits are in flight, and ENXIO
+ *                         while the firmware is down, crashed or a sleep is pending; default 0 (plain global, read at call time)
+ *   debug.qwz.monqmax     K1 (W1): N > 0 = DATA and CONTROL frames from user space are refused with ENOSPC once N frames are queued in the capture
+ *                         TX ring (management frames keep all 63 slots); default 0 = off (plain global, read at call time)
+ *   debug.qwz.monparams   K1 (W3): 1 = MGMT_RATE OFDM 12 Mbit/s on the cell vdev right after it is up, 2 = also MGMT_RETRY_LIMIT 3 and
+ *                         NON_AGG_SW_RETRY_TH 4; default 0; read when the cell starts
+ *   debug.qwz.scanraw     K1 (W2c): 1 = log the non-zero words of the scan request tail for the first three non-plain scan requests, 2 = also for the first
+ *                         three plain launched ones; default 0; release builds too; the words may hold SSID text (plain global, read at call time)
  *   debug.qwz.recover     0 legacy crash handling, 1 armed, write 2 re-arms the engine
  *   debug.qwz.awdlprobe   AWDL data TX probe 0 to 3 (1 to 3 need a proven recovery)
  *   debug.qwz.awdlpeers   M2a WP2, AWDL peer hygiene, bit mask (QWZ_AWDLP_* in qwz_life.h), 0 = M0.1: 1 the heard-sender list starts again at

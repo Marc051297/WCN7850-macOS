@@ -68,6 +68,7 @@
 
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
+#include "qwz_log.h"	/* K1 (W2c): the join-pick evidence line in ieee80211_node_choose_bss */
 
 struct ieee80211_node *ieee80211_node_alloc(struct ieee80211com *);
 void ieee80211_node_free(struct ieee80211com *, struct ieee80211_node *);
@@ -1334,6 +1335,9 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
     struct ieee80211_node *ni, *nextbs, *selbs = NULL,
     *selbs2 = NULL, *selbs5 = NULL;
     uint8_t min_5ghz_rssi;
+    /* K1 (W2c): evidence for the one 'join pick' line below; nothing here feeds the choice */
+    unsigned int jl_seen = 0, jl_rej = 0, jl_namefail = 0, jl_fail_or = 0, jl_bfail = 0;
+    int jl_bch = -1, jl_brssi = -1000;
     
     ni = RB_MIN(ieee80211_tree, &ic->ic_tree);
     
@@ -1355,8 +1359,19 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
             *curbs = ni;
         
         int fail = ieee80211_match_bss(ic, ni, bgscan);
+        jl_seen++;	/* K1 (W2c) */
         if (fail != 0) {
             DPRINTF(("%s ieee80211_match_bss==FALSE, ssid=%s, bssid=%s, %d\n", __FUNCTION__, ni->ni_essid, ether_sprintf(ni->ni_bssid), fail));
+            jl_rej++;	/* K1 (W2c): a node that matched the wanted name (no ESSID or BSSID bit) but failed otherwise is the interesting one; keep the strongest */
+            jl_fail_or |= (unsigned int)fail;
+            if (!(fail & (IEEE80211_NODE_ASSOCFAIL_ESSID | IEEE80211_NODE_ASSOCFAIL_BSSID))) {
+                jl_namefail++;
+                if ((int)ni->ni_rssi > jl_brssi) {
+                    jl_brssi = (int)ni->ni_rssi;
+                    jl_bch = ieee80211_chan2ieee(ic, ni->ni_chan);
+                    jl_bfail = (unsigned int)fail;
+                }
+            }
             continue;
         }
         
@@ -1396,6 +1411,17 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
     else if (selbs5)
         selbs = selbs5;
     
+    {
+        /* K1 (W2c): one line per join pick (only while a join is requested, else every node is refused for the ESSID); no SSID, BSSID or MAC is printed */
+        static unsigned int jl_count;
+#ifdef AIRPORT_WCL
+        if (ic->ic_wcl_join_requested)
+#endif
+        if (qwz_log_ratelimit(&jl_count, 24, 8))
+            qwz_log("airport: join pick #%u: nodes %u rejected %u (fail bits or'd 0x%x) name-matched-but-rejected %u (strongest: ch %d rssi %d fail 0x%x); picked %s ch %d rssi %d\n",
+                    jl_count, jl_seen, jl_rej, jl_fail_or, jl_namefail, jl_bch, jl_namefail ? jl_brssi : 0, jl_bfail,
+                    selbs ? "yes" : "none", selbs ? ieee80211_chan2ieee(ic, selbs->ni_chan) : -1, selbs ? (int)selbs->ni_rssi : 0);
+    }
     return selbs;
 }
 

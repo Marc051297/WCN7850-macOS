@@ -39,6 +39,10 @@ int qwz_m0_on = 1, qwz_dead_aware = 1, qwz_mmio_guard = 1, qwz_bme = 1, qwz_soft
 volatile int qwz_pm_pending = 0;	/* HF-1, HF-3: see qwz_life.h; not a sysctl */
 
 int qwz_cap73 = 1;	/* S1 (hotspot Wi-Fi): debug.qwz.cap73, see qwz_life.h; its own line, apart from the list above */
+int qwz_monnocred = 0;		/* K1 (W1): debug.qwz.monnocred, see qwz_life.h */
+unsigned int qwz_monqmax = 0;	/* K1 (W1): debug.qwz.monqmax, see qwz_life.h */
+int qwz_monparams = 0;		/* K1 (W3): debug.qwz.monparams, see qwz_life.h */
+int qwz_scanraw = 0;		/* K1 (W2c): debug.qwz.scanraw, see qwz_life.h */
 
 int qwz_awdltruth = 0, qwz_awdlclk = 0;	/* M2a WP5: see qwz_life.h; 0 and 0 is M0.1 on the air */
 volatile unsigned int qwz_awdl_lat_us = 0;	/* M2a WP5 (awdlclk 8): see qwz_life.h */
@@ -658,6 +662,14 @@ SYSCTL_UINT(_debug_qwz, OID_AUTO, monflags, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_mon_flags, 0, "monitor-mode experiment flags (QWZ_MON_F_* in qwz_mon.h)");
 SYSCTL_UINT(_debug_qwz, OID_AUTO, monhold, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_mon_hold, 0, "1: Wi-Fi on keeps the capture cell instead of starting the station");
+SYSCTL_INT(_debug_qwz, OID_AUTO, monnocred, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_monnocred, 0, "K1 W1: 1 = the user-space frame write answers ENOSPC (not EAGAIN) while both WMI credits are in flight and ENXIO while the firmware is down; 0 = EAGAIN (default)");
+SYSCTL_UINT(_debug_qwz, OID_AUTO, monqmax, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_monqmax, 0, "K1 W1: N > 0 = DATA and CONTROL frames from user space get ENOSPC once N frames are queued in the capture TX ring (management frames keep all 63 slots); 0 = off (default)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, monparams, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_monparams, 0, "K1 W3: 1 = cell vdev MGMT_RATE OFDM 12 Mbit/s after vdev up, 2 = also MGMT_RETRY_LIMIT 3 and NON_AGG_SW_RETRY_TH 4; 0 = off (default); read when the cell starts");
+SYSCTL_INT(_debug_qwz, OID_AUTO, scanraw, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_scanraw, 0, "K1 W2c: 1 = log the non-zero 32-bit words of the scan request tail for the first three non-plain scan requests, 2 = also for the first three plain launched ones; 0 = off (default); may hold SSID text, redact before sharing");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, monmac, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
     0, 0, qwz_sysctl_monmac, "A", "the capture vdev's MAC: the AWDL address for a node on this card");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, montxframe, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
@@ -799,6 +811,10 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_mon);
 	sysctl_register_oid(&sysctl__debug_qwz_monflags);
 	sysctl_register_oid(&sysctl__debug_qwz_monhold);
+	sysctl_register_oid(&sysctl__debug_qwz_monnocred);
+	sysctl_register_oid(&sysctl__debug_qwz_monqmax);
+	sysctl_register_oid(&sysctl__debug_qwz_monparams);
+	sysctl_register_oid(&sysctl__debug_qwz_scanraw);
 	sysctl_register_oid(&sysctl__debug_qwz_monbssid);
 	sysctl_register_oid(&sysctl__debug_qwz_montx);
 	sysctl_register_oid(&sysctl__debug_qwz_monmac);
@@ -838,6 +854,10 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_monbssid);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monflags);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monhold);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monnocred);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monqmax);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monparams);
+	sysctl_unregister_oid(&sysctl__debug_qwz_scanraw);
 	sysctl_unregister_oid(&sysctl__debug_qwz_mon);
 	/* M0 (C32), in the reverse order of the registration */
 	sysctl_unregister_oid(&sysctl__debug_qwz_health);
