@@ -2346,6 +2346,11 @@ struct qwz_softc {
 	struct qwz_dmamem		*fwmem;
 	int				 expect_fwmem_req;
 	int				 fwmem_ready;
+#ifdef __APPLE__
+	/* K5 (OBSD-1): debug.qwz.fwsegs 1 = one block per firmware segment, each aligned to the next power of two of its size; fwmem above stays the legacy single block */
+	struct qwz_dmamem		*fwseg[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+	uint32_t			 fwseg_n;
+#endif
 	int				 fw_ready;
 
 	int				 ctl_resp;
@@ -2359,6 +2364,18 @@ struct qwz_softc {
 	/* qwz_mon.c: monitor-mode capture (debug.qwz.mon). */
 	struct qwz_vif			 sc_monvif;
 	int				 mon_active;
+	/*
+	 * K5 (L1-C1, debug.qwz.moncoex): the cell that shares the radio with the running station. mon_coex is 1 only while a coex cell runs (every K5 branch
+	 * tests it, never the sysctl, so a live write cannot flip a running cell); mon_coex_setup is 1 while qwz_mon_start of a coex cell is in progress
+	 * (qwz_newstate_task waits on it for at most 2 s) and also makes the create/start/filter code take the coex branches before mon_coex is set;
+	 * base_vdevs/base_peers are the station's counts recorded at admission; halt, swapped and probe belong to the stop path (C13, C10, C14);
+	 * mon_coex_sta_addr is the station's own address; mon_coex_stopped_ns is when the last coex cell stopped.
+	 */
+	int				 mon_coex, mon_coex_setup, mon_coex_base_vdevs, mon_coex_base_peers, mon_coex_halt, mon_coex_swapped, mon_coex_probe;
+	uint8_t				 mon_coex_sta_addr[IEEE80211_ADDR_LEN];
+	uint64_t			 mon_coex_stopped_ns;
+	struct task			 mon_coex_task;	/* K5 (L1-C13, C14): runs in the gate on systq (the 1 s watchdog tick runs on the workloop thread, which may not sleep); NOT reference-counted */
+	int				 mon_coex_task_why;	/* bit 1 stop the cell, 2 restore the RX filter, 4 restart the station vdev; set by the tick, taken by the task */
 	int				 mon_fw_dirty;	/* a cell ran: restart the firmware before the station */
 	int				 mon_chan;
 	uint32_t			 mon_freq;
@@ -2386,6 +2403,7 @@ struct qwz_softc {
 		uint32_t wmi_mgmt_rx_events, ring_mgmt_frames;	/* K2c (C4): WMI management-RX events seen while the cell runs (before any filter); management frames that arrived through the RX ring path */
 		uint32_t ufr_fmt, ufr_fmtfail;	/* K4 (M1): user frames sent with a tx_params block (debug.qwz.monfmt); of those, frames whose tx_params send failed and went again without */
 		uint32_t badcookie, nolink, duplink, linkret_fail;
+		uint32_t coex_st_mgmt, coex_cell_mgmt, coex_st_data, coex_cell_data, coex_drop;	/* K5 (L1-C6, C7, C15): while a coex cell runs, frames the claim tests sent to the station (st_*), to the cell's capture (cell_*), or dropped (drop); reset with the rest of mon_stats at cell start */
 		uint64_t last_log;
 	} mon_stats;
 

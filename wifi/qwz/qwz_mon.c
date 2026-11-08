@@ -29,6 +29,7 @@ int	qwz_wmi_vdev_stop(struct qwz_softc *, uint8_t, uint8_t);
 int	qwz_wmi_vdev_set_param_cmd(struct qwz_softc *, uint32_t, uint8_t, uint32_t, uint32_t);
 int	qwz_wmi_pdev_set_param(struct qwz_softc *, uint32_t, uint32_t, uint8_t);	/* K1 (W3) */
 int	qwz_mac_vdev_setup_sync(struct qwz_softc *);
+void	qwz_mac_vdev_chan_args(struct qwz_softc *, struct ieee80211_node *, struct wmi_vdev_start_req_arg *);	/* K5 (L1-C4): the station's own vdev-start channel arguments */
 int	qwz_mac_setup_vdev_create_params(struct qwz_softc *, struct qwz_vif *, struct qwz_pdev *, struct vdev_create_params *);
 int	qwz_mac_op_update_vif_offload(struct qwz_softc *, struct qwz_pdev *, struct qwz_vif *);
 int	qwz_get_num_chains(uint32_t);
@@ -57,6 +58,10 @@ IOCommandGate *qwz_compat_gate(void);
  * C-linkage block. Nonzero when lane M0.1's listen vdev (awdltest=3..6) or its test lane is up.
  */
 int	qwz_awdl_vdev_busy(struct qwz_softc *);
+/* K5 (L1-C7): qwz.c, C++ linkage like qwz_awdl_vdev_busy: 1 when the address is awdl0's own (the listen lane's vdev address while it listens) */
+int	qwz_mon_awdl_addr_ours(struct qwz_softc *, const uint8_t *);
+/* K5 (L1-C14): qwz.c, the station vdev restart used as step 3 of the deaf-station escalation */
+int	qwz_mac_vdev_restart(struct qwz_softc *, struct qwz_vif *, int);
 /* qwz.c (fix F2): the station bring-up, C++ linkage like qwz_stop (qwzvar.h); the failure path of an in-place stop calls it under the same ioctl lock as enableGated */
 int	qwz_init(struct ifnet *);
 
@@ -142,9 +147,46 @@ qwz_mon_holding(struct ieee80211com *ic)
 {
 	struct qwz_softc *sc = ic ? (struct qwz_softc *)ic->ic_if.if_softc : NULL;
 
+	/* K5 (L1-C5): a coex cell runs beside a genuinely running station; that is not the hold state (Wi-Fi off/on must run the real stop/init) */
+	if (sc != NULL && sc->mon_coex)
+		return 0;
 	/* merge glue (D1): a torn-down, crashed or DEAD firmware never holds; the next enable then runs the full qwz_init */
 	return sc != NULL && qwz_mon_hold != 0 && sc->mon_active && sc->fw_initialized && !QWZ_CRASHED(sc);
 }
+
+/* K5 (L1-C5): a coex cell is running beside the station (mon_coex is 1 only then; it is set just before mon_active and cleared with it) */
+int
+qwz_mon_coex_running(struct qwz_softc *sc)
+{
+	return sc != NULL && sc->mon_active && sc->mon_coex && sc->fw_initialized && !QWZ_CRASHED(sc);
+}
+
+/* K5 (L1-C5): scans must not reach the firmware: the classic hold, or a coex cell with debug.qwz.moncoexscan (live) */
+int
+qwz_mon_scan_hold(struct ieee80211com *ic)
+{
+	struct qwz_softc *sc = ic ? (struct qwz_softc *)ic->ic_if.if_softc : NULL;
+
+	return qwz_mon_holding(ic) || (qwz_moncoexscan != 0 && qwz_mon_coex_running(sc));
+}
+
+/* K5 (L1-C12): qwz_mon_coex_running for a caller that only has the ieee80211com */
+int
+qwz_mon_coex_running_ic(struct ieee80211com *ic)
+{
+	return qwz_mon_coex_running(ic ? (struct qwz_softc *)ic->ic_if.if_softc : NULL);
+}
+
+/*
+ * K5 (L1-C2): 1 while qwz_mon_start of a coex cell is in progress (mon_coex_setup) or the coex cell runs (mon_coex). The create, start and filter code of
+ * a cell takes its coex branches on this, because mon_coex itself is only set just before mon_active.
+ */
+#define QWZ_MON_COEX_ON(sc)	((sc)->mon_coex || (sc)->mon_coex_setup)
+/* K5 (L1-C2): ends the setup window of a coex start (the newstate task waits on it for at most 2 s) */
+#define QWZ_MON_COEX_SETUP_END(sc)	do { (sc)->mon_coex_setup = 0; wakeup(&(sc)->mon_coex_setup); } while (0)
+/* K5 (L1-C14): the deaf-station probe after a coex cell stop: station frame counters at the stop, and how far the escalation went (0 none, 1 silent logged, 2 filter restored, 3 vdev restarted, 4 init queued) */
+static uint32_t qwz_mon_probe_data0, qwz_mon_probe_mgmt0;
+static int qwz_mon_probe_step;
 static uint8_t mon_psf[512];		/* last PSF heard, without FCS */
 static size_t mon_psf_len;
 static uint8_t mon_psf_src[6];
@@ -158,6 +200,58 @@ qwz_mon_have_maps(struct qwz_softc *sc)
 }
 static const uint8_t qwz_awdl_bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
 static const uint8_t qwz_bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+/*
+ * K5 (L1-C6): the station's management frames while a coex cell runs, tested before the cell's claim. A unicast reply to our address is the station's by
+ * A1 alone; a frame of the joined BSS by A3; a group-addressed frame the associated AP sent (beacons keep A3 = BSSID, other broadcasts A2 = the AP).
+ */
+int
+qwz_mon_is_station_frame(struct qwz_softc *sc, const uint8_t *f, size_t len)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *bss = ic->ic_bss;
+
+	if (len < 24)
+		return 0;
+	if (IEEE80211_ADDR_EQ(f + 4, ic->ic_myaddr) || IEEE80211_ADDR_EQ(f + 4, sc->sc_vif.vdev_addr))
+		return 1;
+	if (bss != NULL && IEEE80211_ADDR_EQ(f + 16, bss->ni_bssid))
+		return 1;
+	if ((f[4] & 0x01) && bss != NULL && IEEE80211_ADDR_EQ(f + 10, bss->ni_macaddr))
+		return 1;
+	return 0;
+}
+
+/* K5 (L1-C6): the cell's management frames: on the cell's frequency and in the AWDL BSS (or the debug.qwz.monbssid one), or sent to the cell vdev's address */
+int
+qwz_mon_claims_mgmt(struct qwz_softc *sc, const uint8_t *f, size_t len, uint32_t chan_freq)
+{
+	if (len < 24 || chan_freq != sc->mon_freq)
+		return 0;
+	if (IEEE80211_ADDR_EQ(f + 16, qwz_awdl_bssid))
+		return 1;
+	if (sc->mon_bssid_set && IEEE80211_ADDR_EQ(f + 16, sc->mon_bssid))
+		return 1;
+	return IEEE80211_ADDR_EQ(f + 4, sc->sc_monvif.vdev_addr);
+}
+
+/* K5 (L1-C7): data frames, see qwz_mon.h. The station's frames are never the cell's; everything not positively the cell's is not claimed. */
+int
+qwz_mon_claims_data(struct qwz_softc *sc, const uint8_t *a1, const uint8_t *a2, const uint8_t *a3)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *bss = ic->ic_bss;
+
+	(void)a2;
+	if (!sc->mon_coex)
+		return 1;
+	if (IEEE80211_ADDR_EQ(a1, ic->ic_myaddr) || (bss != NULL && IEEE80211_ADDR_EQ(a3, bss->ni_bssid)))
+		return 0;
+	if (IEEE80211_ADDR_EQ(a3, qwz_awdl_bssid) || (sc->mon_bssid_set && IEEE80211_ADDR_EQ(a3, sc->mon_bssid)) ||
+	    IEEE80211_ADDR_EQ(a1, sc->sc_monvif.vdev_addr) || qwz_mon_awdl_addr_ours(sc, a1))
+		return 1;
+	return 0;
+}
 
 /* Management action, category 127, Apple OUI, AWDL type 8, subtype 0 (PSF). */
 static int
@@ -178,7 +272,23 @@ qwz_mon_is_psf(const uint8_t *f, size_t len)
 static int
 qwz_mon_fw_unavail(struct qwz_softc *sc)
 {
+	if (sc->mon_coex_halt)	/* K5 (L1-C13): the station is leaving, the cell is being stopped: user frames answer ENXIO */
+		return 1;
 	return QWZ_CRASHED(sc) || !sc->fw_initialized || __atomic_load_n(&qwz_pm_pending, __ATOMIC_ACQUIRE) != 0;
+}
+
+/*
+ * K5 (L1-C9): beside the station the cell leaves debug.qwz.moncoexcred (default 1) WMI credits to the station: 1 when only that many are left. 0 outside a
+ * coex cell and with the switch at 0, so K4 is unchanged. Read live.
+ */
+static int
+qwz_mon_cred_reserved(struct qwz_softc *sc)
+{
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[sc->pdevs[0].pdev_id];
+
+	if (!sc->mon_coex || qwz_moncoexcred <= 0 || (unsigned int)wmi->eid >= (unsigned int)ATH12K_HTC_EP_COUNT)
+		return 0;
+	return sc->htc.endpoint[wmi->eid].tx_credits <= qwz_moncoexcred;
 }
 
 static int
@@ -186,6 +296,8 @@ qwz_mon_no_credit(struct qwz_softc *sc)
 {
 	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[sc->pdevs[0].pdev_id];
 
+	if (qwz_mon_cred_reserved(sc))	/* K5 (L1-C9) */
+		return 1;
 	return (unsigned int)wmi->eid >= (unsigned int)ATH12K_HTC_EP_COUNT || sc->htc.endpoint[wmi->eid].tx_credits == 0 ||
 	    (__atomic_load_n(&sc->sc_inject, __ATOMIC_ACQUIRE) & QWZ_INJ_WMI_STARVE) != 0;
 }
@@ -200,6 +312,10 @@ qwz_mon_tx_blocked(struct qwz_softc *sc)
 	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[sc->pdevs[0].pdev_id];
 
 	if (QWZ_CRASHED(sc) || !sc->fw_initialized || __atomic_load_n(&qwz_pm_pending, __ATOMIC_ACQUIRE) != 0)
+		return 1;
+	if (sc->mon_coex_halt)	/* K5 (L1-C13) */
+		return 1;
+	if (qwz_mon_cred_reserved(sc))	/* K5 (L1-C9) */
 		return 1;
 	if ((unsigned int)wmi->eid >= (unsigned int)ATH12K_HTC_EP_COUNT || sc->htc.endpoint[wmi->eid].tx_credits == 0 ||
 	    (__atomic_load_n(&sc->sc_inject, __ATOMIC_ACQUIRE) & QWZ_INJ_WMI_STARVE) != 0)
@@ -423,6 +539,18 @@ qwz_mon_tx_compl(struct qwz_softc *sc, struct wmi_mgmt_tx_compl_event *ev)
 	struct qwz_txmgmt_queue *q = &sc->sc_monvif.txmgmt;
 	struct qwz_tx_data *td;
 
+	/*
+	 * K5 (L1-C8): beside the station the ids are partitioned: 0 to QWZ_MON_COEX_STA_SLOTS-1 are the station's ring, the cell's are the rest (the lane M
+	 * pool starts at 64 and was handled by the caller). No slot-occupancy guess: a station id is never the cell's, a cell id never the station's.
+	 */
+	if (sc->mon_active && sc->mon_coex) {
+		if (ev->desc_id < QWZ_MON_COEX_STA_SLOTS)
+			return 0;
+		if (ev->desc_id < nitems(q->data) && q->data[ev->desc_id].m == NULL) {
+			sc->mon_stats.ufr_compl_nom++;
+			return 1;
+		}
+	}
 	/* K2c (C3): the three silent early returns below are counted (ufr_compl_range / _nom / _sta) so a lost completion is no longer invisible */
 	if (!sc->mon_active)	/* outside a cell every completion is the station's: not counted */
 		;
@@ -542,6 +670,9 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 	int fmt_used = 0;	/* K4 (M1) */
 	static int fmt_logged, fmt_fail_logged;	/* K4 (M1): first 8 tx_params frames and first 4 fallbacks per boot */
 
+	if (sc->mon_coex_halt)	/* K5 (L1-C13): the cell is being stopped because the station leaves RUN */
+		return ENXIO;
+
 	/* K1 (W1), debug.qwz.monnocred: XNU re-runs a sysctl handler while it returns EAGAIN, so EAGAIN here spins inside the kernel; answer exactly instead (the checks below stay for monnocred 0) */
 	if (qwz_monnocred) {
 		if (qwz_mon_fw_unavail(sc))
@@ -563,6 +694,8 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 		sc->mon_stats.ufr_qmax++;
 		return ENOSPC;
 	}
+	if (sc->mon_coex && vif->txmgmt.queued >= (int)nitems(vif->txmgmt.data) - 1 - QWZ_MON_COEX_STA_SLOTS)	/* K5 (L1-C8): the cell's ring is ids 8 to 63 */
+		return ENOSPC;
 	if (vif->txmgmt.queued >= (int)nitems(vif->txmgmt.data) - 1)
 		return ENOSPC;
 	/* K2c (C2), debug.qwz.monreap: the slot the next send takes is still occupied (a lost completion, then a wrap): qwz_mac_mgmt_tx_wmi would overwrite its mbuf and leak it. Reap it when it is older than 250 ms, else refuse */
@@ -742,6 +875,8 @@ qwz_mon_txq_purge(struct qwz_softc *sc)
 		q->data[i].ni = NULL;
 	}
 	q->cur = q->queued = 0;
+	if (sc->mon_active && sc->mon_coex)	/* K5 (L1-C8): a purge of a running coex cell starts at the cell's first id (the stop and teardown paths run with mon_active 0: cur 0 as K4) */
+		q->cur = QWZ_MON_COEX_STA_SLOTS;
 	memset(sc->mon_lat.tx_ns, 0, sizeof(sc->mon_lat.tx_ns));	/* K2c (C3): no per-slot stamp or kind outlives the slots */
 	memset(sc->mon_tx_kind, 0, sizeof(sc->mon_tx_kind));
 }
@@ -1045,6 +1180,13 @@ qwz_mon_rx_filter(struct qwz_softc *sc, int enable)
 		f.pkt_filter_flags3 |= HTT_RX_MON_MO_CTRL_FILTER_FLASG3 |
 		    HTT_RX_MON_MO_DATA_FILTER_FLASG3;
 	}
+	if (QWZ_MON_COEX_ON(sc) && qwz_moncoexfilter == 2) {
+		/* K5 (L1-C10): moncoexfilter 2 = swap, but filter-pass only (the QWZ_MON_F_FP_ONLY result), whatever monflags says */
+		f.pkt_filter_flags0 = HTT_RX_MON_FP_MGMT_FILTER_FLAGS0;
+		f.pkt_filter_flags1 = HTT_RX_MON_FP_MGMT_FILTER_FLAGS1;
+		f.pkt_filter_flags2 = HTT_RX_MON_FP_CTRL_FILTER_FLASG2;
+		f.pkt_filter_flags3 = HTT_RX_MON_FP_CTRL_FILTER_FLASG3 | HTT_RX_MON_FP_DATA_FILTER_FLASG3;
+	}
 	if (qwz_mon_flags & QWZ_MON_F_OFFSETS) {
 		f.offset_valid = 1;
 		f.rx_packet_offset = sc->hal.hal_desc_sz;
@@ -1231,6 +1373,22 @@ qwz_mon_pop_mpdu(struct qwz_softc *sc, struct hal_reo_entrance_ring *ent,
 		sc->mon_stats.frames++;
 		if (flen >= 2 && ((mon_frame[0] >> 2) & 3) == 0)	/* K2c (C4): a management frame that came through the RX ring path (evidence only) */
 			sc->mon_stats.ring_mgmt_frames++;
+		if (sc->mon_coex) {
+			/*
+			 * K5 (L1-C7): beside the station only the cell's frames reach the capture ring: A1, A2 and A3 at offsets 4, 10 and 16 must make the claim
+			 * (control frames and anything shorter than a header are not the cell's). The buffers are returned either way (this function's loop above
+			 * already freed them), so nothing leaks.
+			 */
+			if (flen >= 24 && ((mon_frame[0] >> 2) & 3) != 1 && qwz_mon_claims_data(sc, mon_frame + 4, mon_frame + 10, mon_frame + 16)) {
+				if (((mon_frame[0] >> 2) & 3) == 0)
+					sc->mon_stats.coex_cell_mgmt++;
+				else
+					sc->mon_stats.coex_cell_data++;
+			} else {
+				sc->mon_stats.coex_drop++;
+				return nbuf;
+			}
+		}
 		qwz_mon_rx_hook(sc, mon_frame, flen, flags);
 		moncap_put(mon_frame, flen, flags, decap, (uint8_t)sc->mon_chan, 0, 0);
 	}
@@ -1289,6 +1447,11 @@ qwz_mon_reap(void *arg)
 		    sc->mon_stats.reo_err, sc->mon_stats.wbm_err, sc->mon_stats.bufs,
 		    sc->mon_stats.badcookie, sc->mon_stats.nolink, sc->mon_stats.duplink,
 		    sc->mon_stats.linkret_fail, moncap_dropped, sc->mon_stats.wmi_mgmt_rx_events, sc->mon_stats.ring_mgmt_frames);
+		if (sc->mon_coex)	/* K5 (L1-C15): totals since the cell started of what the claim tests did, plus the credit reserve, the credits left and the filter mode */
+			printf("qwz: mon: coex: counters st_mgmt %u cell_mgmt %u st_data %u cell_data %u drop %u; resv %d credits_left %d filter %d\n",
+			    sc->mon_stats.coex_st_mgmt, sc->mon_stats.coex_cell_mgmt, sc->mon_stats.coex_st_data, sc->mon_stats.coex_cell_data,
+			    sc->mon_stats.coex_drop, qwz_moncoexcred, (unsigned int)sc->wmi.wmi[sc->pdevs[0].pdev_id].eid < (unsigned int)ATH12K_HTC_EP_COUNT ?
+			    (int)sc->htc.endpoint[sc->wmi.wmi[sc->pdevs[0].pdev_id].eid].tx_credits : -1, qwz_moncoexfilter);
 		if (sc->mon_stats.ufr_sent || sc->mon_stats.ufr_full || sc->mon_stats.ufr_fail)
 			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u; nocred %u qmax %u inflight %u; pending %d reaped %u livefull %u compl range %u nom %u sta %u; held_ms %u gate %u fmt %u fmtfail %u\n",
 			    sc->mon_stats.ufr_sent, sc->mon_stats.ufr_full, sc->mon_stats.ufr_fail,
@@ -1366,6 +1529,21 @@ qwz_mon_vdev_create(struct qwz_softc *sc)
 	vif->vdev_addr[0] |= 0x02;
 	if ((qwz_mon_flags & QWZ_MON_F_BSSID_MAC) && sc->mon_bssid_set)
 		IEEE80211_ADDR_COPY(vif->vdev_addr, sc->mon_bssid);
+	/*
+	 * K5 (L1-C3): beside a running station the cell's address must differ from the station vdev's and from the interface address (two vdevs with one
+	 * address left the station unable to associate, commit 884a7e8). Flip the low bits of the last octet, the local bit in the first octet stays.
+	 * The daemon reads the address from debug.qwz.monmac after the start, so a changed address is harmless.
+	 */
+	if (QWZ_MON_COEX_ON(sc)) {
+		uint8_t last = vif->vdev_addr[5];
+		int k;
+
+		for (k = 1; k < 4 && (IEEE80211_ADDR_EQ(vif->vdev_addr, sc->sc_vif.vdev_addr) || IEEE80211_ADDR_EQ(vif->vdev_addr, ic->ic_myaddr)); k++) {
+			vif->vdev_addr[5] = last ^ (uint8_t)k;
+			if (k == 1)
+				printf("qwz: mon: coex: cell MAC adjusted\n");
+		}
+	}
 
 	memset(&params, 0, sizeof(params));
 	ret = qwz_mac_setup_vdev_create_params(sc, vif, pdev, &params);
@@ -1386,6 +1564,8 @@ qwz_mon_vdev_create(struct qwz_softc *sc)
 	if (ret)
 		return ret;
 	nss = qwz_get_num_chains(sc->cfg_tx_chainmask) ? : 1;
+	if (QWZ_MON_COEX_ON(sc) && qwz_moncoexnss == 1)	/* K5 (L1-C3): optional, no Linux precedent */
+		nss = 1;
 	ret = qwz_wmi_vdev_set_param_cmd(sc, vif->vdev_id, pdev->pdev_id,
 	    WMI_VDEV_PARAM_NSS, nss);
 	if (ret)
@@ -1573,6 +1753,32 @@ qwz_mon_vdev_start(struct qwz_softc *sc, int chan, uint32_t freq)
 		arg.bcn_intval = 100;
 		arg.dtim_period = 1;
 	}
+	/*
+	 * K5 (L1-C4): beside the running station the firmware should see ONE chandef for both vdevs, as under Linux (one channel context). Mode 0 asks the
+	 * station's own routine for freq, centre frequency and phy mode (VHT80 / HE80 on 149), mode 1 keeps the HT20-on-the-primary block above. passive:
+	 * moncoexpassive 1 copies the station vdev's rule (qwz_mac_vdev_start_restart: passive from channel 52 up), 0 keeps the K4 cell's. The beacon
+	 * interval is the station's BSS (Linux wants the two to match). No beacon template (QWZ_MON_F_BEACON stays the fallback if vdev-up is refused).
+	 */
+	if (QWZ_MON_COEX_ON(sc) && ic->ic_bss != NULL && ic->ic_bss->ni_chan != NULL) {
+		struct ieee80211_node *bn = ic->ic_bss;
+
+		if (qwz_moncoexmode == 0) {
+			qwz_mac_vdev_chan_args(sc, bn, &arg);
+			arg.channel.min_power = 0;
+			arg.channel.max_power = 20;
+			arg.channel.max_reg_power = 20;
+			arg.channel.max_antenna_gain = 0;
+			if (vif->vdev_type == WMI_VDEV_TYPE_AP) {
+				arg.bcn_intval = bn->ni_intval ? bn->ni_intval : 100;
+				arg.dtim_period = 1;
+			}
+		}
+		if (qwz_moncoexpassive != 0)
+			arg.channel.passive = ieee80211_chan2ieee(ic, bn->ni_chan) >= 52;
+		printf("qwz: mon: coex: cell vdev %u start freq %u cfreq1 %u mode %u passive %u bcn_intval %u\n", vif->vdev_id,
+		    (unsigned int)arg.channel.freq, (unsigned int)arg.channel.band_center_freq1, (unsigned int)arg.channel.mode,
+		    (unsigned int)arg.channel.passive, (unsigned int)arg.bcn_intval);
+	}
 
 	sc->vdev_setup_done = 0;
 	ret = qwz_wmi_vdev_start(sc, &arg, pdev->pdev_id, 0);
@@ -1589,6 +1795,8 @@ qwz_mon_vdev_start(struct qwz_softc *sc, int chan, uint32_t freq)
 	vif->is_started = 1;
 	vif->chan_mode = arg.channel.mode;
 	vif->chan_cfreq1 = freq;
+	if (QWZ_MON_COEX_ON(sc))	/* K5 (L1-C4): the centre frequency actually sent (the primary only in mode 1) */
+		vif->chan_cfreq1 = arg.channel.band_center_freq1;
 
 	if (vif->vdev_type == WMI_VDEV_TYPE_AP && (qwz_mon_flags & QWZ_MON_F_BEACON))
 		qwz_mon_bcn_tmpl(sc, chan);
@@ -1704,6 +1912,7 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 	uint32_t freq = qwz_mon_chan_freq(chan);
 	int ret;
 	int stopped_in_place = 0;	/* fix F2: this call stopped a running station */
+	int coex = 0;			/* K5 (L1-C2): this start runs beside the associated station (debug.qwz.moncoex) */
 
 	if (freq == 0)
 		return EINVAL;
@@ -1735,6 +1944,66 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 	/* fix F2: the refusals that need no firmware conversation come before the station is stopped in place, so a start that fails anyway leaves it running */
 	if (mon_frame == NULL || moncap_ring == NULL || !qwz_mon_have_maps(sc))
 		return ENOMEM;
+	/*
+	 * K5 (L1-C2): debug.qwz.moncoex 1 and a station that is up: the cell starts BESIDE the associated station, on its own channel (6, 44 or 149), and
+	 * the station is never stopped. Every refusal here is EBUSY and changes nothing. No station running at all (IFF_RUNNING clear) falls through to the
+	 * cell-alone path below, unchanged. moncoex 0: this block is skipped and the code below is K4's.
+	 */
+	if (qwz_moncoex != 0 && (ifp->if_flags & IFF_RUNNING)) {
+		struct ieee80211com *cic = &sc->sc_ic;
+		int stachan, ci;
+
+		if (cic->ic_state != IEEE80211_S_RUN || !sc->sc_vif.is_up || !sc->sc_vif.is_started || cic->ic_bss == NULL || cic->ic_bss->ni_chan == NULL) {
+			printf("qwz: mon: coex: refused: the station is not associated (state %d, up %d, started %d)\n",
+			    (int)cic->ic_state, sc->sc_vif.is_up, sc->sc_vif.is_started);
+			return EBUSY;
+		}
+		stachan = ieee80211_chan2ieee(cic, cic->ic_bss->ni_chan);
+		if (stachan != chan || !(chan == 6 || chan == 44 || chan == 149) || (chan >= 52 && chan <= 144)) {
+			printf("qwz: mon: coex: refused: the station is on channel %d, the cell asked for %d (the cell runs only on the station's channel, 6, 44 or 149, never 52 to 144)\n",
+			    stachan, chan);
+			return EBUSY;
+		}
+		if (qwz_mon_flags & QWZ_MON_F_DELETE_STA) {
+			printf("qwz: mon: coex: refused: monflags has DELETE_STA, which deletes the station vdev (clear 0x20 first)\n");
+			return EBUSY;
+		}
+		if (sc->mon_coex_setup || sc->ns_nstate != cic->ic_state) {
+			printf("qwz: mon: coex: refused: a state change is in flight (ns %d, state %d, setup %d)\n",
+			    (int)sc->ns_nstate, (int)cic->ic_state, sc->mon_coex_setup);
+			return EBUSY;
+		}
+		sc->mon_coex_setup = 1;		/* qwz_newstate_task waits on this for at most 2 s */
+		coex = 1;
+		sc->mon_coex_base_vdevs = sc->num_started_vdevs;
+		sc->mon_coex_base_peers = sc->num_peers;
+		sc->mon_coex_swapped = 0;
+		sc->mon_coex_probe = 0;		/* K5 (L1-C14): a new cell ends any watch of the previous one */
+		IEEE80211_ADDR_COPY(sc->mon_coex_sta_addr, cic->ic_myaddr);
+		/* the station's management ring must be empty: up to 100 ms in 10 ms steps, asleep with the gate released (a bounded delay where sleeping is refused) */
+		for (ci = 0; ci < 10 && sc->sc_vif.txmgmt.queued != 0; ci++) {
+			if (tsleep_delay_nsec(&sc->mon_active, 0, "qwzcoexq", MSEC_TO_NSEC(10)) == EDEADLK)
+				delay(10000);
+		}
+		if (!sc->fw_initialized || QWZ_CRASHED(sc) || __atomic_load_n(&qwz_pm_pending, __ATOMIC_ACQUIRE) != 0 ||
+		    !(ifp->if_flags & IFF_RUNNING) || cic->ic_state != IEEE80211_S_RUN || !sc->sc_vif.is_up) {
+			printf("qwz: mon: coex: refused: the station or the firmware changed state while the cell waited\n");
+			QWZ_MON_COEX_SETUP_END(sc);
+			return EBUSY;
+		}
+		if (sc->sc_vif.txmgmt.queued != 0) {
+			printf("qwz: mon: coex: refused: station management frames are still queued (%d)\n", sc->sc_vif.txmgmt.queued);
+			QWZ_MON_COEX_SETUP_END(sc);
+			return EBUSY;
+		}
+		if (sc->num_started_vdevs > sc->mon_coex_base_vdevs || sc->num_peers > sc->mon_coex_base_peers) {
+			printf("qwz: mon: coex: refused: a vdev or peer appeared during the admission (vdevs %d > %d or peers %d > %d)\n",
+			    sc->num_started_vdevs, sc->mon_coex_base_vdevs, sc->num_peers, sc->mon_coex_base_peers);
+			QWZ_MON_COEX_SETUP_END(sc);
+			return EBUSY;
+		}
+		goto k5_coex_guards_done;	/* skips the stop-in-place block and the two cell-alone guards below */
+	}
 	if (ifp->if_flags & IFF_RUNNING) {
 		int i;
 
@@ -1774,10 +2043,13 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 		printf("qwz: mon: refused: a vdev is still started or peers remain\n");
 		return EBUSY;
 	}
+k5_coex_guards_done:	/* K5 (L1-C2) */
 	memset(&sc->mon_stats, 0, sizeof(sc->mon_stats));
 	sc->mon_stats.ufr_inflight = 0;	/* K2b (W1b): no user frame is in flight in a new cell */
 	memset(sc->mon_tx_kind, 0, sizeof(sc->mon_tx_kind));	/* K2b (W1b): no stale per-slot kind from the previous cell may count against the cap */
 	memset(&sc->mon_lat, 0, sizeof(sc->mon_lat));	/* K1 W2b */
+	if (coex)	/* K5 (L1-C8): the cell's management ids start above the station's ring (0 to 7) */
+		sc->sc_monvif.txmgmt.cur = QWZ_MON_COEX_STA_SLOTS;
 	sc->mon_chan = chan;
 	sc->mon_freq = freq;
 	sc->mon_bssid_set = qwz_mon_parse_mac(qwz_mon_bssid_str, sc->mon_bssid);
@@ -1801,11 +2073,18 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 	ret = qwz_mon_vdev_start(sc, chan, freq);
 	if (ret)
 		goto fail;
+	if (coex) {
+		/* K5 (L1-C10): beside the station the filter is never swapped (KEEP_FILTER forced) unless moncoexfilter says 1 or 2; remember the swap so the stop restores exactly then */
+		sc->mon_coex_swapped = (qwz_moncoexfilter != 0 && !(qwz_mon_flags & QWZ_MON_F_KEEP_FILTER)) ? 1 : 0;
+		if (!sc->mon_coex_swapped)
+			goto k5_coex_filter_kept;
+	}
 	if (!(qwz_mon_flags & QWZ_MON_F_KEEP_FILTER)) {
 		ret = qwz_mon_rx_filter(sc, 1);
 		if (ret)
 			goto fail;
 	}
+k5_coex_filter_kept:	/* K5 (L1-C10) */
 	if (qwz_mon_flags & QWZ_MON_F_MNTFILTER)
 		qwz_mon_wmi_mnt_filter(sc, sc->sc_monvif.vdev_id, 1);
 	if (qwz_mon_flags & QWZ_MON_F_PROMISC)
@@ -1813,19 +2092,41 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 	if ((qwz_mon_flags & (QWZ_MON_F_NRP | QWZ_MON_F_NRP_STA)) && sc->mon_bssid_set)
 		qwz_mon_wmi_nrp(sc, sc->sc_monvif.vdev_id, sc->mon_bssid, 1,
 		    !!(qwz_mon_flags & QWZ_MON_F_NRP_STA));
+	if (coex) {
+		/* K5 (L1-C2): the station must still be in RUN with its vdev up, else the cell goes again (the caller may retry) */
+		if (sc->sc_ic.ic_state != IEEE80211_S_RUN || !sc->sc_vif.is_up || !(ifp->if_flags & IFF_RUNNING)) {
+			printf("qwz: mon: coex: the station left RUN during the cell start (state %d): cell torn down\n", (int)sc->sc_ic.ic_state);
+			ret = EAGAIN;
+			goto fail;
+		}
+		sc->mon_coex = 1;	/* just before mon_active: every K5 branch tests this */
+	}
 	sc->mon_active = 1;
 	timeout_set(&sc->mon_cell_timer, qwz_mon_reap, sc);	/* merge glue (E): the cell has its own timer; mon_reap_timer belongs to the DP code (qwz_stop deletes it) */
 	timeout_add_msec(&sc->mon_cell_timer, 10);
 	/* merge glue (G): the hold state IS "interface UP|RUNNING, no station": macOS sees Wi-Fi on and sharingd advertises */
+	if (coex)
+		goto k5_coex_no_hold;	/* K5 (L1-C2): the station already is UP|RUNNING; qwz_mon_run_raised stays 0 so the stop never clears its flag */
 	if (qwz_mon_hold) {
 		ifp->if_flags |= IFF_RUNNING;
 		qwz_mon_run_raised = 1;	/* fix F4 */
 	}
+k5_coex_no_hold:
 	qwz_awdl0_link(1);	/* merge glue (H3) */
+	if (coex) {
+		printf("qwz: mon: coex: station RUN on %d kept (vdev %u, mode %u, cfreq %u)\n", chan, sc->sc_monvif.vdev_id,
+		    (unsigned int)sc->sc_monvif.chan_mode, (unsigned int)sc->sc_monvif.chan_cfreq1);
+		printf("qwz: mon: coex: base_vdevs %d base_peers %d, cred reserve %d, filter mode %d (swapped %d), mgmt ids %d to %d, scan %d join %d fw %d\n",
+		    sc->mon_coex_base_vdevs, sc->mon_coex_base_peers, qwz_moncoexcred, qwz_moncoexfilter, sc->mon_coex_swapped,
+		    QWZ_MON_COEX_STA_SLOTS, (int)nitems(sc->sc_monvif.txmgmt.data) - 1, qwz_moncoexscan, qwz_moncoexjoin, qwz_moncoexfw);
+		QWZ_MON_COEX_SETUP_END(sc);
+	}
 	printf("qwz: mon: capturing\n");
 	return 0;
 
 fail:
+	if (coex)
+		goto k5_coex_fail;	/* K5 (L1-C2): nothing was stopped, the firmware restart below is not wanted */
 	sc->mon_fw_dirty = 1;
 	if (qwz_mon_vdev_teardown(sc)) {
 		printf("qwz: mon: start failed and the firmware stopped answering: restarting it\n");
@@ -1838,6 +2139,31 @@ fail:
 		    ret, rv ? "failed; the next Wi-Fi toggle recovers" : "ok", rv);
 	}
 	return ret;
+
+k5_coex_fail:
+	/*
+	 * K5 (L1-C2): a coex start failed. The station was never stopped, so nothing is restarted: the cell vdev is torn down, the receive filter is
+	 * restored when it was swapped, and mon_fw_dirty is set only when the teardown found the firmware silent (the engine then owns the restart)
+	 * or moncoexfw is 1 (the old restart at the next qwz_init). qwz_init is never called.
+	 */
+	{
+		int wedged = qwz_mon_vdev_teardown(sc);
+
+		if (sc->mon_coex_swapped && !wedged && sc->fw_initialized && !QWZ_CRASHED(sc))
+			printf("qwz: mon: coex: station filter restored: %d\n", qwz_mon_rx_filter(sc, 0));
+		sc->mon_coex_swapped = 0;
+		sc->mon_coex = 0;
+		if (wedged) {
+			printf("qwz: mon: coex: start failed (%d) and the firmware stopped answering: restarting it\n", ret);
+			qwz_mon_fw_wedged(sc, "mon coex start: the firmware stopped answering");
+		} else {
+			if (qwz_moncoexfw == 1)
+				sc->mon_fw_dirty = 1;
+			printf("qwz: mon: coex: start failed (%d): cell torn down, the station was not touched\n", ret);
+		}
+		QWZ_MON_COEX_SETUP_END(sc);
+		return ret;
+	}
 }
 
 void
@@ -1860,7 +2186,10 @@ qwz_mon_stop(struct qwz_softc *sc)
 	 * boot) before the station comes up. Not here: another cell may
 	 * follow without Wi-Fi in between, and it needs the firmware running.
 	 */
+	if (sc->mon_coex && qwz_moncoexfw != 1)
+		goto k5_coex_no_dirty;	/* K5 (L1-C13): the station kept running beside the coex cell; the restart is only the old behaviour (debug.qwz.moncoexfw 1) */
 	sc->mon_fw_dirty = 1;
+k5_coex_no_dirty:
 	/* merge glue (G, H3): the hold flag raised IFF_RUNNING at start; no station runs now, so the interface must not claim it, and awdl0 loses its link */
 	if (qwz_mon_run_raised) {	/* fix F4: this cell raised it (the monhold value now may differ) */
 		sc->sc_ic.ic_if.if_flags &= ~IFF_RUNNING;
@@ -1879,13 +2208,23 @@ qwz_mon_stop(struct qwz_softc *sc)
 		printf("qwz: mon: the firmware stopped answering: restarting it now\n");
 		qwz_mon_reap_ring(sc);
 		qwz_mon_fw_wedged(sc, "mon stop: the firmware stopped answering");
+		sc->mon_coex = 0;	/* K5 (L1-C2) */
+		sc->mon_coex_swapped = 0;
+		sc->mon_coex_halt = 0;	/* K5 (L1-C13) */
 		return;
 	}
 	qwz_mon_reap_ring(sc);	/* return the buffers still in the ring */
+	if (sc->mon_coex) {
+		/* K5 (L1-C10): beside the station the filter is restored exactly when the start swapped it */
+		if (sc->mon_coex_swapped)
+			printf("qwz: mon: coex: station filter restored: %d\n", qwz_mon_rx_filter(sc, 0));
+		goto k5_coex_filter_done;
+	}
 	if (!(qwz_mon_flags & QWZ_MON_F_KEEP_FILTER)) {
 		if (qwz_mon_rx_filter(sc, 0))
 			printf("qwz: mon: could not restore the station filter\n");
 	}
+k5_coex_filter_done:
 	printf("qwz: mon: stopped: entries %u mpdus %u frames %u mgmt %u reo %u "
 	    "reo_err %u wbm_err %u bufs %u badcookie %u nolink %u duplink %u "
 	    "linkret_fail %u capdrop %u\n",
@@ -1898,6 +2237,20 @@ qwz_mon_stop(struct qwz_softc *sc)
 	    sc->mon_stats.rx_psf, sc->mon_stats.tx_sent, sc->mon_stats.tx_fail,
 	    sc->mon_stats.tx_ok, sc->mon_stats.tx_discard, sc->mon_stats.tx_inspect,
 	    sc->mon_stats.tx_noack, sc->mon_stats.tx_other, sc->mon_stats.last_ack_rssi);
+	if (sc->mon_coex) {
+		/* K5 (L1-C15, C14): the station kept running; watch it for 20 s unless debug.qwz.moncoexfw restores the old restart */
+		printf("qwz: mon: coex: stopped, station frames since stop 0, fw_dirty %d\n", sc->mon_fw_dirty);
+		if (qwz_moncoexfw != 1) {
+			qwz_mon_probe_data0 = sc->sc_stall_data_seen;
+			qwz_mon_probe_mgmt0 = sc->sc_stall_mgmt_seen;
+			qwz_mon_probe_step = 0;
+			sc->mon_coex_stopped_ns = getnsecuptime();
+			sc->mon_coex_probe = 1;
+		}
+	}
+	sc->mon_coex = 0;		/* K5 (L1-C2): the coex cell is over (mon_active went 0 above) */
+	sc->mon_coex_swapped = 0;
+	sc->mon_coex_halt = 0;		/* K5 (L1-C13) */
 }
 
 /*
@@ -1916,6 +2269,10 @@ qwz_mon_epoch_reset(struct qwz_softc *sc)
 	if (was_active)
 		printf("qwz: mon: capture cell ended by a firmware teardown (epoch %u)\n", sc->sc_fw_epoch);
 	sc->mon_active = 0;
+	sc->mon_coex = 0;		/* K5 (L1-C2): a firmware teardown ends a coex cell too */
+	sc->mon_coex_swapped = 0;
+	sc->mon_coex_halt = 0;		/* K5 (L1-C13) */
+	sc->mon_coex_probe = 0;		/* K5 (L1-C14): no firmware left to watch */
 	sc->mon_fw_dirty = 0;
 	if (sc->mon_cell_timer != NULL)	/* never set up: nothing to cancel (timeout_del needs the gate) */
 		timeout_del(&sc->mon_cell_timer);
@@ -1978,10 +2335,14 @@ qwz_mon_capture_mgmt_mbuf(struct qwz_softc *sc, struct mbuf *m, int rssi,
 	    (uint8_t)(r > 255 ? 255 : r));
 }
 
+static void qwz_mon_coex_task_fn(void *);
+
 void
 qwz_mon_attach(struct qwz_softc *sc)
 {
 	qwz_mon_sc = sc;
+	task_set(&sc->mon_coex_task, qwz_mon_coex_task_fn, sc, "qwzcoex");	/* K5 (L1-C13, C14) */
+	sc->mon_coex_task_why = 0;
 	if (moncap_lock == NULL)
 		moncap_lock = IOLockAlloc();
 	if (moncap_ring == NULL)
@@ -2026,6 +2387,7 @@ qwz_mon_detach(struct qwz_softc *sc)
 
 	if (sc == NULL)
 		return;
+	task_del(systq, &sc->mon_coex_task);	/* K5 (L1-C13, C14) */
 	qwz_mon_epoch_reset(sc);
 	q = &sc->sc_monvif.txmgmt;
 	for (i = 0; i < (int)nitems(q->data); i++)
@@ -2081,6 +2443,134 @@ qwz_mon_gated(OSObject *, void *arg0, void *arg1, void *, void *)
 	}
 	rw_exit(&sc->ioctl_rwl);
 	return kIOReturnSuccess;
+}
+
+/*
+ * K5 (L1-C13): the station is about to leave RUN (the newstate task, which runs inside the gate on a thread-call thread): stop a running coex cell first,
+ * through the same gated entry the sysctl uses (ioctl_rwl, qwz_mon_stop; the gate is recursive for its holder). mon_coex_halt makes the user-frame write
+ * answer ENXIO meanwhile. Bounded: 20 tries, 100 ms apart, then the cell ends host-only (qwz_mon_epoch_reset), the firmware's cell vdev is then left to the
+ * teardown that follows. Not counted in task_refs; qwz_stop stops the cell before it waits for the tasks, so the lock order has no cycle.
+ */
+int
+qwz_mon_coex_halt(struct qwz_softc *sc)
+{
+	IOCommandGate *gate = qwz_compat_gate();
+	int i, err = 0;
+
+	if (sc == NULL || gate == NULL || !qwz_mon_coex_running(sc))
+		return 0;
+	printf("qwz: mon: coex: stopped (station leaving)\n");
+	sc->mon_coex_halt = 1;
+	for (i = 0; i < 20 && sc->mon_active; i++) {
+		err = 0;
+		gate->runAction(qwz_mon_gated, (void *)(intptr_t)0, &err);
+		if (!sc->mon_active)
+			break;
+		if (tsleep_delay_nsec(&sc->mon_coex_halt, 0, "qwzhalt", MSEC_TO_NSEC(100)) == EDEADLK)
+			break;
+	}
+	if (sc->mon_active) {
+		printf("qwz: mon: coex: the cell did not stop in 2 s (%d): ended host-only\n", err);
+		qwz_mon_epoch_reset(sc);
+	}
+	sc->mon_coex_halt = 0;
+	return 1;
+}
+
+/* K5 (L1-C13, C14): the work the 1 s tick hands over (bit 1 stop the cell, 2 restore the RX filter, 4 restart the station vdev); runs in the gate on systq, where sleeping is allowed */
+static void
+qwz_mon_coex_task_fn(void *arg)
+{
+	struct qwz_softc *sc = (struct qwz_softc *)arg;
+	struct ieee80211com *ic;
+	int why, ret;
+
+	if (sc == NULL || sc != qwz_mon_sc)
+		return;
+	why = __atomic_exchange_n(&sc->mon_coex_task_why, 0, __ATOMIC_ACQ_REL);
+	ic = &sc->sc_ic;
+	if (why & 1)
+		qwz_mon_coex_halt(sc);
+	if ((why & 2) && !sc->mon_active && sc->fw_initialized && !QWZ_CRASHED(sc) && ic->ic_state == IEEE80211_S_RUN) {
+		ret = qwz_dp_rxdma_ring_sel_config_wcn7850(sc);
+		printf("qwz: mon: coex: step 2: station receive filter restored explicitly: %d\n", ret);
+	}
+	if ((why & 4) && !sc->mon_active && sc->fw_initialized && !QWZ_CRASHED(sc) && ic->ic_state == IEEE80211_S_RUN &&
+	    sc->sc_vif.is_started && ic->ic_bss != NULL) {
+		ret = qwz_mac_vdev_restart(sc, &sc->sc_vif, sc->pdevs[0].pdev_id);
+		if (ret == 0)
+			ret = qwz_wmi_vdev_up(sc, sc->sc_vif.vdev_id, sc->pdevs[0].pdev_id, sc->sc_vif.aid, sc->sc_vif.bssid, NULL, 0, 0);
+		printf("qwz: mon: coex: step 3: station vdev restarted and brought up: %d\n", ret);
+	}
+}
+
+/*
+ * K5 (L1-C13 (5), C14): called once a second from qwz_watchdog, on the workloop thread (under the gate, may not sleep: everything slow is handed to
+ * qwz_mon_coex_task_fn). While a coex cell runs: the cell stops when the station left RUN or its channel is no longer the cell's. After a coex cell
+ * stopped (mon_coex_probe, 20 s): the station's received-frame counters (sc_stall_data_seen and sc_stall_mgmt_seen, the ones the data-stall watcher uses)
+ * must move; if nothing arrived by 5 s while the station is in RUN, escalate once per cell: step 1 log (the null-data probe frame is NOT implemented, the
+ * tree has no null-data sender), step 2 at 6 s restore the RX filter, step 3 at 8 s restart the station vdev, step 4 at 11 s mon_fw_dirty and init_task
+ * (today's behaviour). debug.qwz.moncoexfw 1 never arms the probe: the old restart stays.
+ */
+void
+qwz_mon_coex_probe(struct qwz_softc *sc)
+{
+	struct ieee80211com *ic;
+	uint64_t now, el;
+	uint32_t frames;
+
+	if (sc == NULL || sc != qwz_mon_sc)
+		return;
+	ic = &sc->sc_ic;
+	if (sc->mon_active && sc->mon_coex) {
+		if (sc->mon_coex_halt || sc->mon_coex_task_why != 0)
+			return;
+		if (ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL || ic->ic_bss->ni_chan == NULL ||
+		    ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan) != sc->mon_chan) {
+			printf("qwz: mon: coex: the station left RUN or changed channel (state %d): stopping the cell\n", (int)ic->ic_state);
+			__atomic_fetch_or(&sc->mon_coex_task_why, 1, __ATOMIC_ACQ_REL);
+			task_add(systq, &sc->mon_coex_task);
+		}
+		return;
+	}
+	if (!sc->mon_coex_probe)
+		return;
+	if (sc->mon_active || ic->ic_state != IEEE80211_S_RUN || !sc->fw_initialized || QWZ_CRASHED(sc)) {
+		sc->mon_coex_probe = 0;
+		return;
+	}
+	now = getnsecuptime();
+	el = (now - sc->mon_coex_stopped_ns) / 1000000ULL;
+	frames = (sc->sc_stall_data_seen - qwz_mon_probe_data0) + (sc->sc_stall_mgmt_seen - qwz_mon_probe_mgmt0);
+	if (frames != 0) {
+		printf("qwz: mon: coex: station frames since stop %u after %llu ms: the station hears (escalation step %d)\n", frames,
+		    (unsigned long long)el, qwz_mon_probe_step);
+		sc->mon_coex_probe = 0;
+		return;
+	}
+	if (el >= 20000) {
+		printf("qwz: mon: coex: station silent for 20 s after the cell stop (escalation step %d), probe ends\n", qwz_mon_probe_step);
+		sc->mon_coex_probe = 0;
+		return;
+	}
+	if (qwz_mon_probe_step == 0 && el >= 5000) {
+		qwz_mon_probe_step = 1;
+		printf("qwz: mon: coex: station silent after cell stop (%llu ms, 0 frames); probe frame not implemented (no null-data sender in this tree)\n", (unsigned long long)el);
+	} else if (qwz_mon_probe_step == 1 && el >= 6000) {
+		qwz_mon_probe_step = 2;
+		__atomic_fetch_or(&sc->mon_coex_task_why, 2, __ATOMIC_ACQ_REL);
+		task_add(systq, &sc->mon_coex_task);
+	} else if (qwz_mon_probe_step == 2 && el >= 8000) {
+		qwz_mon_probe_step = 3;
+		__atomic_fetch_or(&sc->mon_coex_task_why, 4, __ATOMIC_ACQ_REL);
+		task_add(systq, &sc->mon_coex_task);
+	} else if (qwz_mon_probe_step == 3 && el >= 11000) {
+		qwz_mon_probe_step = 4;
+		printf("qwz: mon: coex: step 4: still silent after %llu ms: firmware restart queued (mon_fw_dirty, init_task)\n", (unsigned long long)el);
+		sc->mon_fw_dirty = 1;
+		sc->mon_coex_probe = 0;
+		task_add(systq, &sc->init_task);
+	}
 }
 
 int

@@ -419,6 +419,21 @@ bool AirportItlwm::start(IOService *provider)
                 qwz_log("qwz: hwmode: boot-arg qwzhwmode=%d ignored (0 to 31 only)\n", hwm_boot);
         }
     }
+    {
+        /* K5 (OBSD-2): qwzfwsegs=N (0 to 2) starts the boot with debug.qwz.fwsegs N, so the first firmware start of a boot can use it; one banner line per boot */
+#ifndef QWZ_FWSEGS_DEFAULT
+#define QWZ_FWSEGS_DEFAULT 0
+#endif
+        int fws_boot = 0;
+        if (PE_parse_boot_argn("qwzfwsegs", &fws_boot, sizeof(fws_boot))) {
+            if (fws_boot >= 0 && fws_boot <= 2) {
+                qwz_fwsegs = fws_boot;
+                qwz_log("qwz: fwsegs: boot-arg qwzfwsegs=%d\n", fws_boot);
+            } else
+                qwz_log("qwz: fwsegs: boot-arg qwzfwsegs=%d ignored (0 to 2 only)\n", fws_boot);
+        }
+        qwz_log("qwz: fwsegs: mode %d (default %d)\n", qwz_fwsegs, (int)QWZ_FWSEGS_DEFAULT);
+    }
     if (PE_parse_boot_argn("qwzhwmguard", &boot_value, sizeof(boot_value)) && boot_value == 1) {
         qwz_hwm_guard = 1;
         qwz_log("qwz: hwmode: boot-arg qwzhwmguard=1: offered hardware mode ids outside the priority table are skipped\n");

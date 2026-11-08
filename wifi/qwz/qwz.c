@@ -114,6 +114,16 @@ qwz_txmgmt_nslots(struct qwz_softc *sc, struct qwz_vif *arvif)
 
 	return (arvif == &sc->sc_vif && n > QWZ_BSS_TXMGMT_SLOTS) ? QWZ_BSS_TXMGMT_SLOTS : n;
 }
+/*
+ * K5 (L1-C8): beside the station (debug.qwz.moncoex) the capture vif's management ids start above the station's ring: the station keeps ids 0 to 7,
+ * the cell takes QWZ_BSS_TXMGMT_SLOTS to 63, lane M's pool stays at 64 and up. 0 for the station and for every K4 cell.
+ */
+static inline int
+qwz_txmgmt_base(struct qwz_softc *sc, struct qwz_vif *arvif)
+{
+	return (arvif == &sc->sc_monvif && sc->mon_coex) ? QWZ_BSS_TXMGMT_SLOTS : 0;
+}
+static_assert(QWZ_MON_COEX_STA_SLOTS == QWZ_BSS_TXMGMT_SLOTS, "qwz_mon.h's partition must equal the BSS ring's size");
 static_assert(QWZ_AWDL_DESC_BASE >= (int)nitems(((struct qwz_txmgmt_queue *)0)->data),
     "the lane M pool's desc_ids (QWZ_AWDL_DESC_BASE + slot) must lie above every management ring slot id");
 static_assert(sizeof(((struct qwz_softc *)0)->sc_awdltest_txns) / sizeof(uint64_t) >= QWZ_BSS_TXMGMT_SLOTS &&
@@ -253,6 +263,8 @@ qwz_bgscan(struct ieee80211com *ic)
 	static int traced;
 	int ret;
 
+	if (sc->mon_coex && sc->mon_active && qwz_moncoexscan)	/* K5 (L1-C11): no firmware scan may pull the radio off the coex cell's channel */
+		return EBUSY;
 	if (sc->scan.state != ATH12K_SCAN_IDLE)
 		return EBUSY;
 	ret = qwz_scan(sc);
@@ -714,6 +726,11 @@ qwz_stop(struct ifnet *ifp)
 	int s = splnet();
 
 	rw_assert_wrlock(&sc->ioctl_rwl);
+	if (sc->mon_active && sc->mon_coex) {
+		/* K5 (L1-C13): the station's channel context goes away: the coex cell stops FIRST (before the task wait below, so the newstate task never needs the cell stopped) */
+		printf("qwz: mon: coex: stopped (station leaving)\n");
+		qwz_mon_stop(sc);
+	}
 	QWZ_CRUMB("stop:begin");
 
 	timeout_del(&sc->mon_reap_timer);
@@ -992,6 +1009,9 @@ qwz_watchdog(struct ifnet *ifp)
 	struct qwz_softc *sc = (struct qwz_softc *)(ifp->if_softc);
 
 	ifp->if_timer = 0;
+
+	if (sc->mon_coex || sc->mon_coex_probe)	/* K5 (L1-C13, C14): the coex cell's guard and the deaf-station probe; nothing runs here without a coex cell */
+		qwz_mon_coex_probe(sc);
 
 	if (sc->sc_tx_timer > 0) {
 		if (--sc->sc_tx_timer == 0) {
@@ -1650,6 +1670,40 @@ qwz_newstate_task(void *arg)
 		refcnt_rele_wake(&sc->task_refs);
 		splx(s);
 		return;
+	}
+
+	/*
+	 * K5 (L1-C2): a coex cell is being started beside the station (qwz_mon_start holds mon_coex_setup): vdev_setup_done is one softc flag shared with
+	 * the station's own vdev start/stop, so this task waits, for at most 2 s in 10 ms steps, until the cell's vdev is up. Only ever set with
+	 * debug.qwz.moncoex 1; at 0 the field stays 0 and the loop is not entered.
+	 */
+	if (sc->mon_coex_setup) {
+		int coexn = 0;
+
+		while (sc->mon_coex_setup && ++coexn < 200 && !QWZ_CRASHED(sc))
+			tsleep_nsec(&sc->mon_coex_setup, 0, "qwzcoex", MSEC_TO_NSEC(10));
+		nstate = sc->ns_nstate;	/* both may have moved while this task slept */
+		ostate = ic->ic_state;
+		if (QWZ_CRASHED(sc)) {
+			refcnt_rele_wake(&sc->task_refs);
+			splx(s);
+			return;
+		}
+	}
+
+	/*
+	 * K5 (L1-C13): the station leaves RUN while a coex cell runs: stop the cell before any of the vdev work below (qwz_mon_coex_halt: bounded, falls
+	 * back to a host-only end). Not counted in task_refs. Only reachable with a coex cell, so K4 never enters it.
+	 */
+	if (ostate == IEEE80211_S_RUN && nstate != IEEE80211_S_RUN && qwz_mon_coex_running(sc)) {
+		qwz_mon_coex_halt(sc);
+		nstate = sc->ns_nstate;	/* both may have moved while the halt slept */
+		ostate = ic->ic_state;
+		if (QWZ_CRASHED(sc)) {
+			refcnt_rele_wake(&sc->task_refs);
+			splx(s);
+			return;
+		}
 	}
 
 	/* A new association starts a new smoothed-RSSI average. */
@@ -6867,6 +6921,143 @@ qwz_qmi_host_cap_send(struct qwz_softc *sc)
 	return 0;
 }
 
+#ifdef __APPLE__
+/*
+ * K5 (OBSD-3): debug.qwz.fwsegs, a hand port of OpenBSD e1004a864b: one DMA block per firmware memory
+ * segment, each aligned to the next power of two of its size (as Linux does), instead of every segment
+ * packed into one 64 KB-aligned block. Mode 0 (default) leaves the legacy single block alone.
+ */
+static void
+qwz_fwsegs_release(struct qwz_softc *sc)
+{
+	uint32_t i;
+
+	for (i = 0; i < nitems(sc->fwseg); i++) {
+		if (sc->fwseg[i] != NULL) {
+			qwz_dmamem_free(sc->sc_dmat, sc->fwseg[i]);
+			sc->fwseg[i] = NULL;
+		}
+	}
+	sc->fwseg_n = 0;
+}
+
+/* Returns 1 only when req is completely filled from per-segment blocks; 0 = run the legacy single-block code. */
+static int
+qwz_fwsegs_try(struct qwz_softc *sc, struct qmi_wlanfw_request_mem_ind_msg_v01 *ind,
+    uint32_t n, struct qmi_wlanfw_respond_mem_req_msg_v01 *req)
+{
+	struct qwz_dmamem *blk[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+	uint8_t reused[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+	int mode = qwz_fwsegs;
+	uint32_t i, nreused = 0;
+	uint64_t bytes = 0;
+	int failed = 0;
+
+	if (mode != 1 && mode != 2) {
+		if (sc->fwseg_n != 0) {
+			qwz_log("qwz: fwsegs: mode 0, releasing %u per-segment blocks\n", sc->fwseg_n);
+			qwz_fwsegs_release(sc);
+		}
+		return 0;
+	}
+	if (n == 0 || n > nitems(blk)) {
+		qwz_log("qwz: fwsegs: %u segments requested, not handled, single block\n", n);
+		qwz_fwsegs_release(sc);
+		return 0;
+	}
+	if (mode == 2 && sc->fwseg_n != 0) {
+		qwz_log("qwz: fwsegs: dry run, releasing %u stored per-segment blocks first\n", sc->fwseg_n);
+		qwz_fwsegs_release(sc);
+	}
+
+	memset(blk, 0, sizeof(blk));
+	memset(reused, 0, sizeof(reused));
+
+	for (i = 0; i < n; i++) {
+		uint32_t size = le32toh(ind->mem_seg[i].size);
+		uint64_t want = PAGE_SIZE;
+
+		blk[i] = NULL;
+		reused[i] = 0;
+		while (want < size)
+			want <<= 1;
+		if (mode == 1 && sc->fwseg[i] != NULL && QWZ_DMA_LEN(sc->fwseg[i]) == size) {
+			blk[i] = sc->fwseg[i];
+			reused[i] = 1;
+			nreused++;
+			bytes += size;
+			continue;
+		}
+		blk[i] = qwz_dmamem_alloc(sc->sc_dmat, size, want);
+		if (blk[i] == NULL) {
+			qwz_log("qwz: fwsegs: seg %u type %u size %u want 0x%llx: allocation FAILED, falling back to the single 64 KB-aligned block\n",
+			    i, le32toh(ind->mem_seg[i].type), size, (unsigned long long)want);
+			failed = 1;
+			break;
+		}
+		{
+			uint64_t pa = QWZ_DMA_DVA(blk[i]);
+			uint64_t got = pa & (~pa + 1);
+			int ok = (pa % want) == 0 && pa + size <= 0x100000000ULL;
+
+			qwz_log("qwz: fwsegs: seg %u type %u size %u pa 0x%llx want 0x%llx got 0x%llx %s [%s]\n",
+			    i, le32toh(ind->mem_seg[i].type), size, (unsigned long long)pa,
+			    (unsigned long long)want, (unsigned long long)got,
+			    mode == 2 ? "dry-run" : "block", ok ? "ok" : "BAD");
+		}
+		bytes += size;
+	}
+
+	if (failed) {
+		for (i = 0; i < n; i++) {
+			if (blk[i] != NULL && !reused[i])
+				qwz_dmamem_free(sc->sc_dmat, blk[i]);
+		}
+		qwz_fwsegs_release(sc);
+		return 0;
+	}
+
+	if (mode == 2) {
+		for (i = 0; i < n; i++)
+			qwz_dmamem_free(sc->sc_dmat, blk[i]);
+		qwz_log("qwz: fwsegs: dry run: %u segments, %llu bytes, all allocated\n", n, (unsigned long long)bytes);
+		return 0;
+	}
+
+	/* Mode 1 success: keep the new set, drop stored blocks that were not reused. */
+	for (i = 0; i < nitems(sc->fwseg); i++) {
+		if (i < n && reused[i]) {
+			memset(QWZ_DMA_KVA(blk[i]), 0, QWZ_DMA_LEN(blk[i]));
+			continue;
+		}
+		if (sc->fwseg[i] != NULL) {
+			qwz_dmamem_free(sc->sc_dmat, sc->fwseg[i]);
+			sc->fwseg[i] = NULL;
+		}
+		if (i < n)
+			sc->fwseg[i] = blk[i];
+	}
+	sc->fwseg_n = n;
+	if (nreused != 0)
+		qwz_log("qwz: fwsegs: %u reused blocks zeroed for the restart\n", nreused);
+	if (sc->fwmem != NULL) {
+		qwz_dmamem_free(sc->sc_dmat, sc->fwmem);
+		sc->fwmem = NULL;
+		qwz_log("qwz: fwsegs: single block released\n");
+	}
+
+	req->mem_seg_len = htole32(n);
+	for (i = 0; i < n; i++) {
+		req->mem_seg[i].addr = htole64(QWZ_DMA_DVA(blk[i]));
+		req->mem_seg[i].size = ind->mem_seg[i].size;
+		req->mem_seg[i].type = ind->mem_seg[i].type;
+	}
+	qwz_log("qwz: fwsegs: per-segment memory: %u segments, %llu bytes, %u reused\n", n,
+	    (unsigned long long)bytes, nreused);
+	return 1;
+}
+#endif
+
 int
 qwz_qmi_mem_seg_send(struct qwz_softc *sc)
 {
@@ -6923,6 +7114,11 @@ qwz_qmi_mem_seg_send(struct qwz_softc *sc)
 		return -1;
 	}
 
+#ifdef __APPLE__
+	/* K5 (OBSD-4): debug.qwz.fwsegs 1 hands over one block per segment */
+	if (total_size != 0 && qwz_fwsegs_try(sc, ind, mem_seg_len, req))
+		goto fwsegs_filled;
+#endif
 	if (total_size == 0) {
 		/* Should not happen. Send back an empty allocation. */
 		printf("%s: firmware has requested no memory\n",
@@ -6968,6 +7164,9 @@ qwz_qmi_mem_seg_send(struct qwz_softc *sc)
 			req->mem_seg[i].type = ind->mem_seg[i].type;
 		}
 	}
+#ifdef __APPLE__
+fwsegs_filled: ;
+#endif
 
 	free(ind, M_DEVBUF, sizeof(*ind));
 	sc->sc_req_mem_ind = NULL;
@@ -12626,12 +12825,33 @@ qwz_mgmt_rx_event(struct qwz_softc *sc, struct mbuf *m)
 	status->rate_idx = ath12k_mac_bitrate_to_idx(sband, rx_ev.rate / 100);
 #endif
 
+	/*
+	 * K5 (L1-C6): beside the station (mon_coex) the capture below is selective. The station's claim is tested FIRST: its frames take the normal path
+	 * (the jump over the capture block below); the cell's go to the capture; anything else (foreign beacons, other networks' probe responses) is counted
+	 * and dropped, so it never creates a node in RUN. Frames shorter than a header cannot be told apart and are dropped. mon_coex is 0 for every K4 cell.
+	 */
+	if (sc->mon_active && sc->mon_coex) {
+		if (M_LEN(m) >= 24 && qwz_mon_is_station_frame(sc, mtod(m, const uint8_t *), (size_t)M_LEN(m))) {
+			sc->mon_stats.coex_st_mgmt++;
+			goto k5_coex_station_mgmt;
+		}
+		if (M_LEN(m) >= 24 && qwz_mon_claims_mgmt(sc, mtod(m, const uint8_t *), (size_t)M_LEN(m), rx_ev.chan_freq)) {
+			sc->mon_stats.coex_cell_mgmt++;
+			qwz_mon_capture_mgmt_mbuf(sc, m, rxi.rxi_rssi, rx_ev.rate);
+			m_freem(m);
+			goto exit;
+		}
+		sc->mon_stats.coex_drop++;
+		m_freem(m);
+		goto exit;
+	}
 	/* Monitor-mode capture (qwz_mon.c): the interface is down, keep the frame. */
 	if (sc->mon_active) {
 		qwz_mon_capture_mgmt_mbuf(sc, m, rxi.rxi_rssi, rx_ev.rate);
 		m_freem(m);
 		goto exit;
 	}
+k5_coex_station_mgmt:	/* K5 (L1-C6) */
 
 	wh = mtod(m, struct ieee80211_frame *);
 	/* Passive: smoothed BSS RSSI and the AWDL probe; the frame goes on unchanged. */
@@ -16824,6 +17044,9 @@ qwz_dp_rx_process_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 		return EIO;
 	}
 
+	/* K5 (L1-C7): beside the station the fc_valid test below keeps its K4 meaning ('!mon_active' lets a cell keep everything) only without a coex cell */
+	if (sc->mon_coex && !sc->hal_rx_ops->rx_desc_get_mpdu_fc_valid(rx_desc))
+		return EIO;
 	/* Drop non-802.11 frames (e.g. WCN7850 FW internal messages). */
 	if (!sc->hal_rx_ops->rx_desc_get_mpdu_fc_valid(rx_desc) && !sc->mon_active)
 		return EIO;
@@ -16836,6 +17059,15 @@ qwz_dp_rx_process_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 	 */
 	mpdu = &rx_desc->u.wcn7850.mpdu_start;
 	if (mpdu->addr1[4] == 0x84 && mpdu->addr1[5] == 0xe1)
+		return EIO;
+	/*
+	 * K5 (L1-C7): beside the station the 'a cell keeps every unicast frame' override below does not apply: a unicast frame not for us is dropped unless
+	 * it is positively the cell's (qwz_mon_claims_data: AWDL BSSID, monbssid, the cell vdev's or awdl0's address).
+	 */
+	if (sc->mon_coex && !(mpdu->addr1[0] & 0x01) &&
+	    !IEEE80211_ADDR_EQ(mpdu->addr1, sc->sc_ic.ic_myaddr) &&
+	    !qwz_awdl_is_our_addr(sc, mpdu->addr1) &&
+	    !qwz_mon_claims_data(sc, mpdu->addr1, mpdu->addr2, mpdu->addr3))
 		return EIO;
 	if (!(mpdu->addr1[0] & 0x01) &&
 	    !sc->mon_active &&	/* awdl-m0-m1 (qwz_mon.c): a capture cell keeps every unicast frame, whoever it is addressed to */
@@ -17033,6 +17265,21 @@ qwz_dp_rx_process_received_packets(struct qwz_softc *sc,
 			continue;
 		}
 
+		if (sc->mon_active && sc->mon_coex && (qwz_mon_flags & QWZ_MON_F_REO)) {
+			/*
+			 * K5 (L1-C7): beside the station only a frame that is positively the cell's (qwz_mon_claims_data on the 802.11 header) goes to the capture
+			 * below; every other frame is the station's and takes the normal delivery, so the download keeps flowing while the cell runs.
+			 */
+			if (M_LEN(msdu->m) >= 24 && qwz_mon_claims_data(sc, mtod(msdu->m, const uint8_t *) + 4, mtod(msdu->m, const uint8_t *) + 10,
+			    mtod(msdu->m, const uint8_t *) + 16))
+				sc->mon_stats.coex_cell_data++;
+			else {
+				sc->mon_stats.coex_st_data++;
+				qwz_dp_rx_deliver_msdu(sc, msdu);
+				msdu->m = NULL;
+				continue;
+			}
+		}
 		if (sc->mon_active && (qwz_mon_flags & QWZ_MON_F_REO)) {
 			/* Monitor-mode capture: keep the frame, nothing is up to take it. */
 			qwz_mon_capture_reo_mbuf(sc, msdu->m);
@@ -25781,6 +26028,8 @@ qwz_mac_mgmt_tx_wmi(struct qwz_softc *sc, struct qwz_vif *arvif,
 		return ENOSPC;
 	if (txmgmt->queued >= qwz_txmgmt_nslots(sc, arvif))	/* the BSS ring is 8 slots (QWZ_BSS_TXMGMT_SLOTS), the capture vif's 64 */
 		return ENOSPC;
+	if (txmgmt->queued >= qwz_txmgmt_nslots(sc, arvif) - qwz_txmgmt_base(sc, arvif))	/* K5 (L1-C8): the coex cell's ring is ids 8 to 63 */
+		return ENOSPC;
 
 	tx_data = &txmgmt->data[buf_id];
 #if 0
@@ -25869,7 +26118,12 @@ qwz_mac_mgmt_tx_wmi(struct qwz_softc *sc, struct qwz_vif *arvif,
 	txmgmt->cur = (txmgmt->cur + 1) % nitems(txmgmt->data);
 	if (txmgmt->cur >= qwz_txmgmt_nslots(sc, arvif))	/* the BSS ring wraps at 8 (QWZ_BSS_TXMGMT_SLOTS) */
 		txmgmt->cur = 0;
+	if (txmgmt->cur < qwz_txmgmt_base(sc, arvif))	/* K5 (L1-C8): the coex cell's ring wraps to its first id (8), never into the station's */
+		txmgmt->cur = qwz_txmgmt_base(sc, arvif);
 	txmgmt->queued++;
+
+	if (arvif == &sc->sc_monvif && sc->mon_coex)	/* K5 (L1-C8): qfullmsk is softc-wide and only the station's completions clear it: a full cell ring must never stop the station's TX */
+		return 0;
 
 	if (txmgmt->queued >= nitems(txmgmt->data) - 1)
 		sc->qfullmsk |= (1U << QWZ_MGMT_QUEUE_ID);
@@ -26142,6 +26396,9 @@ qwz_scan(struct qwz_softc *sc)
 	int ret = 0, num_channels, i;
 	uint32_t scan_timeout;
 	int scan_2ghz = 1, scan_5ghz = 1;
+
+	if (sc->mon_coex && sc->mon_active && qwz_moncoexscan)	/* K5 (L1-C11): see qwz_bgscan; moncoexscan 0 lets the scan through */
+		return EBUSY;
 
 	/*
 	 * TODO Will we need separate scan iterations on devices with
@@ -27806,6 +28063,10 @@ qwz_detach(struct qwz_softc *sc)
 		qwz_dmamem_free(sc->sc_dmat, sc->fwmem);
 		sc->fwmem = NULL;
 	}
+#ifdef __APPLE__
+	/* K5 (OBSD-5): per-segment firmware memory (no-op while empty) */
+	qwz_fwsegs_release(sc);
+#endif
 
 	if (sc->m3_mem) {
 		qwz_dmamem_free(sc->sc_dmat, sc->m3_mem);
@@ -28525,6 +28786,13 @@ qwz_awdl_is_our_addr(struct qwz_softc *sc, const uint8_t *addr)
 {
 	return sc->sc_awdl_listening &&
 	    IEEE80211_ADDR_EQ(addr, qwz_awdltest_vif.vdev_addr);
+}
+
+/* K5 (L1-C7): qwz_mon.c's claim test needs awdl0's address; qwz_awdl_is_our_addr is static here (C++ linkage, declared in qwz_mon.c) */
+int
+qwz_mon_awdl_addr_ours(struct qwz_softc *sc, const uint8_t *addr)
+{
+	return qwz_awdl_is_our_addr(sc, addr);
 }
 
 static int

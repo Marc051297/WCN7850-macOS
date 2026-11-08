@@ -29,6 +29,16 @@
  *   debug.qwz.hwmode      K2 (H1): the hardware mode id asked of the firmware at each start (single_pdev_only chips), default 1 = DBS = the build before K2;
  *                         0 = SINGLE, 5 = DBS_OR_SBS or any id the firmware offered, others EINVAL; read at every firmware start (a Wi-Fi off/on applies
  *                         it); the boot-arg qwzhwmode=N sets the value a boot starts with
+ *   debug.qwz.fwsegs      K5 (OBSD-2): firmware host memory layout, 0 = one 64 KB-aligned block (default, K4), 1 = one block per firmware segment aligned to the
+ *                         next power of two of its size (falls back to the single block on a failed allocation), 2 = dry run (allocate, log, free); read at each
+ *                         firmware start; the boot-arg qwzfwsegs=N (0 to 2) sets the value a boot starts with; compile-time default QWZ_FWSEGS_DEFAULT
+ *   debug.qwz.moncoex     K5 (L1-C1): 1 = a capture cell started while the station is associated on the same channel (6, 44 or 149) runs beside the station,
+ *                         which is not stopped; 0 = the K4 cell (default); read when the cell starts. Sub-switches, all plain ints: moncoexmode (0 clone the
+ *                         station's chandef, 1 HT20 on the primary), moncoexpassive (0 K4 rule, 1 the station's passive flag), moncoexfilter (0 never swap the
+ *                         station's RX filter, 1 honour monflags, 2 swap filter-pass only), moncoexnss (0 chain count, 1 NSS 1), all read at cell start;
+ *                         moncoexscan (1), moncoexcred (1), moncoexfw (0), moncoexjoin (0), read live; defaults in parentheses
+ *   debug.qwz.awdlcell    K5 (L2-C2 placeholder): reserved for the receive-only tee of the cell into the native AWDL engine; nothing reads it yet (default 0); the
+ *                         K5 banner reports it
  *   debug.qwz.scanraw     K1 (W2c): 1 = log the non-zero words of the scan request tail for the first three non-plain scan requests, 2 = also for the first
  *                         three plain launched ones; default 0; release builds too; the words may hold SSID text; K2c: any write re-arms the per-boot evidence budgets (raw words, join pick, IOC 85 blobs)
  *   debug.qwz.monreap    K2c (C2): 1 = the capture TX ring's stale-slot reaper (a slot older than 3 s, checked every 100 ms) and live-slot guard (an occupied slot is reaped when older than 250 ms, else ENOSPC); default 0 = K2b

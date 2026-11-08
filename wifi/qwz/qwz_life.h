@@ -38,6 +38,8 @@ extern unsigned int qwz_monqmax;
 extern int qwz_monparams;
 /* K2 (H1): debug.qwz.hwmode (and the qwzhwmode=N boot-arg), default 1 = WMI_HOST_HW_MODE_DBS = the build before K2: the hardware mode id asked of the firmware at each start when single_pdev_only. Accepted by the sysctl: 0, 1, 5 and any id in qwz_hwm_offered_mask (bit n = the firmware offered id n, n < 32, set from the extended service-ready event). Defined in qwz_sysctl.cpp */
 extern int qwz_hwmode;
+/* K5 (OBSD-2): debug.qwz.fwsegs (and the qwzfwsegs=N boot-arg, 0 to 2), default QWZ_FWSEGS_DEFAULT = 0 = K4: the firmware host memory is one 64 KB-aligned block; 1 = one block per firmware segment, each aligned to the next power of two of its size (single block if any allocation fails); 2 = dry run (allocate, log, free each segment, then as 0); any other value acts as 0. Read at each firmware start. Defined in qwz_sysctl.cpp */
+extern int qwz_fwsegs;
 /* K2: boot-arg qwzhwmguard=1 makes qwz_wmi_tlv_hw_mode_caps skip offered hardware mode ids outside the 7-entry priority table (an out-of-bounds read otherwise); default 0 = the old code path exactly. Defined in qwz_sysctl.cpp */
 extern int qwz_hwm_guard;
 extern unsigned int qwz_hwm_offered_mask;

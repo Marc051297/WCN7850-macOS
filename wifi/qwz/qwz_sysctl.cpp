@@ -46,7 +46,14 @@ int qwz_scanraw = 0;		/* K1 (W2c): debug.qwz.scanraw, see qwz_life.h */
 int qwz_rssisigned = 0, qwz_beaconmeta = 0, qwz_scanprobe = 0, qwz_rssisrc = 0, qwz_scanrest = 0, qwz_rssilog = 0;	/* K3: debug.qwz.rssisigned, beaconmeta, scanprobe, rssisrc, scanrest, rssilog, see qwz_life.h */
 int qwz_monreap = 0, qwz_hintfix = 1;	/* K2c: debug.qwz.monreap (0 = off = K2b, the stale-slot reaper and the live-slot guard of the capture TX ring), debug.qwz.hintfix (1 = the scan-start hint-BSSID copy goes the right way, 0 = the old swapped copy); see qwz_life.h */
 int qwz_monfmt = 0;		/* K4 (M1): debug.qwz.monfmt, see qwz_life.h */
+/* K5 (L1-C1): debug.qwz.moncoex and its sub-switches, see qwz_mon.h; moncoex 0 = K4 exactly; scan and cred default to 1 and only act while a coex cell runs */
+int qwz_moncoex = 0, qwz_moncoexmode = 0, qwz_moncoexpassive = 0, qwz_moncoexfilter = 0, qwz_moncoexscan = 1, qwz_moncoexcred = 1, qwz_moncoexfw = 0, qwz_moncoexnss = 0, qwz_moncoexjoin = 0;
+int qwz_awdlcell = 0;	/* K5 (K5-00 banner, L2-C2): debug.qwz.awdlcell, see qwz_mon.h; no consumer yet (the receive-only tee is not built), the value is only reported in the K5 banner */
 volatile unsigned int qwz_scanraw_gen = 0;	/* K2c (C6): bumped by every write to debug.qwz.scanraw; the per-boot evidence budgets (qwz_log.h qwz_log_rearmed) start again when it changes */
+#ifndef QWZ_FWSEGS_DEFAULT
+#define QWZ_FWSEGS_DEFAULT 0
+#endif
+int qwz_fwsegs = QWZ_FWSEGS_DEFAULT;	/* K5 (OBSD-2): debug.qwz.fwsegs, see qwz_life.h */
 int qwz_hwmode = 1;		/* K2 (H1): debug.qwz.hwmode, see qwz_life.h; 1 = WMI_HOST_HW_MODE_DBS, today's request */
 int qwz_hwm_guard = 0;		/* K2: boot-arg qwzhwmguard=1, see qwz_life.h */
 unsigned int qwz_hwm_offered_mask = 0;	/* K2 (H1): bit n = the firmware offered hardware mode id n (n < 32); 0 until the extended service-ready event was parsed */
@@ -704,6 +711,28 @@ SYSCTL_UINT(_debug_qwz, OID_AUTO, monqmax, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_monqmax, 0, "K1 W1 / K2b: N > 0 = ENOSPC for user DATA and CONTROL frames once N of them are in flight (1..63, larger values act as 63); management frames are never counted; 0 = off (default)");
 SYSCTL_INT(_debug_qwz, OID_AUTO, monparams, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_monparams, 0, "K1 W3: 1 = cell vdev MGMT_RATE OFDM 12 Mbit/s after vdev up, 2 = also MGMT_RETRY_LIMIT 3 and NON_AGG_SW_RETRY_TH 4; 0 = off (default); read when the cell starts");
+SYSCTL_INT(_debug_qwz, OID_AUTO, fwsegs, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_fwsegs, 0, "K5 OBSD-2: firmware host memory layout: 0 = one 64 KB-aligned block (K4 behaviour, default), 1 = one block per firmware segment, each aligned to the next power of two of its size (single block if an allocation fails), 2 = dry run (allocate, log and free each segment, then as 0); any other value acts as 0; read at each firmware start, so a Wi-Fi off/on applies it");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoex, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoex, 0, "K5 L1-C1: 1 = a capture cell started while the station is associated on the same channel (6, 44 or 149) runs beside it and the station is not stopped; 0 = off (default), the K4 cell; read when the cell starts");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexmode, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexmode, 0, "K5 L1-C1: coex cell vdev-start channel: 0 = clone the station's chandef (default), 1 = HT20 on the station's primary channel (the K4 cell's parameters); read when the cell starts");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexpassive, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexpassive, 0, "K5 L1-C1: coex cell vdev-start passive flag: 0 = the K4 cell's rule (default), 1 = copy the station vdev's passive flag; read when the cell starts");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexfilter, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexfilter, 0, "K5 L1-C1/C10: coex cell receive filter: 0 = never swap the station's filter (default, KEEP_FILTER forced), 1 = honour debug.qwz.monflags (swap, filter-pass plus monitor-other), 2 = swap with filter-pass only; read when the cell starts");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexscan, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexscan, 0, "K5 L1-C1/C11: 1 = while a coex cell runs, scans are answered from the node table and never reach the firmware (default); 0 = passed to the firmware; read live");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexcred, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexcred, 0, "K5 L1-C1/C9: 1 = the coex cell never takes the last WMI credit, the station keeps it (default); 0 = no reservation; read live");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexfw, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexfw, 0, "K5 L1-C1/C13: 0 = a coex cell stop does not mark the firmware for a restart (default); 1 = the old restart at the next qwz_init; read live");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexnss, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexnss, 0, "K5 L1-C1/C3: 0 = the coex cell vdev's NSS comes from the chain count (default, as K4); 1 = NSS 1; read when the cell starts");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexjoin, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexjoin, 0, "K5 L1-C1/C12: 0 = a join request is refused while a coex cell runs (default); 1 = the cell is stopped and the join proceeds; read live");
+SYSCTL_INT(_debug_qwz, OID_AUTO, awdlcell, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_awdlcell, 0, "K5 L2-C2: reserved for the receive-only tee of the cell into the native AWDL engine; no code reads it yet (0 = default); only the K5 banner reports it");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, hwmode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, qwz_sysctl_hwmode, "I", "K2 H1: hardware mode id asked of the firmware at each start (single_pdev_only chips): 1 = DBS (default, the old request), 0 = SINGLE, 5 = DBS_OR_SBS, or any id the firmware offered; others EINVAL; a Wi-Fi off/on applies it");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, scanraw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -871,6 +900,17 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_monqmax);
 	sysctl_register_oid(&sysctl__debug_qwz_monparams);
 	sysctl_register_oid(&sysctl__debug_qwz_hwmode);
+	sysctl_register_oid(&sysctl__debug_qwz_fwsegs);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoex);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexmode);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexpassive);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexfilter);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexscan);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexcred);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexfw);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexnss);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexjoin);
+	sysctl_register_oid(&sysctl__debug_qwz_awdlcell);
 	sysctl_register_oid(&sysctl__debug_qwz_scanraw);
 	sysctl_register_oid(&sysctl__debug_qwz_monreap);
 	sysctl_register_oid(&sysctl__debug_qwz_hintfix);
@@ -924,6 +964,17 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_monqmax);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monparams);
 	sysctl_unregister_oid(&sysctl__debug_qwz_hwmode);
+	sysctl_unregister_oid(&sysctl__debug_qwz_fwsegs);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoex);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexmode);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexpassive);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexfilter);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexscan);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexcred);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexfw);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexnss);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexjoin);
+	sysctl_unregister_oid(&sysctl__debug_qwz_awdlcell);
 	sysctl_unregister_oid(&sysctl__debug_qwz_scanraw);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monreap);
 	sysctl_unregister_oid(&sysctl__debug_qwz_hintfix);

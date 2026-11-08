@@ -168,6 +168,10 @@ qwz_health_log(struct qwz_softc *sc, unsigned int wdskip)
 		    sc->mon_active, sc->mon_chan, qwz_mon_hold, sc->mon_fw_dirty, sc->mon_stats.frames, sc->mon_stats.mgmt, sc->mon_stats.reo,
 		    sc->mon_stats.rx_psf, sc->mon_stats.tx_sent, sc->mon_stats.tx_ok, sc->mon_stats.tx_fail, sc->sc_monvif.txmgmt.queued, sc->mon_stats.ufr_inflight);
 
+	if (sc->mon_coex)	/* K5 (L1-C15): the coex cell beside the station: the WMI credit reserve in force and the claim-test totals */
+		qwz_log("qwz: health: coex=1 resv=%d cell_vs_station mgmt %u/%u data %u/%u drop %u probe=%d\n", qwz_moncoexcred, sc->mon_stats.coex_cell_mgmt,
+		    sc->mon_stats.coex_st_mgmt, sc->mon_stats.coex_cell_data, sc->mon_stats.coex_st_data, sc->mon_stats.coex_drop, sc->mon_coex_probe);
+
 	/* rule (b): the test and the scan below are one gate hold with no sleep between them */
 	ring = &sc->dp.tx_ring[0];
 	if (!sc->fw_initialized || ring->data == NULL) {

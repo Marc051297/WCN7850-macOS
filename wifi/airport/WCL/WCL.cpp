@@ -17,6 +17,7 @@
 #include <crypto/sha1.h>
 #include "qwz_log.h"
 #include "qwz_life.h"	/* K1 (W2c): qwz_scanraw */
+#include "qwz_mon.h"	/* K5 (L1-C11, C12): qwz_mon_scan_hold, qwz_mon_coex_running_ic, qwz_mon_set, qwz_moncoexjoin */
 #define QWZLOG(fmt, ...)	qwz_log("qwz: " fmt "\n", ##__VA_ARGS__)
 extern "C" int qwz_mon_holding(struct ieee80211com *);	// qwz/qwz_mon.h (M3 hold)
 
@@ -400,6 +401,16 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         scanLog("Busy", "gate state AUTH/ASSOC");
     if (!(ic->ic_if.if_flags & IFF_RUNNING))
         return kIOReturnNotReady;
+    if (qwz_mon_scan_hold(ic) && !qwz_mon_holding(ic)) {
+        // K5 (L1-C11): a coex cell shares the radio with the running station (debug.qwz.moncoexscan 1): no firmware scan may take the radio off the
+        // cell's channel, so the scan completes at once and the node table keeps the results it has. Same completion as the hold below.
+        static unsigned int coexScans;
+        if (qwz_log_ratelimit(&coexScans, 24, 8))
+            scanLog("coex", "coex: answered from the node table");
+        scanPending = true;
+        finishWCLScan(kIOReturnSuccess);
+        return kIOReturnSuccess;
+    }
     if (qwz_mon_holding(ic)) {
         {
             // K1 (W2c): S2 line for the scans answered empty at once during the hold; its own counter, first 24 then every 8th
@@ -791,6 +802,19 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
         // startWCLJoin zeroes the request on every exit; this early return must too (it can hold a passphrase or PMK).
         explicit_bzero(&join, sizeof(join));
         return kIOReturnNotReady; // M3 hold: no station to join with
+    }
+    if (qwz_mon_coex_running_ic(fHalService->get80211Controller())) {
+        // K5 (L1-C12): a coex cell shares the radio with the running station.
+        if (qwz_moncoexjoin == 0) {
+            static unsigned int coexRefused;
+            if (qwz_log_ratelimit(&coexRefused, 1, 64))
+                QWZLOG("WCL join refused: the AirDrop cell shares the radio (debug.qwz.mon=0 to leave)");
+            explicit_bzero(&join, sizeof(join)); // startWCLJoin zeroes the request on every exit; this early return must too
+            return kIOReturnBusy;
+        }
+        // moncoexjoin 1: a real stop of the cell (command gate), then the join proceeds. Blocking gate call from this thread, as AirportItlwm::stop does.
+        QWZLOG("WCL join: stopping the AirDrop cell first (debug.qwz.moncoexjoin 1)");
+        qwz_mon_set(0);
     }
     return startWCLJoin(join);
 }

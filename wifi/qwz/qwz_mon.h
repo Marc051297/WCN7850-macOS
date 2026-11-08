@@ -91,6 +91,17 @@ struct qwz_montx_hdr {
 #define QWZ_MON_F_PEER_SENDER	0x8000	/* raw firmware peer for the first PSF sender heard (unicast needs?) */
 extern uint32_t qwz_mon_flags;
 /*
+ * K5 (L1-C1): the cell beside the running station, all plain ints defined in qwz_sysctl.cpp, 0 / K4 behaviour by default (see docs/k5 and qwz_sysctl.h).
+ * debug.qwz.moncoex 0 = off, K4 exactly; 1 = a cell started while the station is associated on the same channel (6, 44 or 149) runs beside it and the station is not stopped.
+ * moncoexmode 0 clone the station's vdev-start chandef, 1 HT20 on the primary; moncoexpassive 0 as the K4 cell, 1 copy the station's passive flag;
+ * moncoexfilter 0 never swap the station's RX filter, 1 honour monflags, 2 swap with filter-pass only; moncoexscan 1 answer scans from the node table (live);
+ * moncoexcred 1 reserve one WMI credit (live); moncoexfw 0 no firmware restart at cell stop, 1 the old one (live); moncoexnss 0 NSS from the chain count, 1 NSS 1;
+ * moncoexjoin 0 refuse joins while the cell runs, 1 stop the cell and join (live). moncoex, mode, passive, filter and nss are read when the cell starts.
+ */
+extern int qwz_moncoex, qwz_moncoexmode, qwz_moncoexpassive, qwz_moncoexfilter, qwz_moncoexscan, qwz_moncoexcred, qwz_moncoexfw, qwz_moncoexnss, qwz_moncoexjoin;
+/* K5 (L2-C2): debug.qwz.awdlcell, default 0; nothing reads it yet (the receive-only tee is not built), the K5 banner reports it */
+extern int qwz_awdlcell;
+/*
  * M3: debug.qwz.monhold. While set and the cell is active, macOS turning
  * Wi-Fi on does not start the station: the interface reports UP|RUNNING,
  * scans complete empty, joins are refused, and the cell keeps running. Wi-Fi
@@ -100,6 +111,28 @@ extern uint32_t qwz_mon_flags;
 extern uint32_t qwz_mon_hold;
 struct ieee80211com;
 int	qwz_mon_holding(struct ieee80211com *);	/* hold set and cell active */
+/* K5 (L1-C5): 1 while a coex cell runs beside the station (cell active, mon_coex set, firmware up); qwz_mon_holding is 0 then */
+int	qwz_mon_coex_running(struct qwz_softc *);
+/* K5 (L1-C5): the scan policy: 1 when a scan must not reach the firmware, either the classic hold or (moncoexscan) a coex cell */
+int	qwz_mon_scan_hold(struct ieee80211com *);
+/* K5 (L1-C12): qwz_mon_coex_running for callers that only hold the ieee80211com (WCL.cpp) */
+int	qwz_mon_coex_running_ic(struct ieee80211com *);
+/*
+ * K5 (L1-C6, L1-C7): the per-frame claim tests of a coex cell. f is an 802.11 header (len bytes, at least 24), a1/a2/a3 its three addresses.
+ * qwz_mon_is_station_frame: the station's (A1 is our address, or A3 is the BSSID, or a group-addressed frame from the AP's address); it is tested FIRST.
+ * qwz_mon_claims_mgmt: the cell's (received on the cell's frequency and A3 is the AWDL BSSID or debug.qwz.monbssid, or A1 is the cell vdev's address).
+ * qwz_mon_claims_data: 1 when no coex cell runs (K4 keeps everything); in coex 0 for the station's frames (A1 is our address, A3 the BSSID), else 1 when A3 is
+ * the AWDL BSSID or monbssid or A1 is the cell vdev's or awdl0's address, else 0.
+ */
+int	qwz_mon_is_station_frame(struct qwz_softc *, const uint8_t *f, size_t len);
+int	qwz_mon_claims_mgmt(struct qwz_softc *, const uint8_t *f, size_t len, uint32_t chan_freq);
+int	qwz_mon_claims_data(struct qwz_softc *, const uint8_t *a1, const uint8_t *a2, const uint8_t *a3);
+/* K5 (L1-C13): the station is about to leave RUN (newstate task): stop a running coex cell first; bounded (about 2 s), never blocks on the gate; returns 1 when a cell was running */
+int	qwz_mon_coex_halt(struct qwz_softc *);
+/* K5 (L1-C13, C14): called once a second from qwz_watchdog under the gate: stops the cell when the station's channel changed, and runs the deaf-station probe after a coex cell stopped */
+void	qwz_mon_coex_probe(struct qwz_softc *);
+/* K5 (L1-C8): management-transmit descriptor ids below this belong to the station while a coex cell runs; the cell's ring is ids QWZ_MON_COEX_STA_SLOTS to 63 (qwz.c asserts it equals QWZ_BSS_TXMGMT_SLOTS) */
+#define QWZ_MON_COEX_STA_SLOTS	8
 /*
  * M3/M4: debug.qwz.awdlif = "feth0" | "-feth0". Sets or clears IFEF_AWDL
  * (xnu if_private.h: 0x00100000, which drags LOCALNET_PRIVATE, IPV6_ND6ALT
