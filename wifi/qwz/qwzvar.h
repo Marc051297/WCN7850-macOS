@@ -2368,6 +2368,8 @@ struct qwz_softc {
 	int				 mon_sender_peer;	/* raw firmware peer for mon_sender_addr */
 	uint8_t				 mon_sender_addr[IEEE80211_ADDR_LEN];
 	uint8_t				 mon_tx_kind[64];	/* per transmit slot: 0 replay, 1 user mgmt, 2 user data, 3 user ctrl */
+	int				 mon_txp_valid, mon_txp_err;	/* K4 (M1), debug.qwz.monfmt: the next capture-vdev management send carries a tx_params TLV (set and cleared around one call by qwz_mon_tx_bytes); the error the firmware send returned for it */
+	uint32_t			 mon_txp_d0, mon_txp_d1;	/* K4 (M1): the two tx_params dwords of that send */
 	struct {
 		uint32_t entries, mpdus, frames, bufs, mgmt;
 		uint32_t reo, reo_err, wbm_err;
@@ -2378,6 +2380,11 @@ struct qwz_softc {
 		uint32_t ufr_mgmt_ok, ufr_mgmt_bad, ufr_data_ok, ufr_data_bad, ufr_ctrl_ok, ufr_ctrl_bad;
 		uint32_t ufr_inflight;	/* K2b (W1b): user DATA and CONTROL frames (kind 2, 3) in flight in the capture TX ring, the number monqmax is compared with; management frames are never counted */
 		uint32_t ufr_nocred, ufr_qmax;	/* K1 (W1): refused early with ENOSPC by monnocred (no credit) and by monqmax; both are also counted in ufr_full */
+		uint32_t ufr_reaped, ufr_livefull;	/* K2c (C2): slots freed by the stale-slot reaper (debug.qwz.monreap); sends refused because the next slot was still occupied */
+		uint32_t ufr_compl_range, ufr_compl_nom, ufr_compl_sta;	/* K2c (C3): completions ignored by qwz_mon_tx_compl: descriptor id out of range, no frame in the capture slot, the slot belongs to the station's ring */
+		uint32_t ufr_gate;	/* K2c (C4): times qwz_mon_txframe_gated ran (command-gate holds taken by user frame writes) */
+		uint32_t wmi_mgmt_rx_events, ring_mgmt_frames;	/* K2c (C4): WMI management-RX events seen while the cell runs (before any filter); management frames that arrived through the RX ring path */
+		uint32_t ufr_fmt, ufr_fmtfail;	/* K4 (M1): user frames sent with a tx_params block (debug.qwz.monfmt); of those, frames whose tx_params send failed and went again without */
 		uint32_t badcookie, nolink, duplink, linkret_fail;
 		uint64_t last_log;
 	} mon_stats;

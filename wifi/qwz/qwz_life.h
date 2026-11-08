@@ -30,7 +30,7 @@ extern int qwz_m0_on, qwz_dead_aware, qwz_mmio_guard, qwz_bme, qwz_softassert, q
 /* S1 (hotspot Wi-Fi, docs/research-hotspot-wifi-2026-11-07.md): debug.qwz.cap73, default 1: getCARD_CAPABILITIES sets bit 73 (capabilities[9] 0x02); 0 = the old blob. Defined in qwz_sysctl.cpp */
 extern int qwz_cap73;
 /* K1 (docs/awdl-polish-plan-2026-11-07.md, W1 and W3), all default 0 = the build before K1; plain globals read at call time, defined in qwz_sysctl.cpp.
- * debug.qwz.monnocred 1: the user-space frame write answers ENOSPC (not EAGAIN) while both WMI credits are in flight and ENXIO while the firmware is down, crashed or a sleep is pending;
+ * debug.qwz.monnocred 1: the user-space frame write answers ENOSPC (not EAGAIN) while both WMI credits are in flight and ENXIO while the firmware is down, crashed or a sleep is pending; K2c (C1): THE DEFAULT IS NOW 1, 0 restores EAGAIN;
  * debug.qwz.monqmax N > 0: DATA and CONTROL frames from user space get ENOSPC once N frames are queued in the capture TX ring (management frames keep all 63 slots);
  * debug.qwz.monparams 1: MGMT_RATE OFDM 12 Mbit/s on the cell vdev after it is up, 2: also MGMT_RETRY_LIMIT 3 and NON_AGG_SW_RETRY_TH 4 */
 extern int qwz_monnocred;
@@ -43,6 +43,18 @@ extern int qwz_hwm_guard;
 extern unsigned int qwz_hwm_offered_mask;
 /* K1 (W2c): debug.qwz.scanraw, default 0: 1 = log the non-zero words of the scan request tail for the first three non-plain scan requests, 2 = also for the first three plain launched ones. Defined in qwz_sysctl.cpp, read in airport/WCL/WCL.cpp */
 extern int qwz_scanraw;
+/* K2c: debug.qwz.monreap, default 0 = K2b: 1 = the capture TX ring's stale-slot reaper (3 s, every 100 ms) and live-slot guard (250 ms) in qwz_mon.c; debug.qwz.hintfix, default 1: the scan-start hint-BSSID copy goes params -> message, 0 = the old swapped copy (qwz.c). Defined in qwz_sysctl.cpp. qwz_scanraw_gen (K2c C6) is declared in qwz_log.h */
+extern int qwz_monreap, qwz_hintfix;
+/* K4 (M1): debug.qwz.monfmt, default 0 = tx_params_valid 0 for every cell frame: 1 = user frames under 150 bytes carry a tx_params block (retry limit 2, OFDM 12 Mbit/s); 2 = also user DATA frames (retry limit 1 with the header's NO_ACK flag, else 4; rate from the header's rate byte); 3 (offchan data command) is not implemented and acts as 2 */
+extern int qwz_monfmt;
+/* K3 (docs/research-scan-rssi-2026-11-06.md F1/F2/F3, K3 diagnosis), all default 0 = the build before K3; plain globals read at call time, defined in qwz_sysctl.cpp.
+ * debug.qwz.rssisigned 1: the 5 GHz SCAN-state compare in ieee80211_input.c reads ni_rssi as a signed byte, so the strongest sample is kept (read in ieee80211_input.c);
+ * debug.qwz.beaconmeta 1: the beacon record sent to macOS also sets the flags on channel (6), from beacon (7), noise (12) and SNR (13) (read in airport/WCL/WCL.cpp);
+ * debug.qwz.scanprobe 1: a macOS active scan with no SSID sends one zero-length SSID, 2: also the broadcast-probe flag (read in qwz.c qwz_scan);
+ * debug.qwz.rssisrc 1: data-frame RX RSSI no longer feeds the joined-AP average, beacons and other management frames only (read in qwz.c);
+ * debug.qwz.scanrest N > 0: min rest time N ms (max rest max(N, 50) ms) for a macOS-requested scan in RUN state (read in qwz.c qwz_scan);
+ * debug.qwz.rssilog 1: log the first 8 scan-result publications of the boot with the raw ni_rssi byte and the value sent (read in airport/WCL/WCL.cpp) */
+extern int qwz_rssisigned, qwz_beaconmeta, qwz_scanprobe, qwz_rssisrc, qwz_scanrest, qwz_rssilog;
 /* WP4 (M2a): lane M hardening (qwz_awdl.h), all default 0 = M0.1 behaviour. qwz_awdltx_eff is the rung in force: the configured qwz_awdltx, lowered at run time (three DISCARD or INSPECT completions in a row, or a DEAD with preset frames in flight) */
 extern int qwz_awdlhyg, qwz_awdltx, qwz_awdltx_eff, qwz_awdlgate, qwz_awdltxopt;
 #ifndef QWZ_AWDL_TX_MAX

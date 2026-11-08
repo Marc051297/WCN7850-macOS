@@ -1158,21 +1158,23 @@ setSCANCACHE_CLEAR(void *req)
 
 /*
  * K1 (W2c): IOC 85 (APPLE80211_IOC_IE), the blob airportd sends at every auto-join. The answer is what the inline stub gave (Unsupported); the first 16 bytes
- * of the blob (version, frame_type_flags, add, signature_len) are logged for the first three calls per boot. The IE bytes after them are not printed.
+ * of the blob (version, frame_type_flags, add, signature_len) are logged for the first three calls per boot (K2c: the first 32 bytes, so also ie_len, pad and the first 8 IE bytes; a write to debug.qwz.scanraw re-arms the three). The rest of the IE bytes are not printed.
  */
 IOReturn AirportItlwmSkywalkInterface::
 setIE(struct apple80211_ie_data *data)
 {
-    static unsigned int ieBlobs;
+    static unsigned int ieBlobs, ieGen;
 
     if (data) {
+        // K2c (C6): a write to debug.qwz.scanraw starts the counter again; the first 32 bytes are logged (the 24-byte header and the first 8 IE bytes), not 16
+        qwz_log_rearmed(&ieGen, &ieBlobs);
         unsigned int n = __atomic_add_fetch(&ieBlobs, 1u, __ATOMIC_RELAXED);
         if (n <= 3) {
             const uint8_t *b = reinterpret_cast<const uint8_t *>(data);
-            char hex[3 * 16 + 1];
-            for (unsigned i = 0; i < 16; ++i)
-                snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x%s", b[i], i < 15 ? " " : "");
-            qwz_log("airport: ioctl 85 (IE) blob #%u: first 16 bytes %s (ie_len %u)\n", n, hex, unsigned(data->ie_len));
+            char hex[3 * 32 + 1];
+            for (unsigned i = 0; i < 32; ++i)
+                snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x%s", b[i], i < 31 ? " " : "");
+            qwz_log("airport: ioctl 85 (IE) blob #%u: first 32 bytes %s (ie_len %u)\n", n, hex, unsigned(data->ie_len));
         }
     }
     return kIOReturnUnsupported;

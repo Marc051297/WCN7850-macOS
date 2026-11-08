@@ -448,7 +448,7 @@ private:
     IOReturn leaveWCLNetwork();
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
-    void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
+    void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t, const uint8_t *frame = nullptr, size_t frameLength = 0);	/* K3 (S2): frame = the 802.11 frame, for the beacon/probe-response subtype */
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
     bool scanPending;

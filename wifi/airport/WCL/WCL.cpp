@@ -324,13 +324,18 @@ static void logWCLScanRequest(const void *request, const AirportWCL::ScanRequest
     char prev[24] = "";
     if (st.prevSsidLength >= 0)
         snprintf(prev, sizeof(prev), " prev_ssid_len %d", st.prevSsidLength);
+    // K2c (C6): the words the family builds into the request (flags +0x44, active dwell +0x48, passive dwell +0x4c, rest time +0x50), on every non-plain line
+    char famWords[72] = "";
+    if (p && !(launched && !list && !(scan && scan->ssidLength)))
+        snprintf(famWords, sizeof(famWords), " family flags 0x%x active %u passive %u rest %u", AirportWCL::read32(p + 0x44), AirportWCL::read32(p + 0x48),
+                 AirportWCL::read32(p + 0x4c), AirportWCL::read32(p + 0x50));
     qwz_log("airport: WCL scan req%s #%u: id %u type %u ssid_len %u ssid_hash %08x bssid %s ch %u first%s list %u | "
-            "state %s idle %d scanPending %d joinPending %d bgscan %d skip %d%s | %s (%s)\n",
+            "state %s idle %d scanPending %d joinPending %d bgscan %d skip %d%s | %s (%s)%s\n",
             launched && !list && !(scan && scan->ssidLength) ? "" : "!", seq, p ? AirportWCL::read32(p) : 0, p ? AirportWCL::read32(p + 0x40) : 0,
             p ? AirportWCL::read32(p + 0x1c) : 0, scan ? wclScanHash(scan->ssid, scan->ssidLength) : 0,
             zero ? "zero" : "set", scan ? scan->channelCount : (p ? AirportWCL::read32(p + 0x54) : 0), chans, list,
             st.state >= 0 && st.state < IEEE80211_S_MAX ? ieee80211_state_name[st.state] : "?", st.idle,
-            st.scanPending, st.joinPending, st.bgscan, st.skip, prev, outcome, detail);
+            st.scanPending, st.joinPending, st.bgscan, st.skip, prev, outcome, detail, famWords);
 #ifdef QWZ_DEBUG
     static unsigned int dumps;
     // Raw bytes +0x44..+0x57 and the first 0x40 at +0x1318 for the first three requests that carry a list. They may hold SSID text:
@@ -346,9 +351,12 @@ static void logWCLScanRequest(const void *request, const AirportWCL::ScanRequest
     {
         // K1 (W2c): debug.qwz.scanraw, every build, default 0. 1: the first three non-plain requests (a list, a primary SSID or a non-launch outcome);
         // 2: also the first three plain launched ones. The tail is +0x44..+0x58 (after the type word) and +0x1318..+0x1598 (the list and what follows it).
-        static unsigned int rawNonPlain, rawPlain;
+        static unsigned int rawNonPlain, rawPlain, rawGen;
         int mode = qwz_scanraw;
-        bool plain = launched && !list && !(scan && scan->ssidLength);
+        // K2c (C6): a write to debug.qwz.scanraw starts the budgets again; a scan answered empty during the monitor hold ("hold") counts as plain
+        if (qwz_log_rearmed(&rawGen, &rawNonPlain))
+            rawPlain = 0;
+        bool plain = (launched || !strncmp(outcome, "hold", 4)) && !list && !(scan && scan->ssidLength);
         if (p && mode >= 1 && (!plain || mode >= 2) &&
             __atomic_add_fetch(plain ? &rawPlain : &rawNonPlain, 1u, __ATOMIC_RELAXED) <= 3) {
             wclScanRawWords(seq, p, 0x44, 0x58);
@@ -501,7 +509,7 @@ void AirportItlwmSkywalkInterface::completeWCLScan()
         finishWCLScan(scanCompleted ? kIOReturnSuccess : kIOReturnTimeout);
 }
 
-void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
+void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length, const uint8_t *frame, size_t frameLength)
 {
     if (!node || node->ni_esslen > 32 || !AirportWCL::validIEs(ies, length))
         return;
@@ -528,6 +536,20 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     metadata->interval = node->ni_intval;
     metadata->capability = node->ni_capinfo;
     metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
+    if (qwz_beaconmeta) {	/* K3 (S2): noise is -95 and snr = rssi - noise, both already set above */
+        metadata->flags |= AirportWCL::OnChannel | AirportWCL::NoiseValid | AirportWCL::SNRValid;
+        if (frame && frameLength >= 1 && (frame[0] & 0xfc) == 0x80)	/* beacon, not a probe response */
+            metadata->flags |= AirportWCL::FromBeacon;
+    }
+    {	/* K3: debug.qwz.rssilog, the first 8 publications of the boot; no addresses */
+        static unsigned int rssiLogged;
+        if (qwz_rssilog && rssiLogged < 8) {
+            rssiLogged++;
+            qwz_log("airport: K3 publish #%u: ch %u raw ni_rssi byte %u sent rssi %d noise %d snr %d flags 0x%x beaconmeta %d\n",
+                rssiLogged, channel, (unsigned)node->ni_rssi, (int)metadata->rssi, (int)metadata->noise,
+                (int)metadata->snr, (unsigned)metadata->flags, qwz_beaconmeta);
+        }
+    }
     memcpy(metadata + 1, ies, length);
     metadata->ieLength = uint32_t(AirportWCL::selectWPA2TransitionMode(
         reinterpret_cast<uint8_t *>(metadata + 1), length));
@@ -1219,7 +1241,7 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             if (scanPending || joinPending || ic->ic_state == IEEE80211_S_SCAN ||
                 (portAuthorized && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)))
-                publishWCLBeacon(beacon->node, beacon->ies, beacon->length);
+                publishWCLBeacon(beacon->node, beacon->ies, beacon->length, beacon->frame, beacon->frame_length);
             if (joinPending && assocNotified && !firstBeaconNotified &&
                 IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)) {
                 AirportWCL::FirstBeaconEvent event = {};

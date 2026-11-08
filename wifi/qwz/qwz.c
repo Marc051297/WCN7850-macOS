@@ -1549,7 +1549,7 @@ qwz_rx_observe_data(struct qwz_softc *sc, struct qwz_rx_msdu *msdu)
 	sc->sc_probe_data_seen++;
 	if (!IEEE80211_ADDR_EQ(wh->i_addr3, qwz_awdl_bssid))	/* M0 (C23): an AWDL data MSDU does not show that the infra data path works */
 		sc->sc_stall_data_seen++;
-	if (fresh && (wh->i_fc[1] & IEEE80211_FC1_DIR_MASK) ==
+	if (fresh && !qwz_rssisrc && (wh->i_fc[1] & IEEE80211_FC1_DIR_MASK) ==	/* K3 (S4): rssisrc 1 = beacons and other management frames only */
 	    IEEE80211_FC1_DIR_FROMDS)
 		qwz_bss_rssi_sample(sc, wh->i_addr2, msdu->rxi.rxi_rssi);
 	if (IEEE80211_ADDR_EQ(wh->i_addr3, qwz_awdl_bssid)) {
@@ -12584,6 +12584,8 @@ qwz_mgmt_rx_event(struct qwz_softc *sc, struct mbuf *m)
 	struct ieee80211_frame *wh;
 	struct ieee80211_node *ni;
 
+	if (sc->mon_active)	/* K2c (C4): every WMI management-RX event seen while the capture cell runs, counted before any filtering (evidence only) */
+		sc->mon_stats.wmi_mgmt_rx_events++;
 	if (qwz_pull_mgmt_rx_params_tlv(sc, m, &rx_ev) != 0) {
 		printf("%s: failed to extract mgmt rx event\n",
 		    sc->sc_dev.dv_xname);
@@ -18699,9 +18701,13 @@ qwz_wmi_send_scan_start_cmd(struct qwz_softc *sc,
 		for (i = 0; i < params->num_hint_bssid; ++i) {
 			hint_bssid->freq_flags =
 				params->hint_bssid[i].freq_flags;
+			if (!qwz_hintfix)	/* K2c (C5): the statement below has source and destination swapped (it overwrites params with the message, then the message is never filled); it runs only with debug.qwz.hintfix=0, today's behaviour */
 			IEEE80211_ADDR_COPY(
 			    &params->hint_bssid[i].bssid.addr[0],
 			    &hint_bssid->bssid.addr[0]);
+			if (qwz_hintfix)	/* K2c (C5): the corrected copy, params -> message (Linux and OpenBSD fixed the same swap) */
+				IEEE80211_ADDR_COPY(&hint_bssid->bssid.addr[0],
+				    &params->hint_bssid[i].bssid.addr[0]);
 			hint_bssid++;
 		}
 	}
@@ -19558,6 +19564,7 @@ qwz_wmi_mgmt_send(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	uint32_t buf_len, buf_len_aligned;
 	int ret, len;
 	uint64_t paddr;
+	int txp = (arvif == &sc->sc_monvif && sc->mon_txp_valid);	/* K4 (M1), debug.qwz.monfmt: one-shot tx_params of a capture-cell frame (set and cleared by qwz_mon_tx_bytes); 0 for every other caller */
 
 	paddr = tx_data->map->dm_segs[0].ds_addr;
 
@@ -19567,6 +19574,8 @@ qwz_wmi_mgmt_send(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	buf_len_aligned = roundup(buf_len, sizeof(uint32_t));
 
 	len = sizeof(*cmd) + sizeof(*frame_tlv) + buf_len_aligned;
+	if (txp)
+		len += 3 * sizeof(uint32_t);	/* K4 (M1): the TX_SEND_PARAMS TLV, header and two dwords, after the byte array */
 
 	m = qwz_wmi_alloc_mbuf(len);
 	if (!m)
@@ -19584,6 +19593,8 @@ qwz_wmi_mgmt_send(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	cmd->frame_len = M_PKTLEN(frame);
 	cmd->buf_len = buf_len;
 	cmd->tx_params_valid = 0;
+	if (txp)
+		cmd->tx_params_valid = 1;	/* K4 (M1) */
 
 	frame_tlv = (struct wmi_tlv *)(mtod(m, uint8_t *) +
 	    sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr) +
@@ -19595,9 +19606,18 @@ qwz_wmi_mgmt_send(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 #if 0 /* Not needed on OpenBSD? */
 	ath12k_ce_byte_swap(frame_tlv->value, buf_len);
 #endif
+	if (txp) {	/* K4 (M1): the layout of qwz_wmi_awdl_send for fmt 1 (tag 0x284, 8 bytes of payload) */
+		uint32_t *tp = (uint32_t *)(frame_tlv->value + buf_len_aligned);
+
+		tp[0] = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_TX_SEND_PARAMS) | FIELD_PREP(WMI_TLV_LEN, 2 * sizeof(uint32_t));
+		tp[1] = sc->mon_txp_d0;
+		tp[2] = sc->mon_txp_d1;
+	}
 
 	ret = qwz_wmi_cmd_send(wmi, m, WMI_MGMT_TX_SEND_CMDID);
 	if (ret) {
+		if (txp)
+			sc->mon_txp_err = ret;	/* K4 (M1): the caller retries this frame without tx_params */
 		if (ret != ESHUTDOWN) {
 			printf("%s: failed to submit "
 			    "WMI_MGMT_TX_SEND_CMDID cmd\n",
@@ -26210,6 +26230,33 @@ qwz_scan(struct qwz_softc *sc)
 		    ic->ic_des_esslen);
 	} else
 		arg->scan_flags |= WMI_SCAN_FLAG_PASSIVE;
+
+#ifdef AIRPORT_WCL
+	/*
+	 * K3 (S3, debug.qwz.scanprobe, default 0): a macOS active scan with no
+	 * SSID sends one zero-length SSID (a wildcard probe request); 2 also
+	 * asks for the broadcast probe flag.
+	 */
+	if (qwz_scanprobe && ic->ic_wcl_scan_requested && arg->num_ssids == 0 &&
+	    !(arg->scan_flags & WMI_SCAN_FLAG_PASSIVE) &&
+	    AirportWCL::scanUsesProbes(true, ic->ic_wcl_scan_active)) {
+		arg->num_ssids = 1;
+		arg->ssid[0].length = 0;
+		if (qwz_scanprobe == 2)
+			arg->scan_f_bcast_probe = 1;
+	}
+	/*
+	 * K3 (S5a, debug.qwz.scanrest, default 0): a shorter home-channel rest
+	 * for a macOS-requested scan while associated.
+	 */
+	if (qwz_scanrest > 0 && ic->ic_wcl_scan_requested &&
+	    ic->ic_state == IEEE80211_S_RUN) {
+		int rest_n = qwz_scanrest > 500 ? 500 : qwz_scanrest;	/* K2c (C7): values above 500 act as 500 */
+
+		arg->min_rest_time = rest_n;
+		arg->max_rest_time = rest_n < 50 ? 50 : rest_n;	/* min <= max always */
+	}
+#endif
 
 	if (IFM_MODE(ic->ic_media.ifm_cur->ifm_media) != IFM_AUTO) {
 		if (ic->ic_curmode == IEEE80211_MODE_11A)

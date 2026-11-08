@@ -164,9 +164,9 @@ qwz_health_log(struct qwz_softc *sc, unsigned int wdskip)
 	    (unsigned long long)(__atomic_load_n(&qwz_mem_bytes, __ATOMIC_RELAXED) >> 10), wdskip);
 
 	if (sc->mon_active)	/* merge glue (I): the capture cell (qwz_mon.c), printed only while one runs; the counters are qwz_mon.c's own */
-		qwz_log("qwz: health: mon[active=%d chan=%d hold=%u dirty=%d frames=%u mgmt=%u reo=%u psf=%u tx=%u ok=%u fail=%u qd=%d]\n",
+		qwz_log("qwz: health: mon[active=%d chan=%d hold=%u dirty=%d frames=%u mgmt=%u reo=%u psf=%u tx=%u ok=%u fail=%u qd=%d] inflight=%u\n",
 		    sc->mon_active, sc->mon_chan, qwz_mon_hold, sc->mon_fw_dirty, sc->mon_stats.frames, sc->mon_stats.mgmt, sc->mon_stats.reo,
-		    sc->mon_stats.rx_psf, sc->mon_stats.tx_sent, sc->mon_stats.tx_ok, sc->mon_stats.tx_fail, sc->sc_monvif.txmgmt.queued);
+		    sc->mon_stats.rx_psf, sc->mon_stats.tx_sent, sc->mon_stats.tx_ok, sc->mon_stats.tx_fail, sc->sc_monvif.txmgmt.queued, sc->mon_stats.ufr_inflight);
 
 	/* rule (b): the test and the scan below are one gate hold with no sleep between them */
 	ring = &sc->dp.tx_ring[0];

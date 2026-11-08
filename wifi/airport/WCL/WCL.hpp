@@ -51,7 +51,12 @@ inline bool copyHardwareAddress(const uint8_t *address, HardwareAddress &out) {
 
 enum BeaconFlags : uint32_t {
     SSIDPresent = 1U << 1,
-    RSSIValid = 1U << 14
+    RSSIValid = 1U << 14,
+    /* K3 (S2, debug.qwz.beaconmeta): the flags Apple's driver also sets */
+    OnChannel = 1U << 6,
+    FromBeacon = 1U << 7,
+    NoiseValid = 1U << 12,
+    SNRValid = 1U << 13
 };
 
 enum Message : uint32_t {

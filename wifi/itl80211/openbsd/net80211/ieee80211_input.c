@@ -67,6 +67,7 @@
 
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
+#include "qwz_life.h"	/* K3 (S1): qwz_rssisigned */
 
 mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
                                  struct ieee80211_node *, mbuf_t,
@@ -2169,7 +2170,8 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
          */
         if (isprobe || ni->ni_rssi == 0)
             ni->ni_rssi = rxi->rxi_rssi;
-        else if (ni->ni_rssi < rxi->rxi_rssi)
+        else if (qwz_rssisigned ? ((int8_t)ni->ni_rssi < rxi->rxi_rssi)	/* K3 (S1): signed compare */
+            : (ni->ni_rssi < rxi->rxi_rssi))
             ni->ni_rssi = rxi->rxi_rssi;
     } else
         ni->ni_rssi = rxi->rxi_rssi;

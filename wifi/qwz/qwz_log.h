@@ -51,6 +51,24 @@ qwz_log_ratelimit(unsigned int *count, unsigned int first, unsigned int every)
 }
 
 /*
+ * K2c (C6): debug.qwz.scanraw is a generation counter as well; every write bumps qwz_scanraw_gen (defined in qwz_sysctl.cpp). A per-boot evidence budget
+ * keeps its own `seen` copy: when it differs, the budget starts again (*seen = current, *count = 0) and the call returns 1. So a Wi-Fi restart
+ * re-arms the scan-request raw words, the join-pick line and the IOC 85 blobs without a reboot. Never used from interrupt context.
+ */
+extern volatile unsigned int qwz_scanraw_gen;
+static inline int
+qwz_log_rearmed(unsigned int *seen, unsigned int *count)
+{
+	unsigned int g = __atomic_load_n(&qwz_scanraw_gen, __ATOMIC_RELAXED);
+
+	if (*seen == g)
+		return 0;
+	*seen = g;
+	*count = 0;
+	return 1;
+}
+
+/*
  * File sink for bring-ups started from the terminal: between begin and end,
  * lines logged by the calling thread are also appended to QWZ_LOG_FILE with
  * a synchronous write each, so the last line before a hard freeze survives.

@@ -229,6 +229,72 @@ qwz_mon_lat_stamp(struct qwz_softc *sc, int slot)
 		sc->mon_lat.tx_ns[slot] = getnsecuptime();
 }
 
+/*
+ * K2c (C2): free one occupied slot of the capture TX ring whose completion never came back. Under the command gate only (the cell timer and the
+ * user-frame write both run there). Counts like a completion would (queued, ufr_inflight for kind 2 and 3) and clears the slot's stamp and kind. The
+ * caller has checked the age. The first 8 per boot are logged.
+ */
+static void
+qwz_mon_reap_slot(struct qwz_softc *sc, int slot, uint64_t now)
+{
+	static unsigned int reap_logged;
+	struct qwz_txmgmt_queue *q = &sc->sc_monvif.txmgmt;
+	struct qwz_tx_data *td = &q->data[slot];
+	uint8_t kind = sc->mon_tx_kind[slot];
+	uint64_t st = sc->mon_lat.tx_ns[slot];
+
+	if (td->m == NULL)
+		return;
+	if (reap_logged < 8) {
+		reap_logged++;
+		printf("qwz: mon: tx reap: slot %d kind %u age %llu ms\n", slot, (unsigned)kind,
+		    (unsigned long long)(st != 0 && now > st ? (now - st) / 1000000ULL : 0));
+	}
+	bus_dmamap_unload(sc->sc_dmat, td->map);
+	m_freem(td->m);
+	td->m = NULL;
+	td->ni = NULL;
+	if (q->queued > 0)
+		q->queued--;
+	if ((kind == 2 || kind == 3) && sc->mon_stats.ufr_inflight > 0)
+		sc->mon_stats.ufr_inflight--;
+	sc->mon_tx_kind[slot] = 0;
+	sc->mon_lat.tx_ns[slot] = 0;
+	sc->mon_stats.ufr_reaped++;
+}
+
+/* K2c (C2): the cell timer, every 100 ms: free slots older than 3 s. A held slot without a stamp (it cannot happen: every send stamps) gets one now so it ages. */
+static void
+qwz_mon_reap_stale(struct qwz_softc *sc, uint64_t now)
+{
+	struct qwz_txmgmt_queue *q = &sc->sc_monvif.txmgmt;
+	int i;
+
+	for (i = 0; i < (int)nitems(q->data) && i < (int)nitems(sc->mon_lat.tx_ns); i++) {
+		if (q->data[i].m == NULL)
+			continue;
+		if (sc->mon_lat.tx_ns[i] == 0)
+			sc->mon_lat.tx_ns[i] = now;
+		else if (now - sc->mon_lat.tx_ns[i] > 3000000000ULL)
+			qwz_mon_reap_slot(sc, i, now);
+	}
+}
+
+/* K2c (C4): age in ms of the oldest slot still held in the capture TX ring (0 = none held); evidence only */
+static uint32_t
+qwz_mon_oldest_ms(struct qwz_softc *sc, uint64_t now)
+{
+	struct qwz_txmgmt_queue *q = &sc->sc_monvif.txmgmt;
+	uint64_t oldest = 0;
+	int i;
+
+	for (i = 0; i < (int)nitems(q->data) && i < (int)nitems(sc->mon_lat.tx_ns); i++)
+		if (q->data[i].m != NULL && sc->mon_lat.tx_ns[i] != 0 && now > sc->mon_lat.tx_ns[i] &&
+		    now - sc->mon_lat.tx_ns[i] > oldest)
+			oldest = now - sc->mon_lat.tx_ns[i];
+	return (uint32_t)(oldest / 1000000ULL);
+}
+
 void
 qwz_mon_lat_credit(struct qwz_softc *sc, int eid, int credits, int what)
 {
@@ -357,6 +423,15 @@ qwz_mon_tx_compl(struct qwz_softc *sc, struct wmi_mgmt_tx_compl_event *ev)
 	struct qwz_txmgmt_queue *q = &sc->sc_monvif.txmgmt;
 	struct qwz_tx_data *td;
 
+	/* K2c (C3): the three silent early returns below are counted (ufr_compl_range / _nom / _sta) so a lost completion is no longer invisible */
+	if (!sc->mon_active)	/* outside a cell every completion is the station's: not counted */
+		;
+	else if (ev->desc_id >= nitems(q->data))
+		sc->mon_stats.ufr_compl_range++;
+	else if (q->data[ev->desc_id].m == NULL)
+		sc->mon_stats.ufr_compl_nom++;
+	else if (sc->sc_vif.txmgmt.data[ev->desc_id].m != NULL)
+		sc->mon_stats.ufr_compl_sta++;
 	if (ev->desc_id >= nitems(q->data))
 		return 0;
 	td = &q->data[ev->desc_id];
@@ -400,6 +475,63 @@ qwz_mon_tx_compl(struct qwz_softc *sc, struct wmi_mgmt_tx_compl_event *ev)
 	return 1;
 }
 
+/*
+ * K4 (M1), debug.qwz.monfmt: the per-frame header of a user frame (qwz_montx_hdr) reaches qwz_mon_tx_bytes through these two
+ * statics, which qwz_mon_txframe_gated sets and clears around its one call (it runs inside the command gate); the other caller path
+ * (qwz_mon_tx_copy) never sets qwz_mon_fmt_user, so its frames always go with tx_params_valid 0. The presets are the lane M ones
+ * (QWZ_AWDL_TXP_MC0 / UC0 / DATA1 in qwz.c: 20 dBm, 1 stream, 20 MHz, OFDM preamble).
+ */
+#define QWZ_MON_TXP_MC0		0x10104028u
+#define QWZ_MON_TXP_UC0		0x4011c028u
+#define QWZ_MON_TXP_DATA1	0x00108400u
+static int qwz_mon_fmt_user;
+static uint16_t qwz_mon_fmt_flags;
+static uint8_t qwz_mon_fmt_rate;
+
+/* The daemon's rate byte (500 kbit/s units) as the index of the OFDM rate in the firmware's mcs_mask (bit 4 + index): 6, 9, 12, 18, 24, 36, 48, 54 Mbit/s; zero, CCK and anything else is OFDM 12 (index 2) */
+static int
+qwz_mon_fmt_rate_idx(uint8_t rate)
+{
+	switch (rate) {
+	case 12: return 0;
+	case 18: return 1;
+	case 24: return 2;
+	case 36: return 3;
+	case 48: return 4;
+	case 72: return 5;
+	case 96: return 6;
+	case 108: return 7;
+	}
+	return 2;
+}
+
+/* 1 and the two tx_params dwords when this user frame is sent with a tx_params block under debug.qwz.monfmt, else 0 */
+static int
+qwz_mon_fmt_pick(uint8_t kind, size_t len, uint32_t *d0, uint32_t *d1, unsigned *retry, unsigned *rate)
+{
+	int mode = qwz_monfmt > 2 ? 2 : qwz_monfmt;	/* 3 (offchan data command) is not implemented: acts as 2 */
+	uint32_t preset = QWZ_MON_TXP_MC0;
+	unsigned r = 2, idx = 2;
+
+	if (mode <= 0 || !qwz_mon_fmt_user)
+		return 0;
+	if (kind == 2 && mode >= 2) {
+		preset = QWZ_MON_TXP_UC0;
+		r = (qwz_mon_fmt_flags & QWZ_MONTX_F_NO_ACK) ? 1 : (QWZ_MON_TXP_UC0 >> 28);
+		idx = qwz_mon_fmt_rate_idx(qwz_mon_fmt_rate);
+	} else if (len >= 150)
+		return 0;
+	*d0 = (preset & 0x000000ffu) | ((1u << (4 + idx)) << 8) | (preset & 0x0ff00000u) | (r << 28);
+	*d1 = kind == 2 ? QWZ_MON_TXP_DATA1 : (QWZ_MON_TXP_DATA1 & ~(1u << 20));	/* frame_type bit: Data = 1, management and control 0 */
+	*retry = r;
+	{
+		static const uint8_t units[8] = { 12, 18, 24, 36, 48, 72, 96, 108 };
+
+		*rate = units[idx];	/* 500 kbit/s units, as logged */
+	}
+	return 1;
+}
+
 /* Transmit `frame` (no FCS) on the capture vdev; the slot remembers the frame type. */
 static int
 qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t kind)
@@ -407,6 +539,8 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 	struct qwz_vif *vif = &sc->sc_monvif;
 	struct mbuf *m;
 	int slot, ret;
+	int fmt_used = 0;	/* K4 (M1) */
+	static int fmt_logged, fmt_fail_logged;	/* K4 (M1): first 8 tx_params frames and first 4 fallbacks per boot */
 
 	/* K1 (W1), debug.qwz.monnocred: XNU re-runs a sysctl handler while it returns EAGAIN, so EAGAIN here spins inside the kernel; answer exactly instead (the checks below stay for monnocred 0) */
 	if (qwz_monnocred) {
@@ -431,6 +565,21 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 	}
 	if (vif->txmgmt.queued >= (int)nitems(vif->txmgmt.data) - 1)
 		return ENOSPC;
+	/* K2c (C2), debug.qwz.monreap: the slot the next send takes is still occupied (a lost completion, then a wrap): qwz_mac_mgmt_tx_wmi would overwrite its mbuf and leak it. Reap it when it is older than 250 ms, else refuse */
+	if (qwz_monreap && vif->txmgmt.cur >= 0 && vif->txmgmt.cur < (int)nitems(vif->txmgmt.data) &&
+	    vif->txmgmt.data[vif->txmgmt.cur].m != NULL) {
+		int cs = vif->txmgmt.cur;
+		uint64_t now = getnsecuptime(), st = cs < (int)nitems(sc->mon_lat.tx_ns) ? sc->mon_lat.tx_ns[cs] : 0;
+
+		if (st != 0 && now - st > 250000000ULL)
+			qwz_mon_reap_slot(sc, cs, now);
+		else {
+			if (st == 0 && cs < (int)nitems(sc->mon_lat.tx_ns))
+				sc->mon_lat.tx_ns[cs] = now;
+			sc->mon_stats.ufr_livefull++;
+			return ENOSPC;
+		}
+	}
 	m = m_gethdr(M_DONTWAIT, MT_DATA);
 	if (m == NULL)
 		return ENOBUFS;
@@ -445,7 +594,37 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 	M_SETLEN(m, len);
 	memcpy(mtod(m, uint8_t *), frame, len);
 	slot = vif->txmgmt.cur;
+	{	/* K4 (M1), debug.qwz.monfmt: this frame goes with a tx_params block (one-shot fields of sc, read by qwz_wmi_mgmt_send) */
+		uint32_t fd0 = 0, fd1 = 0;
+		unsigned fretry = 0, frate = 0;
+
+		fmt_used = qwz_mon_fmt_pick(kind, len, &fd0, &fd1, &fretry, &frate);
+		if (fmt_used) {
+			sc->mon_txp_d0 = fd0;
+			sc->mon_txp_d1 = fd1;
+			sc->mon_txp_err = 0;
+			sc->mon_txp_valid = 1;
+			if (fmt_logged < 8) {
+				fmt_logged++;
+				printf("qwz: mon: fmt: kind %u len %u retry %u rate %u params 0x%08x 0x%08x\n", (unsigned)kind, (unsigned)len, fretry, frate, fd0, fd1);
+			}
+		}
+	}
 	ret = qwz_mac_mgmt_tx_wmi(sc, vif, sc->pdevs[0].pdev_id, NULL, m);
+	if (fmt_used) {	/* K4 (M1): a failed tx_params send must not stop the cell: the same frame goes again as the plain command */
+		sc->mon_txp_valid = 0;
+		if (ret == 0)
+			sc->mon_stats.ufr_fmt++;
+		else if (sc->mon_txp_err != 0 && ret != ESHUTDOWN) {
+			sc->mon_stats.ufr_fmtfail++;
+			if (fmt_fail_logged < 4) {
+				fmt_fail_logged++;
+				printf("qwz: mon: fmt: the tx_params send failed (%d), the frame goes without\n", ret);
+			}
+			sc->mon_txp_err = 0;
+			ret = qwz_mac_mgmt_tx_wmi(sc, vif, sc->pdevs[0].pdev_id, NULL, m);
+		}
+	}
 	if (ret) {
 		if (ret != ENOBUFS)
 			m_freem(m);
@@ -477,9 +656,14 @@ qwz_mon_txframe_gated(OSObject *, void *arg0, void *arg1, void *arg2, void *)
 		*errp = ENXIO;
 		return kIOReturnSuccess;
 	}
+	sc->mon_stats.ufr_gate++;	/* K2c (C4): evidence only */
 	type = (frame[0] >> 2) & 3;
 	kind = type == 0 ? 1 : type == 2 ? 2 : 3;
+	qwz_mon_fmt_flags = h->flags;	/* K4 (M1): the per-frame header, for qwz_mon_fmt_pick */
+	qwz_mon_fmt_rate = h->rate;
+	qwz_mon_fmt_user = 1;
 	ret = qwz_mon_tx_bytes(sc, frame, flen, kind);
+	qwz_mon_fmt_user = 0;
 	if (ret == 0)
 		sc->mon_stats.ufr_sent++;
 	else if (ret == ENOSPC)
@@ -558,6 +742,8 @@ qwz_mon_txq_purge(struct qwz_softc *sc)
 		q->data[i].ni = NULL;
 	}
 	q->cur = q->queued = 0;
+	memset(sc->mon_lat.tx_ns, 0, sizeof(sc->mon_lat.tx_ns));	/* K2c (C3): no per-slot stamp or kind outlives the slots */
+	memset(sc->mon_tx_kind, 0, sizeof(sc->mon_tx_kind));
 }
 
 /*
@@ -1043,6 +1229,8 @@ qwz_mon_pop_mpdu(struct qwz_softc *sc, struct hal_reo_entrance_ring *ent,
 	sc->mon_stats.mpdus++;
 	if (flen > 0) {
 		sc->mon_stats.frames++;
+		if (flen >= 2 && ((mon_frame[0] >> 2) & 3) == 0)	/* K2c (C4): a management frame that came through the RX ring path (evidence only) */
+			sc->mon_stats.ring_mgmt_frames++;
 		qwz_mon_rx_hook(sc, mon_frame, flen, flags);
 		moncap_put(mon_frame, flen, flags, decap, (uint8_t)sc->mon_chan, 0, 0);
 	}
@@ -1083,23 +1271,36 @@ qwz_mon_reap(void *arg)
 		return;
 	n = qwz_mon_reap_ring(sc);
 	now = getnsecuptime();
+	{	/* K2c (C2), debug.qwz.monreap: every 100 ms free the capture TX slots whose frame is older than 3 s; this timer runs on the command-gate work loop, like the ring work above */
+		static uint64_t reap_last_ns;
+
+		if (qwz_monreap && now - reap_last_ns >= 100000000ULL) {
+			reap_last_ns = now;
+			qwz_mon_reap_stale(sc, now);
+		}
+	}
 	if (now - sc->mon_stats.last_log > 5000000000ULL) {
 		sc->mon_stats.last_log = now;
 		printf("qwz: mon: ch %u: entries %u mpdus %u frames %u mgmt %u reo %u "
 		    "reo_err %u wbm_err %u bufs %u badcookie %u nolink %u duplink %u "
-		    "linkret_fail %u capdrop %u\n",
+		    "linkret_fail %u capdrop %u wmi_rx %u ring_mgmt %u\n",
 		    sc->mon_chan, sc->mon_stats.entries, sc->mon_stats.mpdus,
 		    sc->mon_stats.frames, sc->mon_stats.mgmt, sc->mon_stats.reo,
 		    sc->mon_stats.reo_err, sc->mon_stats.wbm_err, sc->mon_stats.bufs,
 		    sc->mon_stats.badcookie, sc->mon_stats.nolink, sc->mon_stats.duplink,
-		    sc->mon_stats.linkret_fail, moncap_dropped);
+		    sc->mon_stats.linkret_fail, moncap_dropped, sc->mon_stats.wmi_mgmt_rx_events, sc->mon_stats.ring_mgmt_frames);
 		if (sc->mon_stats.ufr_sent || sc->mon_stats.ufr_full || sc->mon_stats.ufr_fail)
-			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u; nocred %u qmax %u inflight %u\n",
+			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u; nocred %u qmax %u inflight %u; pending %d reaped %u livefull %u compl range %u nom %u sta %u; held_ms %u gate %u fmt %u fmtfail %u\n",
 			    sc->mon_stats.ufr_sent, sc->mon_stats.ufr_full, sc->mon_stats.ufr_fail,
 			    sc->mon_stats.ufr_mgmt_ok, sc->mon_stats.ufr_mgmt_bad,
 			    sc->mon_stats.ufr_data_ok, sc->mon_stats.ufr_data_bad,
 			    sc->mon_stats.ufr_ctrl_ok, sc->mon_stats.ufr_ctrl_bad,
-			    sc->mon_stats.ufr_nocred, sc->mon_stats.ufr_qmax, sc->mon_stats.ufr_inflight);
+			    sc->mon_stats.ufr_nocred, sc->mon_stats.ufr_qmax, sc->mon_stats.ufr_inflight,
+			    (int)(sc->mon_stats.ufr_sent - (sc->mon_stats.ufr_mgmt_ok + sc->mon_stats.ufr_mgmt_bad + sc->mon_stats.ufr_data_ok +
+			    sc->mon_stats.ufr_data_bad + sc->mon_stats.ufr_ctrl_ok + sc->mon_stats.ufr_ctrl_bad)),	/* K2c (C3): user frames sent minus all completions seen */
+			    sc->mon_stats.ufr_reaped, sc->mon_stats.ufr_livefull, sc->mon_stats.ufr_compl_range,
+			    sc->mon_stats.ufr_compl_nom, sc->mon_stats.ufr_compl_sta, qwz_mon_oldest_ms(sc, now), sc->mon_stats.ufr_gate,
+			    sc->mon_stats.ufr_fmt, sc->mon_stats.ufr_fmtfail);
 		if (sc->mon_stats.rx_psf || sc->mon_stats.tx_sent)
 			printf("qwz: mon: tx: psf heard %u, sent %u fail %u, compl ok %u discard %u inspect %u noack %u other %u, last ack rssi %d, mode 0x%x\n",
 			    sc->mon_stats.rx_psf, sc->mon_stats.tx_sent, sc->mon_stats.tx_fail,

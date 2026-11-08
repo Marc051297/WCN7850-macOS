@@ -39,10 +39,14 @@ int qwz_m0_on = 1, qwz_dead_aware = 1, qwz_mmio_guard = 1, qwz_bme = 1, qwz_soft
 volatile int qwz_pm_pending = 0;	/* HF-1, HF-3: see qwz_life.h; not a sysctl */
 
 int qwz_cap73 = 1;	/* S1 (hotspot Wi-Fi): debug.qwz.cap73, see qwz_life.h; its own line, apart from the list above */
-int qwz_monnocred = 0;		/* K1 (W1): debug.qwz.monnocred, see qwz_life.h */
+int qwz_monnocred = 1;		/* K1 (W1): debug.qwz.monnocred, see qwz_life.h; K2c (C1): the default is 1 (clean in the 11-08 runs), 0 restores the EAGAIN answers of K1 */
 unsigned int qwz_monqmax = 0;	/* K1 (W1): debug.qwz.monqmax, see qwz_life.h */
 int qwz_monparams = 0;		/* K1 (W3): debug.qwz.monparams, see qwz_life.h */
 int qwz_scanraw = 0;		/* K1 (W2c): debug.qwz.scanraw, see qwz_life.h */
+int qwz_rssisigned = 0, qwz_beaconmeta = 0, qwz_scanprobe = 0, qwz_rssisrc = 0, qwz_scanrest = 0, qwz_rssilog = 0;	/* K3: debug.qwz.rssisigned, beaconmeta, scanprobe, rssisrc, scanrest, rssilog, see qwz_life.h */
+int qwz_monreap = 0, qwz_hintfix = 1;	/* K2c: debug.qwz.monreap (0 = off = K2b, the stale-slot reaper and the live-slot guard of the capture TX ring), debug.qwz.hintfix (1 = the scan-start hint-BSSID copy goes the right way, 0 = the old swapped copy); see qwz_life.h */
+int qwz_monfmt = 0;		/* K4 (M1): debug.qwz.monfmt, see qwz_life.h */
+volatile unsigned int qwz_scanraw_gen = 0;	/* K2c (C6): bumped by every write to debug.qwz.scanraw; the per-boot evidence budgets (qwz_log.h qwz_log_rearmed) start again when it changes */
 int qwz_hwmode = 1;		/* K2 (H1): debug.qwz.hwmode, see qwz_life.h; 1 = WMI_HOST_HW_MODE_DBS, today's request */
 int qwz_hwm_guard = 0;		/* K2: boot-arg qwzhwmguard=1, see qwz_life.h */
 unsigned int qwz_hwm_offered_mask = 0;	/* K2 (H1): bit n = the firmware offered hardware mode id n (n < 32); 0 until the extended service-ready event was parsed */
@@ -481,6 +485,20 @@ qwz_sysctl_mon(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req 
 	return qwz_mon_set(v);
 }
 
+/* debug.qwz.scanraw (K1 W2c; K2c C6): the value is a plain int as before; a write also bumps qwz_scanraw_gen, which re-arms the per-boot evidence budgets */
+static int
+qwz_sysctl_scanraw(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int v = qwz_scanraw;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	qwz_scanraw = v;
+	__atomic_add_fetch(&qwz_scanraw_gen, 1u, __ATOMIC_RELAXED);
+	return 0;
+}
+
 /* debug.qwz.hwmode (K2 H1): the hardware mode id for the next firmware start. 0, 1 and 5 are always accepted; any other id only when the firmware offered it; else EINVAL. */
 static int
 qwz_sysctl_hwmode(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
@@ -681,15 +699,33 @@ SYSCTL_UINT(_debug_qwz, OID_AUTO, monflags, CTLFLAG_RW | CTLFLAG_LOCKED,
 SYSCTL_UINT(_debug_qwz, OID_AUTO, monhold, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_mon_hold, 0, "1: Wi-Fi on keeps the capture cell instead of starting the station");
 SYSCTL_INT(_debug_qwz, OID_AUTO, monnocred, CTLFLAG_RW | CTLFLAG_LOCKED,
-    &qwz_monnocred, 0, "K1 W1: 1 = the user-space frame write answers ENOSPC (not EAGAIN) while both WMI credits are in flight and ENXIO while the firmware is down; 0 = EAGAIN (default)");
+    &qwz_monnocred, 0, "K1 W1 / K2c: 1 (default) = the user-space frame write answers ENOSPC (not EAGAIN) while both WMI credits are in flight and ENXIO while the firmware is down; 0 = EAGAIN (the K1/K2b default)");
 SYSCTL_UINT(_debug_qwz, OID_AUTO, monqmax, CTLFLAG_RW | CTLFLAG_LOCKED,
-    &qwz_monqmax, 0, "K1 W1 / K2b: N > 0 (1..63) = DATA and CONTROL frames from user space get ENOSPC once N such frames are in flight in the capture TX ring (management frames are never counted and keep all 63 slots); 0 = off (default)");
+    &qwz_monqmax, 0, "K1 W1 / K2b: N > 0 = ENOSPC for user DATA and CONTROL frames once N of them are in flight (1..63, larger values act as 63); management frames are never counted; 0 = off (default)");
 SYSCTL_INT(_debug_qwz, OID_AUTO, monparams, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_monparams, 0, "K1 W3: 1 = cell vdev MGMT_RATE OFDM 12 Mbit/s after vdev up, 2 = also MGMT_RETRY_LIMIT 3 and NON_AGG_SW_RETRY_TH 4; 0 = off (default); read when the cell starts");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, hwmode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     0, 0, qwz_sysctl_hwmode, "I", "K2 H1: hardware mode id asked of the firmware at each start (single_pdev_only chips): 1 = DBS (default, the old request), 0 = SINGLE, 5 = DBS_OR_SBS, or any id the firmware offered; others EINVAL; a Wi-Fi off/on applies it");
-SYSCTL_INT(_debug_qwz, OID_AUTO, scanraw, CTLFLAG_RW | CTLFLAG_LOCKED,
-    &qwz_scanraw, 0, "K1 W2c: 1 = log the non-zero 32-bit words of the scan request tail for the first three non-plain scan requests, 2 = also for the first three plain launched ones; 0 = off (default); may hold SSID text, redact before sharing");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, scanraw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_scanraw, "I", "K1 W2c / K2c: 1 = log the non-zero 32-bit words of the scan request tail for the first three non-plain scan requests, 2 = also for the first three plain launched ones (a scan answered empty during the monitor hold counts as plain); 0 = off (default); any write re-arms the per-boot budgets (these words, the join-pick line, the IOC 85 blobs); may hold SSID text, redact before sharing");
+SYSCTL_INT(_debug_qwz, OID_AUTO, monreap, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_monreap, 0, "K2c C2: 1 = capture TX ring: every 100 ms a slot older than 3 s is unloaded and freed (queued and in-flight counts corrected, 'qwz: mon: tx reap' logged for the first 8), and a send that would take a still-occupied slot reaps it when older than 250 ms or answers ENOSPC; 0 = off (default, as K2b)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, hintfix, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_hintfix, 0, "K2c C5: 1 = the scan-start command copies each hint BSSID from the request into the message (default); 0 = the old copy with source and destination swapped; nothing sets a hint BSSID today");
+SYSCTL_INT(_debug_qwz, OID_AUTO, monfmt, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_monfmt, 0, "K4 M1: capture cell user frames with a per-frame tx_params block: 1 = frames under 150 bytes with retry limit 2 and OFDM 12 Mbit/s, 2 = also user DATA frames (retry limit 1 when the frame header says NO_ACK, else 4; rate from the header's rate byte, zero or unknown = OFDM 12); 0 = off (default, tx_params_valid 0); 3 and above act as 2");
+SYSCTL_INT(_debug_qwz, OID_AUTO, rssisigned, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_rssisigned, 0, "K3 S1: 1 = the 5 GHz SCAN-state RSSI compare reads ni_rssi as a signed byte (strongest sample kept); 0 = today's compare (default)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, beaconmeta, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_beaconmeta, 0, "K3 S2: 1 = the beacon record sent to macOS also sets flags 6 (on channel), 7 (from beacon), 12 (noise) and 13 (SNR); 0 = flags 0x4002 (default)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, scanprobe, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_scanprobe, 0, "K3 S3: 1 = a macOS active scan with no SSID sends one zero-length SSID, 2 = also the broadcast-probe flag; 0 = off (default)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, rssisrc, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_rssisrc, 0, "K3 S4: 1 = data-frame RX RSSI no longer feeds the joined-AP RSSI average (management frames only); 0 = off (default)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, scanrest, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_scanrest, 0, "K3 S5a / K2c: N > 0 (ms, values above 500 act as 500) = min rest time N, max rest max(N, 50) for a macOS-requested scan in RUN state; 0 = 50/500 (default)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, rssilog, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_rssilog, 0, "K3: 1 = log the first 8 scan-result publications of the boot (raw ni_rssi byte, value sent, flags, no addresses); 0 = off (default)");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, monmac, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
     0, 0, qwz_sysctl_monmac, "A", "the capture vdev's MAC: the AWDL address for a node on this card");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, montxframe, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
@@ -836,6 +872,15 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_monparams);
 	sysctl_register_oid(&sysctl__debug_qwz_hwmode);
 	sysctl_register_oid(&sysctl__debug_qwz_scanraw);
+	sysctl_register_oid(&sysctl__debug_qwz_monreap);
+	sysctl_register_oid(&sysctl__debug_qwz_hintfix);
+	sysctl_register_oid(&sysctl__debug_qwz_monfmt);
+	sysctl_register_oid(&sysctl__debug_qwz_rssisigned);
+	sysctl_register_oid(&sysctl__debug_qwz_beaconmeta);
+	sysctl_register_oid(&sysctl__debug_qwz_scanprobe);
+	sysctl_register_oid(&sysctl__debug_qwz_rssisrc);
+	sysctl_register_oid(&sysctl__debug_qwz_scanrest);
+	sysctl_register_oid(&sysctl__debug_qwz_rssilog);
 	sysctl_register_oid(&sysctl__debug_qwz_monbssid);
 	sysctl_register_oid(&sysctl__debug_qwz_montx);
 	sysctl_register_oid(&sysctl__debug_qwz_monmac);
@@ -880,6 +925,15 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_monparams);
 	sysctl_unregister_oid(&sysctl__debug_qwz_hwmode);
 	sysctl_unregister_oid(&sysctl__debug_qwz_scanraw);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monreap);
+	sysctl_unregister_oid(&sysctl__debug_qwz_hintfix);
+	sysctl_unregister_oid(&sysctl__debug_qwz_monfmt);
+	sysctl_unregister_oid(&sysctl__debug_qwz_rssisigned);
+	sysctl_unregister_oid(&sysctl__debug_qwz_beaconmeta);
+	sysctl_unregister_oid(&sysctl__debug_qwz_scanprobe);
+	sysctl_unregister_oid(&sysctl__debug_qwz_rssisrc);
+	sysctl_unregister_oid(&sysctl__debug_qwz_scanrest);
+	sysctl_unregister_oid(&sysctl__debug_qwz_rssilog);
 	sysctl_unregister_oid(&sysctl__debug_qwz_mon);
 	/* M0 (C32), in the reverse order of the registration */
 	sysctl_unregister_oid(&sysctl__debug_qwz_health);

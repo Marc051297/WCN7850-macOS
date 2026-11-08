@@ -21,7 +21,7 @@
  *   debug.qwz.cap73       S1: getCARD_CAPABILITIES bit 73 (capabilities[9] 0x02, SSID-list scans), default 1; 0 = the old blob; a Wi-Fi
  *                         toggle or reboot applies it
  *   debug.qwz.monnocred   K1 (W1): 1 = the user-space frame write (montxframe) answers ENOSPC, not EAGAIN, while both WMI credits are in flight, and ENXIO
- *                         while the firmware is down, crashed or a sleep is pending; default 0 (plain global, read at call time)
+ *                         while the firmware is down, crashed or a sleep is pending; default 1 since K2c (0 = EAGAIN, the K1/K2b default; plain global, read at call time)
  *   debug.qwz.monqmax     K1 (W1): N > 0 = DATA and CONTROL frames from user space are refused with ENOSPC once N frames are queued in the capture
  *                         TX ring (management frames keep all 63 slots); default 0 = off (plain global, read at call time)
  *   debug.qwz.monparams   K1 (W3): 1 = MGMT_RATE OFDM 12 Mbit/s on the cell vdev right after it is up, 2 = also MGMT_RETRY_LIMIT 3 and
@@ -30,7 +30,16 @@
  *                         0 = SINGLE, 5 = DBS_OR_SBS or any id the firmware offered, others EINVAL; read at every firmware start (a Wi-Fi off/on applies
  *                         it); the boot-arg qwzhwmode=N sets the value a boot starts with
  *   debug.qwz.scanraw     K1 (W2c): 1 = log the non-zero words of the scan request tail for the first three non-plain scan requests, 2 = also for the first
- *                         three plain launched ones; default 0; release builds too; the words may hold SSID text (plain global, read at call time)
+ *                         three plain launched ones; default 0; release builds too; the words may hold SSID text; K2c: any write re-arms the per-boot evidence budgets (raw words, join pick, IOC 85 blobs)
+ *   debug.qwz.monreap    K2c (C2): 1 = the capture TX ring's stale-slot reaper (a slot older than 3 s, checked every 100 ms) and live-slot guard (an occupied slot is reaped when older than 250 ms, else ENOSPC); default 0 = K2b
+ *   debug.qwz.hintfix    K2c (C5): 1 = the scan-start command copies hint BSSIDs the right way (default); 0 = the old swapped copy
+ *   debug.qwz.monfmt     K4 (M1): capture cell frames with a tx_params block: 1 = user frames under 150 bytes (retry limit 2, OFDM 12 Mbit/s), 2 = also user DATA frames (retry 1 with NO_ACK, else 4; rate from the header's rate byte); default 0 = tx_params_valid 0
+ *   debug.qwz.rssisigned  K3 (S1): 1 = the 5 GHz SCAN-state RSSI compare reads ni_rssi as a signed byte (strongest sample kept); default 0
+ *   debug.qwz.beaconmeta  K3 (S2): 1 = the beacon record sent to macOS also sets flags 6, 7, 12 (noise -95) and 13 (SNR); default 0 (flags 0x4002)
+ *   debug.qwz.scanprobe   K3 (S3): 1 = a macOS active scan with no SSID sends one zero-length SSID, 2 = also the broadcast-probe flag; default 0
+ *   debug.qwz.rssisrc     K3 (S4): 1 = data-frame RX RSSI no longer feeds the joined-AP RSSI average (management frames only); default 0
+ *   debug.qwz.scanrest    K3 (S5a): N > 0 = min rest time N ms (max max(N,50) ms) for a macOS-requested scan while associated; default 0 = 50/500
+ *   debug.qwz.rssilog     K3: 1 = log the first 8 scan-result publications of the boot (raw ni_rssi byte, value sent, flags); default 0
  *   debug.qwz.recover     0 legacy crash handling, 1 armed, write 2 re-arms the engine
  *   debug.qwz.awdlprobe   AWDL data TX probe 0 to 3 (1 to 3 need a proven recovery)
  *   debug.qwz.awdlpeers   M2a WP2, AWDL peer hygiene, bit mask (QWZ_AWDLP_* in qwz_life.h), 0 = M0.1: 1 the heard-sender list starts again at

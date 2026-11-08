@@ -1413,11 +1413,14 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
     
     {
         /* K1 (W2c): one line per join pick (only while a join is requested, else every node is refused for the ESSID); no SSID, BSSID or MAC is printed */
-        static unsigned int jl_count;
+        static unsigned int jl_count, jl_gen, jl_forced;
+        /* K2c (C6): a write to debug.qwz.scanraw starts the counter again; a pick of none, or one that rejected a candidate whose name matched, is always logged (at most 200 per start, a flood guard) */
+        if (qwz_log_rearmed(&jl_gen, &jl_count))
+            jl_forced = 0;
 #ifdef AIRPORT_WCL
         if (ic->ic_wcl_join_requested)
 #endif
-        if (qwz_log_ratelimit(&jl_count, 24, 8))
+        if (qwz_log_ratelimit(&jl_count, 24, 8) || ((selbs == NULL || jl_namefail) && jl_forced++ < 200))
             qwz_log("airport: join pick #%u: nodes %u rejected %u (fail bits or'd 0x%x) name-matched-but-rejected %u (strongest: ch %d rssi %d fail 0x%x); picked %s ch %d rssi %d\n",
                     jl_count, jl_seen, jl_rej, jl_fail_or, jl_namefail, jl_bch, jl_namefail ? (int)(int8_t)jl_brssi : 0, jl_bfail,
                     selbs ? "yes" : "none", selbs ? ieee80211_chan2ieee(ic, selbs->ni_chan) : -1, selbs ? (int)(int8_t)selbs->ni_rssi : 0);
