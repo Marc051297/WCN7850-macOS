@@ -2404,6 +2404,7 @@ struct qwz_softc {
 		uint32_t ufr_fmt, ufr_fmtfail;	/* K4 (M1): user frames sent with a tx_params block (debug.qwz.monfmt); of those, frames whose tx_params send failed and went again without */
 		uint32_t badcookie, nolink, duplink, linkret_fail;
 		uint32_t coex_st_mgmt, coex_cell_mgmt, coex_st_data, coex_cell_data, coex_drop;	/* K5 (L1-C6, C7, C15): while a coex cell runs, frames the claim tests sent to the station (st_*), to the cell's capture (cell_*), or dropped (drop); reset with the rest of mon_stats at cell start */
+		uint32_t coex_wbm_taken, coex_wbm_skipped, coex_wbm_badhdr;	/* K6 (K6-1): coex cell, WBM error ring: peer-less data frames copied to the capture (taken), multi-buffer or already-processed frames left alone (skipped), frames whose descriptor or length could not be used (badhdr); reset at cell start */
 		uint64_t last_log;
 	} mon_stats;
 

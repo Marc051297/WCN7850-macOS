@@ -16398,11 +16398,29 @@ qwz_dp_rx_wbm_err(struct qwz_softc *sc, struct qwz_rx_msdu *msdu,
 		break;
 	}
 
+	if (drop && sc->mon_active && sc->mon_coex)	/* K6 (K6-1): beside the station the cell's peer-less data frames are copied to the capture first; the mbuf is freed below as before */
+		(void)qwz_mon_capture_wbm_msdu(sc, msdu);
 	if (drop) {
 		qwz_awdl_rx_err_note(sc, msdu);
 		m_freem(msdu->m);
 		msdu->m = NULL;
 		sc->sc_ic.ic_if.if_ierrors++;
+		return;
+	}
+
+	if (sc->mon_active && sc->mon_coex && qwz_moncoexwbm && (qwz_mon_flags & QWZ_MON_F_REO) && msdu->m != NULL && M_LEN(msdu->m) >= 24 &&
+	    qwz_mon_claims_data(sc, mtod(msdu->m, const uint8_t *) + 4, mtod(msdu->m, const uint8_t *) + 10, mtod(msdu->m, const uint8_t *) + 16)) {
+		/*
+		 * K6 (K6-1b): the frame was processed (undecapped, header rebuilt) and would be delivered to the station, which discards it; it is the cell's,
+		 * so it goes to the capture exactly as the K5 REO tap does.
+		 */
+		sc->mon_stats.coex_cell_data++;
+		if (++sc->mon_stats.coex_wbm_taken == 1)
+			qwz_log("qwz: mon: coex: wbm tap: first frame taken on the delivery path (src %u code %u peer %u)\n",
+			    msdu->err_rel_src, msdu->err_code, msdu->peer_id);
+		qwz_mon_capture_reo_mbuf(sc, msdu->m);
+		m_freem(msdu->m);
+		msdu->m = NULL;
 		return;
 	}
 

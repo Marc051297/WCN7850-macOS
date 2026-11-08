@@ -99,6 +99,8 @@ extern uint32_t qwz_mon_flags;
  * moncoexjoin 0 refuse joins while the cell runs, 1 stop the cell and join (live). moncoex, mode, passive, filter and nss are read when the cell starts.
  */
 extern int qwz_moncoex, qwz_moncoexmode, qwz_moncoexpassive, qwz_moncoexfilter, qwz_moncoexscan, qwz_moncoexcred, qwz_moncoexfw, qwz_moncoexnss, qwz_moncoexjoin;
+/* K6 (K6-1): debug.qwz.moncoexwbm, default 1, acts only while a coex cell runs (moncoex defaults to 0): the WBM error path hands the cell's peer-less data frames to the capture; read live */
+extern int qwz_moncoexwbm;
 /* K5 (L2-C2): debug.qwz.awdlcell, default 0; nothing reads it yet (the receive-only tee is not built), the K5 banner reports it */
 extern int qwz_awdlcell;
 /*
@@ -162,6 +164,8 @@ struct mbuf;
 void	qwz_mon_capture_mgmt_mbuf(struct qwz_softc *, struct mbuf *, int rssi, uint32_t rate_kbps);
 /* qwz_dp_rx_process_received_packets(): an 802.11 frame off the REO path while capturing. */
 void	qwz_mon_capture_reo_mbuf(struct qwz_softc *, struct mbuf *);
+struct qwz_rx_msdu;
+int	qwz_mon_capture_wbm_msdu(struct qwz_softc *, struct qwz_rx_msdu *);	/* K6 (K6-1): 1 = copied into the capture, the caller still frees the mbuf */
 /* K1 W2b: evidence hooks, no effect on any decision. what: 0 a WMI credit consumed (htc send), 1 a credit report arrived, 2 a consumed credit was given back unused. */
 void	qwz_mon_lat_credit(struct qwz_softc *, int eid, int credits, int what);
 /* K1 W2b: ring 0..3 = REO destination ring, n buffers reaped. */

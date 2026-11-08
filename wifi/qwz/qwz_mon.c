@@ -1452,6 +1452,9 @@ qwz_mon_reap(void *arg)
 			    sc->mon_stats.coex_st_mgmt, sc->mon_stats.coex_cell_mgmt, sc->mon_stats.coex_st_data, sc->mon_stats.coex_cell_data,
 			    sc->mon_stats.coex_drop, qwz_moncoexcred, (unsigned int)sc->wmi.wmi[sc->pdevs[0].pdev_id].eid < (unsigned int)ATH12K_HTC_EP_COUNT ?
 			    (int)sc->htc.endpoint[sc->wmi.wmi[sc->pdevs[0].pdev_id].eid].tx_credits : -1, qwz_moncoexfilter);
+		if (sc->mon_coex)	/* K6 (K6-1): the WBM error ring tap, adjacent additive line */
+			printf("qwz: mon: coex: wbm counters taken %u skipped %u badhdr %u wbm_err %u; moncoexwbm %d\n",
+			    sc->mon_stats.coex_wbm_taken, sc->mon_stats.coex_wbm_skipped, sc->mon_stats.coex_wbm_badhdr, sc->mon_stats.wbm_err, qwz_moncoexwbm);
 		if (sc->mon_stats.ufr_sent || sc->mon_stats.ufr_full || sc->mon_stats.ufr_fail)
 			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u; nocred %u qmax %u inflight %u; pending %d reaped %u livefull %u compl range %u nom %u sta %u; held_ms %u gate %u fmt %u fmtfail %u\n",
 			    sc->mon_stats.ufr_sent, sc->mon_stats.ufr_full, sc->mon_stats.ufr_fail,
@@ -2119,6 +2122,8 @@ k5_coex_no_hold:
 		printf("qwz: mon: coex: base_vdevs %d base_peers %d, cred reserve %d, filter mode %d (swapped %d), mgmt ids %d to %d, scan %d join %d fw %d\n",
 		    sc->mon_coex_base_vdevs, sc->mon_coex_base_peers, qwz_moncoexcred, qwz_moncoexfilter, sc->mon_coex_swapped,
 		    QWZ_MON_COEX_STA_SLOTS, (int)nitems(sc->sc_monvif.txmgmt.data) - 1, qwz_moncoexscan, qwz_moncoexjoin, qwz_moncoexfw);
+		if (qwz_moncoexfilter == 1 && sc->mon_coex_swapped)	/* K6 (K6-3) */
+			printf("qwz: mon: coex: filter 1 swapped: the station is deaf while the cell runs (diagnostic mode)\n");
 		QWZ_MON_COEX_SETUP_END(sc);
 	}
 	printf("qwz: mon: capturing\n");
@@ -2314,6 +2319,81 @@ qwz_mon_capture_reo_mbuf(struct qwz_softc *sc, struct mbuf *m)
 	sc->mon_stats.reo++;
 	moncap_put(mon_mgmt_buf, (size_t)len, QWZ_MONCAP_F_REO,
 	    DP_RX_DECAP_TYPE_NATIVE_WIFI, (uint8_t)sc->mon_chan, 0, 0);
+}
+
+/*
+ * K6 (K6-1): beside the station the WBM error ring releases the cell's peer-less data frames (A3 = the AWDL BSSID, sender not a firmware peer) after REO
+ * processed them. Called from qwz_dp_rx_wbm_err just before the drop, in the same context as the REO tap. Returns 1 when the frame was copied into the
+ * capture: the buffer is NOT taken, the caller frees the mbuf exactly as before. Only a single-buffer MSDU whose 802.11 header (A1/A2/A3 from the rx
+ * descriptor's mpdu_start) is positively the cell's (qwz_mon_claims_data, which never claims the station's frames) is copied. The mbuf must still be as the
+ * ring left it (data pointer at the rx descriptor): after qwz_dp_rx_process_msdu has adjusted or rebuilt it, the frame is left alone (skipped).
+ * Frame layout as the other emitters: RAW decap = the 802.11 frame including the FCS (QWZ_MONCAP_F_FCS), native-wifi decap = the 802.11 header and body
+ * (QWZ_MONCAP_F_REO as the REO tap); Ethernet decap cannot be rebuilt here and counts as badhdr.
+ */
+int
+qwz_mon_capture_wbm_msdu(struct qwz_softc *sc, struct qwz_rx_msdu *msdu)
+{
+	struct rx_mpdu_start_qcn9274 *mpdu;
+	struct hal_rx_desc *d;
+	size_t desc_sz = sc->hal.hal_desc_sz, plen;
+	uint32_t mlen;
+	uint16_t flags = 0;
+	uint8_t decap, l3pad;
+
+	if (!sc->mon_active || !sc->mon_coex || !qwz_moncoexwbm || mon_mgmt_buf == NULL || msdu == NULL || msdu->m == NULL ||
+	    msdu->rx_desc == NULL)
+		return 0;
+	d = msdu->rx_desc;
+	if (!msdu->is_first_msdu || !msdu->is_last_msdu || msdu->is_continuation) {
+		/* a later buffer of a multi-buffer frame has no usable descriptor; a first buffer is counted only when it is the cell's */
+		mpdu = &d->u.wcn7850.mpdu_start;
+		if (msdu->is_first_msdu && !(sc->hal_rx_ops->rx_desc_get_mpdu_fc_valid(d) &&
+		    qwz_mon_claims_data(sc, mpdu->addr1, mpdu->addr2, mpdu->addr3)))
+			return 0;
+		if (++sc->mon_stats.coex_wbm_skipped == 1)
+			printf("qwz: mon: coex: wbm tap: first multi-buffer frame skipped (first %d last %d cont %d src %u code %u)\n",
+			    msdu->is_first_msdu, msdu->is_last_msdu, msdu->is_continuation, msdu->err_rel_src, msdu->err_code);
+		return 0;
+	}
+	if (!sc->hal_rx_ops->rx_desc_get_mpdu_fc_valid(d)) {
+		if (++sc->mon_stats.coex_wbm_badhdr == 1)
+			printf("qwz: mon: coex: wbm tap: first frame without a valid 802.11 header in the descriptor (src %u code %u)\n",
+			    msdu->err_rel_src, msdu->err_code);
+		return 0;
+	}
+	mpdu = &d->u.wcn7850.mpdu_start;
+	if (!qwz_mon_claims_data(sc, mpdu->addr1, mpdu->addr2, mpdu->addr3))
+		return 0;
+	if ((uint8_t *)d != mtod(msdu->m, uint8_t *)) {
+		if (++sc->mon_stats.coex_wbm_skipped == 1)
+			printf("qwz: mon: coex: wbm tap: first already-processed frame skipped (src %u code %u)\n", msdu->err_rel_src, msdu->err_code);
+		return 0;
+	}
+	decap = sc->hal_rx_ops->rx_desc_get_decap_type(d);
+	mlen = sc->hal_rx_ops->rx_desc_get_msdu_len(d);
+	l3pad = sc->hal_rx_ops->rx_desc_get_l3_pad_bytes(d);
+	if ((decap != DP_RX_DECAP_TYPE_RAW && decap != DP_RX_DECAP_TYPE_NATIVE_WIFI) || mlen < 24 ||
+	    desc_sz + l3pad + mlen > DP_RX_BUFFER_SIZE || desc_sz + l3pad + mlen > (size_t)M_LEN(msdu->m)) {
+		if (++sc->mon_stats.coex_wbm_badhdr == 1)
+			printf("qwz: mon: coex: wbm tap: first unusable frame (decap %u len %u l3pad %u src %u code %u)\n",
+			    decap, mlen, l3pad, msdu->err_rel_src, msdu->err_code);
+		return 0;
+	}
+	plen = mlen;
+	if (plen > QWZ_MONCAP_MAXFRAME) {
+		plen = QWZ_MONCAP_MAXFRAME;
+		flags |= QWZ_MONCAP_F_TRUNC;
+	}
+	if (decap == DP_RX_DECAP_TYPE_RAW)
+		flags |= QWZ_MONCAP_F_FCS;
+	else
+		flags |= QWZ_MONCAP_F_REO;
+	memcpy(mon_mgmt_buf, mtod(msdu->m, uint8_t *) + desc_sz + l3pad, plen);
+	if (++sc->mon_stats.coex_wbm_taken == 1)
+		printf("qwz: mon: coex: wbm tap: first frame taken (src %u code %u peer %u decap %u len %u)\n",
+		    msdu->err_rel_src, msdu->err_code, msdu->peer_id, decap, mlen);
+	moncap_put(mon_mgmt_buf, plen, flags, decap, (uint8_t)sc->mon_chan, 0, 0);
+	return 1;
 }
 
 void

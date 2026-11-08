@@ -37,6 +37,8 @@
  *                         station's chandef, 1 HT20 on the primary), moncoexpassive (0 K4 rule, 1 the station's passive flag), moncoexfilter (0 never swap the
  *                         station's RX filter, 1 honour monflags, 2 swap filter-pass only), moncoexnss (0 chain count, 1 NSS 1), all read at cell start;
  *                         moncoexscan (1), moncoexcred (1), moncoexfw (0), moncoexjoin (0), read live; defaults in parentheses
+ *   debug.qwz.moncoexwbm  K6 (K6-1): 1 = while a coex cell runs, the cell's peer-less data frames released through the WBM error ring are copied to the capture
+ *                         before they are dropped (default 1; no effect unless moncoex is 1); 0 = dropped as in K5; read live
  *   debug.qwz.awdlcell    K5 (L2-C2 placeholder): reserved for the receive-only tee of the cell into the native AWDL engine; nothing reads it yet (default 0); the
  *                         K5 banner reports it
  *   debug.qwz.scanraw     K1 (W2c): 1 = log the non-zero words of the scan request tail for the first three non-plain scan requests, 2 = also for the first
