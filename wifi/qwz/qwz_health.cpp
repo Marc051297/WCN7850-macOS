@@ -375,14 +375,17 @@ qwz_dossier_hwmode(struct qwz_softc *sc)
 	    (unsigned int)sc->hwm_resp_nent,
 	    sc->hwm_resp_raw[0], sc->hwm_resp_raw[1], sc->hwm_resp_raw[2], sc->hwm_resp_raw[3], sc->hwm_resp_raw[4], sc->hwm_resp_raw[5]);
 	if (sc->hwm_resp_have_ev) {
-		if (sc->hwm_resp_ev_tlen >= 12)
-			qwz_log("qwz: dossier: hwmode resp w0=%u w1=%u w2=%u (tlen %u; ath11k order: status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
+		if (sc->hwm_resp_ev_tlen >= 16)
+			qwz_log("qwz: dossier: hwmode resp w0=%u w1=%u w2=%u w3=%u (tlen %u; layout unverified; firmware fixed_param order is believed to be pdev_id, status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
+			    sc->hwm_resp_w0, sc->hwm_resp_w1, sc->hwm_resp_w2, sc->hwm_resp_w3, sc->hwm_resp_ev_tlen);
+		else if (sc->hwm_resp_ev_tlen >= 12)
+			qwz_log("qwz: dossier: hwmode resp w0=%u w1=%u w2=%u (w3 absent) (tlen %u; layout unverified; firmware fixed_param order is believed to be pdev_id, status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
 			    sc->hwm_resp_w0, sc->hwm_resp_w1, sc->hwm_resp_w2, sc->hwm_resp_ev_tlen);
 		else if (sc->hwm_resp_ev_tlen >= 8)
-			qwz_log("qwz: dossier: hwmode resp w0=%u w1=%u (w2 absent) (tlen %u; ath11k order: status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
+			qwz_log("qwz: dossier: hwmode resp w0=%u w1=%u (w2 absent) (tlen %u; layout unverified; firmware fixed_param order is believed to be pdev_id, status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
 			    sc->hwm_resp_w0, sc->hwm_resp_w1, sc->hwm_resp_ev_tlen);
 		else if (sc->hwm_resp_ev_tlen >= 4)
-			qwz_log("qwz: dossier: hwmode resp w0=%u (w1, w2 absent) (tlen %u; ath11k order: status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
+			qwz_log("qwz: dossier: hwmode resp w0=%u (w1, w2 absent) (tlen %u; layout unverified; firmware fixed_param order is believed to be pdev_id, status, cfgd_hw_mode_index, num_vdev_mac_entries)\n",
 			    sc->hwm_resp_w0, sc->hwm_resp_ev_tlen);
 		else
 			qwz_log("qwz: dossier: hwmode resp event TLV empty (tlen %u)\n", sc->hwm_resp_ev_tlen);
@@ -390,6 +393,15 @@ qwz_dossier_hwmode(struct qwz_softc *sc)
 	for (i = 0; i < sc->hwm_resp_nent; i++)
 		qwz_log("qwz: dossier: hwmode resp entry %u: vdev %u -> pdev %u\n", i,
 		    sc->hwm_resp_ent[i].vdev_id, sc->hwm_resp_ent[i].pdev_id);
+	/* K2 (H2): the vdev-to-mac mapping from qwz_hwmode_map_note */
+	if (sc->hwm_map_have_ev && sc->hwm_map_tlen >= 16)
+		qwz_log("qwz: dossier: hwmode map (4-word layout pdev_id, status, cfgd_hw_mode_index, num_vdev_mac_entries; UNVERIFIED, from memory): pdev %u status %u configured index %u declared %u found %u (%u payload bytes after the event TLV)\n",
+		    sc->hwm_map_pdev, sc->hwm_map_status, sc->hwm_map_index, sc->hwm_map_declared, (unsigned int)sc->hwm_map_n, sc->hwm_map_trailing);
+	else if (sc->hwm_map_have_ev)
+		qwz_log("qwz: dossier: hwmode map: short event body %u bytes: w0 %u w1 %u w2 %u (layout unverified) found %u\n",
+		    sc->hwm_map_tlen, sc->hwm_map_w[0], sc->hwm_map_w[1], sc->hwm_map_w[2], (unsigned int)sc->hwm_map_n);
+	for (i = 0; i < sc->hwm_map_n; i++)
+		qwz_log("qwz: dossier: hwmode map: vdev %u -> mac %u\n", sc->hwm_map[i].vdev_id, sc->hwm_map[i].mac_id);
 }
 
 /*

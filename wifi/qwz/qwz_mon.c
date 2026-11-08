@@ -379,6 +379,8 @@ qwz_mon_tx_compl(struct qwz_softc *sc, struct wmi_mgmt_tx_compl_event *ev)
 	case 3: if (ev->status == 0) sc->mon_stats.ufr_ctrl_ok++; else sc->mon_stats.ufr_ctrl_bad++; break;
 	default: break;
 	}
+	if ((sc->mon_tx_kind[ev->desc_id] == 2 || sc->mon_tx_kind[ev->desc_id] == 3) && sc->mon_stats.ufr_inflight > 0)
+		sc->mon_stats.ufr_inflight--;	/* K2b (W1b): a user DATA or CONTROL frame left the ring (never below zero) */
 	sc->mon_tx_kind[ev->desc_id] = 0;
 	/* WMI_MGMT_TX_COMP_TYPE_*: 0 complete ok, 1 discard, 2 inspect, 3 complete no ack. */
 	if (ev->status == 0) {
@@ -421,9 +423,9 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 		return ENXIO;
 	if (len < 10 || len > QWZ_MONTX_MAXFRAME)
 		return EINVAL;
-	/* K1 (W1), debug.qwz.monqmax: DATA and CONTROL frames (kind 2, 3) stop at N queued; management frames (kind 1, PSF/MIF sync) keep all 63 slots */
+	/* K1 (W1), debug.qwz.monqmax: DATA and CONTROL frames (kind 2, 3) stop at N IN FLIGHT; management frames (kind 1, PSF/MIF sync) keep all 63 slots and are never counted. K2b: N is compared with ufr_inflight (user data and control frames only), NOT with txmgmt.queued, which also holds the management sync frames and starved every data frame at N below the management queue depth */
 	if (qwz_monqmax != 0 && kind != 1 &&
-	    (unsigned int)vif->txmgmt.queued >= (qwz_monqmax > 63U ? 63U : qwz_monqmax)) {
+	    sc->mon_stats.ufr_inflight >= (qwz_monqmax > 63U ? 63U : qwz_monqmax)) {
 		sc->mon_stats.ufr_qmax++;
 		return ENOSPC;
 	}
@@ -450,6 +452,8 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 		return ret;
 	}
 	sc->mon_tx_kind[slot] = kind;
+	if (kind == 2 || kind == 3)
+		sc->mon_stats.ufr_inflight++;	/* K2b (W1b): counted only after the firmware accepted the frame */
 	qwz_mon_lat_stamp(sc, slot);	/* K1 W2b */
 	sc->mon_lat.tx_bytes += len;
 	sc->mon_lat.tx_frames++;
@@ -1090,12 +1094,12 @@ qwz_mon_reap(void *arg)
 		    sc->mon_stats.badcookie, sc->mon_stats.nolink, sc->mon_stats.duplink,
 		    sc->mon_stats.linkret_fail, moncap_dropped);
 		if (sc->mon_stats.ufr_sent || sc->mon_stats.ufr_full || sc->mon_stats.ufr_fail)
-			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u; nocred %u qmax %u\n",
+			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u; nocred %u qmax %u inflight %u\n",
 			    sc->mon_stats.ufr_sent, sc->mon_stats.ufr_full, sc->mon_stats.ufr_fail,
 			    sc->mon_stats.ufr_mgmt_ok, sc->mon_stats.ufr_mgmt_bad,
 			    sc->mon_stats.ufr_data_ok, sc->mon_stats.ufr_data_bad,
 			    sc->mon_stats.ufr_ctrl_ok, sc->mon_stats.ufr_ctrl_bad,
-			    sc->mon_stats.ufr_nocred, sc->mon_stats.ufr_qmax);
+			    sc->mon_stats.ufr_nocred, sc->mon_stats.ufr_qmax, sc->mon_stats.ufr_inflight);
 		if (sc->mon_stats.rx_psf || sc->mon_stats.tx_sent)
 			printf("qwz: mon: tx: psf heard %u, sent %u fail %u, compl ok %u discard %u inspect %u noack %u other %u, last ack rssi %d, mode 0x%x\n",
 			    sc->mon_stats.rx_psf, sc->mon_stats.tx_sent, sc->mon_stats.tx_fail,
@@ -1570,6 +1574,8 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 		return EBUSY;
 	}
 	memset(&sc->mon_stats, 0, sizeof(sc->mon_stats));
+	sc->mon_stats.ufr_inflight = 0;	/* K2b (W1b): no user frame is in flight in a new cell */
+	memset(sc->mon_tx_kind, 0, sizeof(sc->mon_tx_kind));	/* K2b (W1b): no stale per-slot kind from the previous cell may count against the cap */
 	memset(&sc->mon_lat, 0, sizeof(sc->mon_lat));	/* K1 W2b */
 	sc->mon_chan = chan;
 	sc->mon_freq = freq;
@@ -1717,6 +1723,7 @@ qwz_mon_epoch_reset(struct qwz_softc *sc)
 	sc->mon_self_peer = 0;
 	sc->mon_sender_peer = 0;
 	memset(sc->mon_tx_kind, 0, sizeof(sc->mon_tx_kind));
+	sc->mon_stats.ufr_inflight = 0;	/* K2b (W1b): the ring is purged below */
 	if (sc->sc_monvif.txmgmt.data[0].map != NULL)
 		qwz_mon_txq_purge(sc);
 	/* a hold raised IFF_RUNNING for the cell (qwz_mon_start); it must not outlive the cell, or enableGated would skip qwz_init */

@@ -2304,6 +2304,7 @@ struct qwz_softc {
 	uint32_t hwm_resp_w0;			/* first three event words, order unconfirmed (informational only) */
 	uint32_t hwm_resp_w1;
 	uint32_t hwm_resp_w2;
+	uint32_t hwm_resp_w3;			/* K2b: fourth event word, present when the event body is 16 bytes or more */
 	uint32_t hwm_resp_ev_tlen;		/* length of the event TLV body */
 	int hwm_resp_have_ev;			/* the fixed-param TLV was found */
 	uint8_t hwm_resp_nent;
@@ -2312,6 +2313,23 @@ struct qwz_softc {
 		uint32_t pdev_id;
 	} hwm_resp_ent[4];
 	uint32_t hwm_resp_raw[6];		/* first 24 payload bytes */
+	/* K2 (H1): debug.qwz.hwmode. hwm_pick is the id qwz_hwmode_pick chose for the next set-hw-mode command; the sender takes it once (hwm_pick_valid). */
+	int hwm_pick;
+	int hwm_pick_valid;
+	/* K2 (H2): the vdev-to-mac mapping of the set-hw-mode response, parsed by qwz_hwmode_map_note (log and dossier only; no decision reads it) */
+	int hwm_map_have_ev;			/* the fixed event TLV was found */
+	uint32_t hwm_map_status;		/* event words in the ath11k/ath12k order (4-word layout from memory, UNVERIFIED): pdev_id, status, cfgd_hw_mode_index, num_vdev_mac_entries; valid only when hwm_map_tlen >= 16 */
+	uint32_t hwm_map_index;
+	uint32_t hwm_map_declared;		/* num_vdev_mac_entries as the firmware states it */
+	uint32_t hwm_map_pdev;			/* body word 0 when the event body is 16 bytes or more */
+	uint32_t hwm_map_tlen;			/* event TLV body length in bytes */
+	uint32_t hwm_map_w[3];			/* raw body words 0..2, used instead of the named fields when hwm_map_tlen < 16 */
+	uint32_t hwm_map_trailing;		/* payload bytes after the event TLV */
+	uint8_t hwm_map_n;
+	struct {
+		uint32_t vdev_id;
+		uint32_t mac_id;
+	} hwm_map[8];
 	uint32_t pdevs_active;
 	int pdevs_macaddr_valid;
 	struct ath12k_hal_reg_capabilities_ext hal_reg_cap[MAX_RADIOS];
@@ -2358,6 +2376,7 @@ struct qwz_softc {
 		/* Frames handed in from userspace (M2), by 802.11 type. */
 		uint32_t ufr_sent, ufr_full, ufr_fail;
 		uint32_t ufr_mgmt_ok, ufr_mgmt_bad, ufr_data_ok, ufr_data_bad, ufr_ctrl_ok, ufr_ctrl_bad;
+		uint32_t ufr_inflight;	/* K2b (W1b): user DATA and CONTROL frames (kind 2, 3) in flight in the capture TX ring, the number monqmax is compared with; management frames are never counted */
 		uint32_t ufr_nocred, ufr_qmax;	/* K1 (W1): refused early with ENOSPC by monnocred (no credit) and by monqmax; both are also counted in ufr_full */
 		uint32_t badcookie, nolink, duplink, linkret_fail;
 		uint64_t last_log;

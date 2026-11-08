@@ -175,6 +175,24 @@ enum wmi_host_hw_mode_config_type {
 	WMI_HOST_HW_MODE_MAX
 };
 
+/* K2 (H2): the set-hw-mode response as ath11k and ath12k lay it out: a fixed event TLV (WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_EVENT), then, when
+ * num_vdev_mac_entries > 0, an array-of-struct TLV of entries (WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_VDEV_MAC_ENTRY, each with its own TLV header).
+ * Read only through bounds-checked copies in qwz_hwmode_map_note; the firmware here sends a 16-byte event body, so the event struct may grow. */
+/* UNVERIFIED layout, from memory of ath11k/ath12k (no upstream copy in the tree); nothing uses these two structs, they only document the guess. Remove once the layout is confirmed from hardware. */
+struct wmi_pdev_set_hw_mode_response_event_k2 {
+	uint32_t tlv_header;
+	uint32_t pdev_id;
+	uint32_t status;
+	uint32_t cfgd_hw_mode_index;
+	uint32_t num_vdev_mac_entries;
+};
+
+struct wmi_pdev_set_hw_mode_response_vdev_mac_entry_k2 {
+	uint32_t tlv_header;
+	uint32_t vdev_id;
+	uint32_t mac_id;
+};
+
 /* HW mode priority values used to detect the preferred HW mode
  * on the available modes.
  */

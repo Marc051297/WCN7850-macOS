@@ -408,6 +408,21 @@ bool AirportItlwm::start(IOService *provider)
         stallSbr = true;
         qwz_log("qwz: pm: -qwzstallsbr: the second data-stall restart also does a secondary bus reset\n");
     }
+    {
+        /* K2 (H1): qwzhwmode=N starts the boot with debug.qwz.hwmode N (the firmware's offered list is not known yet; an id that is not 0, 1 or 5 and not offered falls back to 1 at the firmware start, with a log line) */
+        int hwm_boot = 0;
+        if (PE_parse_boot_argn("qwzhwmode", &hwm_boot, sizeof(hwm_boot))) {
+            if (hwm_boot >= 0 && hwm_boot < 32) {
+                qwz_hwmode = hwm_boot;
+                qwz_log("qwz: hwmode: boot-arg qwzhwmode=%d: debug.qwz.hwmode starts at %d\n", hwm_boot, hwm_boot);
+            } else
+                qwz_log("qwz: hwmode: boot-arg qwzhwmode=%d ignored (0 to 31 only)\n", hwm_boot);
+        }
+    }
+    if (PE_parse_boot_argn("qwzhwmguard", &boot_value, sizeof(boot_value)) && boot_value == 1) {
+        qwz_hwm_guard = 1;
+        qwz_log("qwz: hwmode: boot-arg qwzhwmguard=1: offered hardware mode ids outside the priority table are skipped\n");
+    }
     if (PE_parse_boot_argn("-novht", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOVHT;
     if (PE_parse_boot_argn("-noht40", &boot_value, sizeof(boot_value)))

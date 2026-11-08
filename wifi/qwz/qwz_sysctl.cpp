@@ -43,6 +43,9 @@ int qwz_monnocred = 0;		/* K1 (W1): debug.qwz.monnocred, see qwz_life.h */
 unsigned int qwz_monqmax = 0;	/* K1 (W1): debug.qwz.monqmax, see qwz_life.h */
 int qwz_monparams = 0;		/* K1 (W3): debug.qwz.monparams, see qwz_life.h */
 int qwz_scanraw = 0;		/* K1 (W2c): debug.qwz.scanraw, see qwz_life.h */
+int qwz_hwmode = 1;		/* K2 (H1): debug.qwz.hwmode, see qwz_life.h; 1 = WMI_HOST_HW_MODE_DBS, today's request */
+int qwz_hwm_guard = 0;		/* K2: boot-arg qwzhwmguard=1, see qwz_life.h */
+unsigned int qwz_hwm_offered_mask = 0;	/* K2 (H1): bit n = the firmware offered hardware mode id n (n < 32); 0 until the extended service-ready event was parsed */
 
 int qwz_awdltruth = 0, qwz_awdlclk = 0;	/* M2a WP5: see qwz_life.h; 0 and 0 is M0.1 on the air */
 volatile unsigned int qwz_awdl_lat_us = 0;	/* M2a WP5 (awdlclk 8): see qwz_life.h */
@@ -478,6 +481,21 @@ qwz_sysctl_mon(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req 
 	return qwz_mon_set(v);
 }
 
+/* debug.qwz.hwmode (K2 H1): the hardware mode id for the next firmware start. 0, 1 and 5 are always accepted; any other id only when the firmware offered it; else EINVAL. */
+static int
+qwz_sysctl_hwmode(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int v = qwz_hwmode;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (!(v == 0 || v == 1 || v == 5 || (v >= 0 && v < 32 && ((qwz_hwm_offered_mask >> v) & 1u))))
+		return EINVAL;
+	qwz_hwmode = v;
+	return 0;
+}
+
 /* debug.qwz.montx: M1 transmit ops (bit 1 broadcast once, 2 auto reply, 4 unicast once). */
 static int
 qwz_sysctl_montx(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
@@ -665,9 +683,11 @@ SYSCTL_UINT(_debug_qwz, OID_AUTO, monhold, CTLFLAG_RW | CTLFLAG_LOCKED,
 SYSCTL_INT(_debug_qwz, OID_AUTO, monnocred, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_monnocred, 0, "K1 W1: 1 = the user-space frame write answers ENOSPC (not EAGAIN) while both WMI credits are in flight and ENXIO while the firmware is down; 0 = EAGAIN (default)");
 SYSCTL_UINT(_debug_qwz, OID_AUTO, monqmax, CTLFLAG_RW | CTLFLAG_LOCKED,
-    &qwz_monqmax, 0, "K1 W1: N > 0 = DATA and CONTROL frames from user space get ENOSPC once N frames are queued in the capture TX ring (management frames keep all 63 slots); 0 = off (default)");
+    &qwz_monqmax, 0, "K1 W1 / K2b: N > 0 (1..63) = DATA and CONTROL frames from user space get ENOSPC once N such frames are in flight in the capture TX ring (management frames are never counted and keep all 63 slots); 0 = off (default)");
 SYSCTL_INT(_debug_qwz, OID_AUTO, monparams, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_monparams, 0, "K1 W3: 1 = cell vdev MGMT_RATE OFDM 12 Mbit/s after vdev up, 2 = also MGMT_RETRY_LIMIT 3 and NON_AGG_SW_RETRY_TH 4; 0 = off (default); read when the cell starts");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, hwmode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, qwz_sysctl_hwmode, "I", "K2 H1: hardware mode id asked of the firmware at each start (single_pdev_only chips): 1 = DBS (default, the old request), 0 = SINGLE, 5 = DBS_OR_SBS, or any id the firmware offered; others EINVAL; a Wi-Fi off/on applies it");
 SYSCTL_INT(_debug_qwz, OID_AUTO, scanraw, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_scanraw, 0, "K1 W2c: 1 = log the non-zero 32-bit words of the scan request tail for the first three non-plain scan requests, 2 = also for the first three plain launched ones; 0 = off (default); may hold SSID text, redact before sharing");
 SYSCTL_PROC(_debug_qwz, OID_AUTO, monmac, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
@@ -814,6 +834,7 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_monnocred);
 	sysctl_register_oid(&sysctl__debug_qwz_monqmax);
 	sysctl_register_oid(&sysctl__debug_qwz_monparams);
+	sysctl_register_oid(&sysctl__debug_qwz_hwmode);
 	sysctl_register_oid(&sysctl__debug_qwz_scanraw);
 	sysctl_register_oid(&sysctl__debug_qwz_monbssid);
 	sysctl_register_oid(&sysctl__debug_qwz_montx);
@@ -857,6 +878,7 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_monnocred);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monqmax);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monparams);
+	sysctl_unregister_oid(&sysctl__debug_qwz_hwmode);
 	sysctl_unregister_oid(&sysctl__debug_qwz_scanraw);
 	sysctl_unregister_oid(&sysctl__debug_qwz_mon);
 	/* M0 (C32), in the reverse order of the registration */

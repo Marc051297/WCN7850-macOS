@@ -459,7 +459,7 @@ ItlQwz::attach(IOPCIDevice *device)
 	    ITLWM_VERSION, GIT_COMMIT, qwz_recover, qwz_silent, qwz_m0_on, qwz_dead_aware, qwz_mmio_guard, qwz_bme,
 	    qwz_softassert, qwz_awdlprobe, qwz_capsae, qwz_late_settle);
 	QWZLOG("S1: cap73=%d (debug.qwz.cap73; capability bit 73, byte 9 mask 0x02)", qwz_cap73);
-	QWZLOG("K1: monnocred=%d monqmax=%u monparams=%d scanraw=%d (debug.qwz.monnocred, monqmax, monparams, scanraw; W1 queue control, W3 cell rate and retry, W2c scan request raw words; W2a/W2b/W2c evidence logging is always on)", qwz_monnocred, qwz_monqmax, qwz_monparams, qwz_scanraw);
+	QWZLOG("K1: monnocred=%d monqmax=%u monparams=%d scanraw=%d hwmode=%d (monqmax=inflight-data-cap: K2b semantics, counts user data and control frames in flight, never management; debug.qwz.monnocred, monqmax, monparams, scanraw, hwmode; W1 queue control, W3 cell rate and retry, W2c scan request raw words, K2 hardware mode id asked of the firmware (also boot-arg qwzhwmode=N); W2a/W2b/W2c evidence logging is always on)", qwz_monnocred, qwz_monqmax, qwz_monparams, qwz_scanraw, qwz_hwmode);
 	/* M0 (C12): one PCI config snapshot now (device alive, config reads only), so the first wake never starts from none */
 	saveConfig();
 	qwz_log("qwz: pm: attach-time PCI snapshot taken (valid %d) id %08x cmd %04x\n", saved.valid, saved.id, saved.cmd);

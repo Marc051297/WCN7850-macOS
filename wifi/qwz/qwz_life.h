@@ -36,6 +36,11 @@ extern int qwz_cap73;
 extern int qwz_monnocred;
 extern unsigned int qwz_monqmax;
 extern int qwz_monparams;
+/* K2 (H1): debug.qwz.hwmode (and the qwzhwmode=N boot-arg), default 1 = WMI_HOST_HW_MODE_DBS = the build before K2: the hardware mode id asked of the firmware at each start when single_pdev_only. Accepted by the sysctl: 0, 1, 5 and any id in qwz_hwm_offered_mask (bit n = the firmware offered id n, n < 32, set from the extended service-ready event). Defined in qwz_sysctl.cpp */
+extern int qwz_hwmode;
+/* K2: boot-arg qwzhwmguard=1 makes qwz_wmi_tlv_hw_mode_caps skip offered hardware mode ids outside the 7-entry priority table (an out-of-bounds read otherwise); default 0 = the old code path exactly. Defined in qwz_sysctl.cpp */
+extern int qwz_hwm_guard;
+extern unsigned int qwz_hwm_offered_mask;
 /* K1 (W2c): debug.qwz.scanraw, default 0: 1 = log the non-zero words of the scan request tail for the first three non-plain scan requests, 2 = also for the first three plain launched ones. Defined in qwz_sysctl.cpp, read in airport/WCL/WCL.cpp */
 extern int qwz_scanraw;
 /* WP4 (M2a): lane M hardening (qwz_awdl.h), all default 0 = M0.1 behaviour. qwz_awdltx_eff is the rung in force: the configured qwz_awdltx, lowered at run time (three DISCARD or INSPECT completions in a row, or a DEAD with preset frames in flight) */

@@ -26,6 +26,9 @@
  *                         TX ring (management frames keep all 63 slots); default 0 = off (plain global, read at call time)
  *   debug.qwz.monparams   K1 (W3): 1 = MGMT_RATE OFDM 12 Mbit/s on the cell vdev right after it is up, 2 = also MGMT_RETRY_LIMIT 3 and
  *                         NON_AGG_SW_RETRY_TH 4; default 0; read when the cell starts
+ *   debug.qwz.hwmode      K2 (H1): the hardware mode id asked of the firmware at each start (single_pdev_only chips), default 1 = DBS = the build before K2;
+ *                         0 = SINGLE, 5 = DBS_OR_SBS or any id the firmware offered, others EINVAL; read at every firmware start (a Wi-Fi off/on applies
+ *                         it); the boot-arg qwzhwmode=N sets the value a boot starts with
  *   debug.qwz.scanraw     K1 (W2c): 1 = log the non-zero words of the scan request tail for the first three non-plain scan requests, 2 = also for the first
  *                         three plain launched ones; default 0; release builds too; the words may hold SSID text (plain global, read at call time)
  *   debug.qwz.recover     0 legacy crash handling, 1 armed, write 2 re-arms the engine

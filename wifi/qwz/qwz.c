@@ -10647,6 +10647,10 @@ qwz_wmi_tlv_hw_mode_caps(struct qwz_softc *sc, uint16_t len,
 		sc->hwm_modes[i].cfg_type = svc_rdy_ext->hw_mode_caps[i].hw_mode_config_type;
 		sc->hwm_nmodes = i + 1;
 	}
+	qwz_hwm_offered_mask = 0;	/* K2 (H1): the ids the firmware offers (the kept ones), for debug.qwz.hwmode */
+	for (i = 0; i < sc->hwm_nmodes; i++)
+		if (sc->hwm_modes[i].hw_mode_id < 32)
+			qwz_hwm_offered_mask |= 1u << sc->hwm_modes[i].hw_mode_id;
 
 	i = 0;
 	while (i < svc_rdy_ext->n_hw_mode_caps) {
@@ -10654,6 +10658,11 @@ qwz_wmi_tlv_hw_mode_caps(struct qwz_softc *sc, uint16_t len,
 		mode = (enum wmi_host_hw_mode_config_type)(hw_mode_caps->hw_mode_id);
 		pref = sc->wmi.preferred_hw_mode;
 
+		if (qwz_hwm_guard && ((unsigned int)mode >= nitems(qwz_hw_mode_pri_map) ||
+		    (unsigned int)pref >= nitems(qwz_hw_mode_pri_map))) {	/* K2 guard (off by default): an offered id outside the priority table is skipped instead of read past its end */
+			i++;
+			continue;
+		}
 		if (qwz_hw_mode_pri_map[mode] < qwz_hw_mode_pri_map[pref]) {
 			svc_rdy_ext->pref_hw_mode_caps = *hw_mode_caps;
 			sc->wmi.preferred_hw_mode = mode;
@@ -13041,7 +13050,7 @@ qwz_hwmode_resp_note(struct qwz_softc *sc, struct mbuf *m)
 	sc->hwm_resp_ntlv = 0;
 	sc->hwm_resp_have_ev = 0;
 	sc->hwm_resp_ev_tlen = 0;
-	sc->hwm_resp_w0 = sc->hwm_resp_w1 = sc->hwm_resp_w2 = 0;
+	sc->hwm_resp_w0 = sc->hwm_resp_w1 = sc->hwm_resp_w2 = sc->hwm_resp_w3 = 0;
 	sc->hwm_resp_nent = 0;
 	for (k = 0; k < nitems(sc->hwm_resp_raw); k++) {
 		uint32_t w = 0;
@@ -13070,6 +13079,8 @@ qwz_hwmode_resp_note(struct qwz_softc *sc, struct mbuf *m)
 				memcpy(&sc->hwm_resp_w1, body + 4, 4);
 			if (tlen >= 12)
 				memcpy(&sc->hwm_resp_w2, body + 8, 4);
+			if (tlen >= 16)
+				memcpy(&sc->hwm_resp_w3, body + 12, 4);
 			sc->hwm_resp_have_ev = 1;
 		} else if (tag == WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_VDEV_MAC_ENTRY && tlen >= 8 &&
 		    sc->hwm_resp_nent < nitems(sc->hwm_resp_ent)) {
@@ -13083,6 +13094,145 @@ qwz_hwmode_resp_note(struct qwz_softc *sc, struct mbuf *m)
 		else
 			p = body + tlen;
 	}
+}
+
+/*
+ * K2 (H1): the name of a hardware mode id, for log lines only.
+ */
+static const char *
+qwz_hwm_idname(uint32_t id)
+{
+	switch (id) {
+	case 0: return "SINGLE";
+	case 1: return "DBS";
+	case 2: return "SBS_PASSIVE";
+	case 3: return "SBS";
+	case 4: return "DBS_SBS";
+	case 5: return "DBS_OR_SBS";
+	default: return "?";
+	}
+}
+
+/*
+ * K2 (H1): the hardware mode id to ask for at this firmware start, read from
+ * debug.qwz.hwmode (default 1, DBS = what the driver always asked). 0, 1 and 5
+ * are taken as they are; any other id only when the firmware offered it (the
+ * boot-arg is not checked at parse time), else the default 1 is asked and the
+ * log says so. Logs the one 'asking' line per start; the sender substitutes the
+ * returned id once (sc->hwm_pick).
+ */
+static int
+qwz_hwmode_pick(struct qwz_softc *sc)
+{
+	char list[64];
+	unsigned int i, n = 0;
+	int want = qwz_hwmode, offered = 0;
+
+	list[0] = '\0';
+	for (i = 0; i < sc->hwm_nmodes; i++) {
+		if (sc->hwm_modes[i].hw_mode_id == (uint32_t)want)
+			offered = 1;
+		if (n + 12 < sizeof(list))
+			n += snprintf(list + n, sizeof(list) - n, "%s%u", i ? "," : "",
+			    (unsigned int)sc->hwm_modes[i].hw_mode_id);
+	}
+	if (!(want == 0 || want == 1 || want == 5 || offered)) {
+		qwz_log("qwz: hwmode: switch value %d is not an id the firmware offers [%s], asking id 1 (DBS) instead\n", want, list);
+		want = WMI_HOST_HW_MODE_DBS;
+	}
+	qwz_log("qwz: hwmode: asking id %d (%s) offered [%s]\n", want, qwz_hwm_idname((uint32_t)want), list);
+	sc->hwm_pick = want;
+	sc->hwm_pick_valid = 1;
+	return want;
+}
+
+/*
+ * K2 (H1, H2): the set-hw-mode response, status and configured index and the
+ * vdev-to-mac mapping entries, from a second bounds-checked walk (the K1 walk
+ * above keeps its own fields). Logs one line for the response and one per entry;
+ * allocates nothing and never fails: the caller goes on exactly as before.
+ */
+static void
+qwz_hwmode_map_note(struct qwz_softc *sc, struct mbuf *m)
+{
+	const uint8_t *p, *end, *ev_end = NULL;
+	uint32_t len, k;
+	char what[48];
+
+	sc->hwm_map_have_ev = 0;
+	sc->hwm_map_status = sc->hwm_map_index = sc->hwm_map_declared = sc->hwm_map_trailing = 0;
+	sc->hwm_map_pdev = sc->hwm_map_tlen = 0;
+	sc->hwm_map_w[0] = sc->hwm_map_w[1] = sc->hwm_map_w[2] = 0;
+	sc->hwm_map_n = 0;
+	if (m == NULL)
+		return;
+	p = mtod(m, const uint8_t *);
+	len = M_LEN(m) > 0 ? (uint32_t)M_LEN(m) : 0;
+	end = p + len;
+	while ((size_t)(end - p) >= sizeof(struct wmi_tlv)) {
+		uint32_t hdr, tlen, tag;
+		const uint8_t *body;
+
+		memcpy(&hdr, p, sizeof(hdr));
+		tag = FIELD_GET(WMI_TLV_TAG, hdr);
+		tlen = FIELD_GET(WMI_TLV_LEN, hdr);
+		body = p + sizeof(struct wmi_tlv);
+		if (tlen > (size_t)(end - body))
+			break;
+		if (tag == WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_EVENT && !sc->hwm_map_have_ev) {
+			sc->hwm_map_tlen = tlen;
+			if (tlen >= 16) {
+				/* 4-word layout (from memory of ath11k/ath12k, unverified): pdev_id, status, cfgd_hw_mode_index, num_vdev_mac_entries */
+				memcpy(&sc->hwm_map_pdev, body, 4);
+				memcpy(&sc->hwm_map_status, body + 4, 4);
+				memcpy(&sc->hwm_map_index, body + 8, 4);
+				memcpy(&sc->hwm_map_declared, body + 12, 4);
+			} else {
+				if (tlen >= 4)
+					memcpy(&sc->hwm_map_w[0], body, 4);
+				if (tlen >= 8)
+					memcpy(&sc->hwm_map_w[1], body + 4, 4);
+				if (tlen >= 12)
+					memcpy(&sc->hwm_map_w[2], body + 8, 4);
+			}
+			sc->hwm_map_have_ev = 1;
+			ev_end = body + tlen;
+		} else if (tag == WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_VDEV_MAC_ENTRY && tlen >= 8 &&
+		    sc->hwm_map_n < nitems(sc->hwm_map)) {
+			memcpy(&sc->hwm_map[sc->hwm_map_n].vdev_id, body, 4);
+			memcpy(&sc->hwm_map[sc->hwm_map_n].mac_id, body + 4, 4);
+			sc->hwm_map_n++;
+		}
+		if (tag == WMI_TAG_ARRAY_STRUCT)
+			p = body;
+		else
+			p = body + tlen;
+	}
+	sc->hwm_map_trailing = ev_end != NULL ? (uint32_t)(end - ev_end) : len;
+	if (!sc->hwm_map_have_ev) {
+		qwz_log("qwz: hwmode: response has no event TLV (len %u)\n", len);
+		return;
+	}
+	if (sc->hwm_map_tlen < 16) {
+		qwz_log("qwz: hwmode: response event body %u bytes: w0 %u w1 %u w2 %u (layout unverified, short body)\n",
+		    sc->hwm_map_tlen, sc->hwm_map_w[0], sc->hwm_map_w[1], sc->hwm_map_w[2]);
+		return;
+	}
+	what[0] = '\0';
+	for (k = 0; k < sc->hwm_nmodes; k++)
+		if (sc->hwm_modes[k].hw_mode_id == sc->hwm_map_index)
+			break;
+	if (k < sc->hwm_nmodes)
+		snprintf(what, sizeof(what), "id %u %s", sc->hwm_map_index, qwz_hwm_idname(sc->hwm_map_index));
+	else
+		snprintf(what, sizeof(what), "not an offered id");
+	qwz_log("qwz: hwmode: response (4-word layout pdev_id, status, cfgd_hw_mode_index, num_vdev_mac_entries; unverified, from memory): pdev %u status %u configured index %u (%s) entries %u\n",
+	    sc->hwm_map_pdev, sc->hwm_map_status, sc->hwm_map_index, what, sc->hwm_map_declared);
+	for (k = 0; k < sc->hwm_map_n; k++)
+		qwz_log("qwz: hwmode: map entry %u: vdev %u -> mac %u\n", k, sc->hwm_map[k].vdev_id, sc->hwm_map[k].mac_id);
+	if (sc->hwm_map_declared != sc->hwm_map_n)
+		qwz_log("qwz: hwmode: response declares %u entries, payload holds %u (%u bytes follow the event TLV)\n",
+		    sc->hwm_map_declared, (unsigned int)sc->hwm_map_n, sc->hwm_map_trailing);
 }
 
 void
@@ -13234,6 +13384,7 @@ qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 		break;
 	case WMI_PDEV_SET_HW_MODE_RESP_EVENTID:
 		qwz_hwmode_resp_note(sc, m);	/* K1 W2a: keep the payload for the dossier; changes nothing below */
+		qwz_hwmode_map_note(sc, m);	/* K2 (H1, H2): configured index, status and vdev-mac entries (log and dossier only) */
 		sc->wmi.hw_mode_ready = 1;
 		wakeup(&sc->wmi.hw_mode_ready);
 		break;
@@ -19332,7 +19483,12 @@ qwz_wmi_set_hw_mode(struct qwz_softc *sc,
 
 	cmd->pdev_id = WMI_PDEV_ID_SOC;
 	cmd->hw_mode_index = mode;
+	if (sc->hwm_pick_valid) {	/* K2 (H1): debug.qwz.hwmode, chosen by qwz_hwmode_pick at the call site; default 1 = the mode passed */
+		cmd->hw_mode_index = (uint32_t)sc->hwm_pick;
+		sc->hwm_pick_valid = 0;
+	}
 	sc->hwm_asked = (int)mode;	/* K1 W2a: the dossier prints which index the driver asked for */
+	sc->hwm_asked = (int)cmd->hw_mode_index;	/* K2 (H1): the index actually sent */
 	sc->hwm_asked_set = 1;
 
 	ret = qwz_wmi_cmd_send(&wmi->wmi[0], m, WMI_PDEV_SET_HW_MODE_CMDID);
@@ -20021,6 +20177,7 @@ qwz_core_start(struct qwz_softc *sc)
 	/* put hardware to DBS mode */
 	if (sc->hw_params.single_pdev_only) {
 		sc->wmi.hw_mode_ready = 0;
+		(void)qwz_hwmode_pick(sc);	/* K2 (H1): debug.qwz.hwmode, default 1 = DBS; the sender sends the picked id */
 		ret = qwz_wmi_set_hw_mode(sc, WMI_HOST_HW_MODE_DBS);
 		if (ret) {
 			printf("%s: failed to send dbs mode: %d\n",
