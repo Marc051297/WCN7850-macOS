@@ -68,6 +68,8 @@ int	qwz_init(struct ifnet *);
 /* ---- M1 transmit state ----------------------------------------------- */
 
 static void qwz_mon_sender_peer(struct qwz_softc *, const uint8_t *, int);
+static void qwz_mon_coex_quota_apply(struct qwz_softc *, int);	/* F2-3 */
+static void qwz_mon_coex_quota_clear(struct qwz_softc *);
 static int qwz_mon_parse_mac(const char *, uint8_t *);
 static struct qwz_softc *qwz_mon_sc;	/* the one softc; set by qwz_mon_attach() */
 
@@ -2189,6 +2191,8 @@ k5_coex_no_hold:
 			printf("qwz: mon: coex: filter 1 swapped: the station is deaf while the cell runs (diagnostic mode)\n");
 		QWZ_MON_COEX_SETUP_END(sc);
 	}
+	if (coex && qwz_moncoexmcc != 0 && qwz_moncoexquota > 0)	/* F2-3 */
+		qwz_mon_coex_quota_apply(sc, chan);
 	printf("qwz: mon: capturing\n");
 	return 0;
 
@@ -2234,6 +2238,107 @@ k5_coex_fail:
 	}
 }
 
+/*
+ * F2-3: the firmware's multi-channel scheduler. With an mcc cell the radio has two channels to serve, the station's and the
+ * cell's; left to its adaptive scheduler the firmware stays on the busy station channel and the cell on 149 hears nothing
+ * (f2b, 11-13: 0 % ping loss and zero frames heard). Qualcomm's own driver fixes the split with WMI_RESMGR_SET_CHAN_TIME_QUOTA
+ * (percent per channel, two channels) after disabling the adaptive scheduler (WMI_RESMGR_ADAPTIVE_OCS_EN_DIS). Layouts from
+ * fw-api wmi_unified.h: fixed parameters, then a byte-array TLV of {chan_mhz, channel_time_quota} entries.
+ */
+struct wmi_resmgr_adaptive_ocs_cmd { uint32_t tlv_header; uint32_t enable; uint32_t pdev_id; } __attribute__((packed));
+struct wmi_resmgr_chan_time_quota_cmd { uint32_t tlv_header; uint32_t num_chans; } __attribute__((packed));
+struct wmi_resmgr_chan_time_quota { uint32_t chan_mhz; uint32_t channel_time_quota; } __attribute__((packed));
+static int qwz_mon_quota_applied;
+
+static int
+qwz_mon_wmi_adaptive_ocs(struct qwz_softc *sc, int enable)
+{
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[sc->pdevs[0].pdev_id];
+	struct wmi_resmgr_adaptive_ocs_cmd *cmd;
+	struct mbuf *m;
+	int ret;
+
+	m = qwz_wmi_alloc_mbuf(sizeof(*cmd));
+	if (m == NULL)
+		return ENOMEM;
+	cmd = (struct wmi_resmgr_adaptive_ocs_cmd *)(mtod(m, uint8_t *) + sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr));
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_RESMGR_ADAPTIVE_OCS_ENABLE_DISABLE_CMD) |
+	    FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->enable = enable ? 1 : 0;
+	cmd->pdev_id = sc->pdevs[0].pdev_id;
+	ret = qwz_wmi_cmd_send(wmi, m, WMI_RESMGR_ADAPTIVE_OCS_EN_DIS_CMDID);
+	if (ret)
+		m_freem(m);
+	return ret;
+}
+
+static int
+qwz_mon_wmi_chan_quota(struct qwz_softc *sc, uint32_t freq1, uint32_t pct1, uint32_t freq2)
+{
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[sc->pdevs[0].pdev_id];
+	struct wmi_resmgr_chan_time_quota_cmd *cmd;
+	struct wmi_resmgr_chan_time_quota *q;
+	struct wmi_tlv *tlv;
+	struct mbuf *m;
+	const uint32_t qlen = 2 * sizeof(*q);
+	int ret;
+
+	m = qwz_wmi_alloc_mbuf(sizeof(*cmd) + TLV_HDR_SIZE + qlen);
+	if (m == NULL)
+		return ENOMEM;
+	cmd = (struct wmi_resmgr_chan_time_quota_cmd *)(mtod(m, uint8_t *) + sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr));
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_RESMGR_SET_CHAN_TIME_QUOTA_CMD) |
+	    FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->num_chans = 2;
+	tlv = (struct wmi_tlv *)((uint8_t *)cmd + sizeof(*cmd));
+	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_BYTE) | FIELD_PREP(WMI_TLV_LEN, qlen);
+	q = (struct wmi_resmgr_chan_time_quota *)tlv->value;
+	q[0].chan_mhz = freq1;
+	q[0].channel_time_quota = pct1;
+	q[1].chan_mhz = freq2;
+	q[1].channel_time_quota = 100 - pct1;
+	ret = qwz_wmi_cmd_send(wmi, m, WMI_RESMGR_SET_CHAN_TIME_QUOTA_CMDID);
+	if (ret)
+		m_freem(m);
+	return ret;
+}
+
+static void
+qwz_mon_coex_quota_apply(struct qwz_softc *sc, int chan)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	uint32_t cell_freq = qwz_mon_chan_freq(chan), sta_freq;
+	int pct = qwz_moncoexquota, r1, r2;
+
+	if (pct <= 0 || ic->ic_bss == NULL || ic->ic_bss->ni_chan == NULL || cell_freq == 0)
+		return;
+	if (pct < 5)
+		pct = 5;
+	if (pct > 95)
+		pct = 95;
+	sta_freq = ic->ic_bss->ni_chan->ic_freq;
+	if (!((sc->wmi.svc_map[WMI_TLV_SERVICE_ADAPTIVE_OCS / 8] >> (WMI_TLV_SERVICE_ADAPTIVE_OCS % 8)) & 1))
+		printf("qwz: mon: coex: quota: the firmware does not list the adaptive-OCS service (39); trying anyway\n");
+	r1 = qwz_mon_wmi_adaptive_ocs(sc, 0);
+	r2 = qwz_mon_wmi_chan_quota(sc, cell_freq, (uint32_t)pct, sta_freq);
+	qwz_mon_quota_applied = (r1 == 0 || r2 == 0);
+	printf("qwz: mon: coex: quota: adaptive scheduler off: %d; cell %u MHz %d %%, station %u MHz %d %%: %d\n",
+	    r1, (unsigned int)cell_freq, pct, (unsigned int)sta_freq, 100 - pct, r2);
+}
+
+static void
+qwz_mon_coex_quota_clear(struct qwz_softc *sc)
+{
+	int r;
+
+	if (!qwz_mon_quota_applied)
+		return;
+	qwz_mon_quota_applied = 0;
+	r = qwz_mon_wmi_adaptive_ocs(sc, 1);
+	printf("qwz: mon: coex: quota: adaptive scheduler back on: %d\n", r);
+}
+
+
 void
 qwz_mon_stop(struct qwz_softc *sc)
 {
@@ -2246,6 +2351,7 @@ qwz_mon_stop(struct qwz_softc *sc)
 	}
 	sc->mon_active = 0;
 	timeout_del(&sc->mon_cell_timer);
+	qwz_mon_coex_quota_clear(sc);	/* F2-3: the firmware's scheduler back to adaptive, while the firmware is up */
 	/*
 	 * Every cell leaves the firmware unable to serve the station: its own
 	 * frames went out but no replies reached the host any more, so no

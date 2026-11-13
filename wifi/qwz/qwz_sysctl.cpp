@@ -47,7 +47,8 @@ int qwz_rssisigned = 0, qwz_beaconmeta = 0, qwz_scanprobe = 0, qwz_rssisrc = 0, 
 int qwz_monreap = 0, qwz_hintfix = 1;	/* K2c: debug.qwz.monreap (0 = off = K2b, the stale-slot reaper and the live-slot guard of the capture TX ring), debug.qwz.hintfix (1 = the scan-start hint-BSSID copy goes the right way, 0 = the old swapped copy); see qwz_life.h */
 int qwz_monfmt = 0;		/* K4 (M1): debug.qwz.monfmt, see qwz_life.h */
 /* K5 (L1-C1): debug.qwz.moncoex and its sub-switches, see qwz_mon.h; moncoex 0 = K4 exactly; scan and cred default to 1 and only act while a coex cell runs */
-int qwz_moncoexmcc = 0;	/* F2-2: the coex cell on its own channel beside the station (the firmware's MCC scheduler); 0 = K5 rule (same channel only) */
+int qwz_moncoexmcc = 0;
+int qwz_moncoexquota = 0;	/* F2-3: percent of radio time the firmware's scheduler gives the cell's channel while an mcc cell runs (0 = leave the firmware's adaptive scheduler alone); read at cell start */	/* F2-2: the coex cell on its own channel beside the station (the firmware's MCC scheduler); 0 = K5 rule (same channel only) */
 int qwz_moncoex = 0, qwz_moncoexmode = 0, qwz_moncoexpassive = 0, qwz_moncoexfilter = 0, qwz_moncoexscan = 1, qwz_moncoexcred = 1, qwz_moncoexfw = 0, qwz_moncoexnss = 0, qwz_moncoexjoin = 0;
 int qwz_moncoexwbm = 1;	/* K6 (K6-1): debug.qwz.moncoexwbm, see qwz_mon.h; no effect unless a coex cell runs (moncoex defaults to 0) */
 int qwz_awdlcell = 0;	/* K5 (K5-00 banner, L2-C2): debug.qwz.awdlcell, see qwz_mon.h; no consumer yet (the receive-only tee is not built), the value is only reported in the K5 banner */
@@ -721,6 +722,8 @@ SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexmode, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_moncoexmode, 0, "K5 L1-C1: coex cell vdev-start channel: 0 = clone the station's chandef (default), 1 = HT20 on the station's primary channel (the K4 cell's parameters); read when the cell starts");
 SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexmcc, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_moncoexmcc, 0, "F2-2: 1 = a coex cell may start on 6, 44 or 149 while the station is on another channel (HT20 on that channel, the firmware time-shares as it does for STA+AP); 0 = the cell runs only on the station's channel (K5)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexquota, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexquota, 0, "F2-3: with moncoexmcc, the percent of radio time for the cell's channel (5..95; 0 = adaptive scheduler untouched). Applied when the cell starts (WMI_RESMGR_SET_CHAN_TIME_QUOTA after disabling the adaptive scheduler), undone at cell stop");
 SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexpassive, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_moncoexpassive, 0, "K5 L1-C1: coex cell vdev-start passive flag: 0 = the K4 cell's rule (default), 1 = copy the station vdev's passive flag; read when the cell starts");
 SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexfilter, CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -910,6 +913,7 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_moncoex);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexmode);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexmcc);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexquota);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexpassive);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexfilter);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexwbm);
@@ -976,6 +980,7 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoex);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexmode);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexmcc);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexquota);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexpassive);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexfilter);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexwbm);

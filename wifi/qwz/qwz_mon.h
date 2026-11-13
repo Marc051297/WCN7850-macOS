@@ -103,6 +103,8 @@ extern int qwz_moncoex, qwz_moncoexmode, qwz_moncoexpassive, qwz_moncoexfilter, 
 extern int qwz_moncoexwbm;
 /* F2-2: debug.qwz.moncoexmcc, default 0: the coex cell on its own channel (6, 44 or 149) beside a station on another channel; read at cell start and by the probe. */
 extern int qwz_moncoexmcc;
+/* F2-3: debug.qwz.moncoexquota, default 0: percent of radio time for the cell's channel while an mcc cell runs (firmware channel time quota). */
+extern int qwz_moncoexquota;
 /* K5 (L2-C2): debug.qwz.awdlcell, default 0; nothing reads it yet (the receive-only tee is not built), the K5 banner reports it */
 extern int qwz_awdlcell;
 /*
