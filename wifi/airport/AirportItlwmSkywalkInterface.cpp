@@ -1409,6 +1409,8 @@ setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
                 instance->fAWDLInterface->release();
                 instance->fAWDLInterface = nullptr;
             }
+            else
+                instance->awdlNativeRadioStart();	/* F2-1: connect the cell to the peer manager */
         }
         qwz_log("airport: awdl0: native create: attached %d result 0x%x\n", attached, result);
         qwz_log_publish();

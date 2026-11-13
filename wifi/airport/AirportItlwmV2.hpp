@@ -419,6 +419,23 @@ public:
     bool awdlManagementInputEnabled;
     UInt32 awdlManagementActive;
     UInt32 awdlCreateRequests;
+    /* F2-1 (native AWDL radio glue, airport/awdlnative/QwzAWDLRadio.cpp): the cell is the radio; a gated timer sends. */
+    void awdlNativeRadioStart();
+    void awdlNativeRadioStop();
+    static void awdlNativeRadioRx(void *arg, const uint8_t *frame, size_t len, uint16_t flags, uint8_t chan, int8_t rssi);
+    void awdlNativeRadioInput(const uint8_t *frame, size_t len, uint16_t flags, uint8_t chan, int8_t rssi);
+    static void awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *sender);
+    IOTimerEventSource *awdlNativeTimer;
+    uint8_t *awdlNativeScratch;
+    uint64_t awdlNativeLastSyncUS, awdlNativeLastDataUS, awdlNativeLastPublishUS;
+    int awdlNativeRssiFallback;		/* itlawdlrssi=N (dBm) stands in when the capture path has no RSSI; default -60 */
+    struct {
+        uint64_t timerTicks, cellTimerTicks;
+        uint64_t rxAction, rxActionHanded, rxActionRefused, rxActionTrimmed, rxActionTooLong;
+        uint64_t rxData, rxDataHanded, rxDataTooLong, rxNotInGate, rxNoMbuf, rssiFallbacks;
+        uint64_t syncSent, syncBuildFailures, syncTxErrors, dataSent, dataTxErrors, queued;
+        uint32_t rxActionLastError, syncLastBuild, syncLastTxError, dataLastTxError;
+    } awdlNativeStats;
     static int awdlSysctl(void *arg, int value);
     static IOReturn awdlLinkGated(OSObject *target, void *arg0, void *, void *, void *);
     /* AWDL action frames from qwz (ItlQwz::setAwdlRx) into the AWDL engine, while awdl0's link is up. */

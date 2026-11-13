@@ -2,24 +2,260 @@
 //  QwzAWDLRadio.cpp
 //  AirportWCN7850
 //
-//  The radio side of the native AWDL port, slice F1: only the three policy answers the Apple half asks the radio for.
-//  On Intel these live in ItlIwx.cpp beside the listener context; here they will read the WCN7850 lane's state in F2
-//  (docs/forbiddenitlwm-port-map-2026-11-13.md, R1-R7). Until then: channel 149, 20 MHz class, one stream.
+//  The radio side of the native AWDL port, slice F2-1 (docs/forbiddenitlwm-port-map-2026-11-13.md, R1-R7). The radio is
+//  the K5/K6 cell beside the station (qwz/qwz_mon.c, debug.qwz.moncoex=1, debug.qwz.mon=<the station's channel>); this
+//  file only connects it to the Apple half (QwzAWDLController.cpp):
+//    receive:  every frame the capture path sees (qwz_mon_set_native_rx) is classified here, in the gate: AWDL action
+//              frames go to the peer manager through receiveAWDLActionFrame (channel and RSSI attached), AWDL data frames
+//              to awdl0 through observeAWDLDataFrame;
+//    transmit: a timer on the controller's work loop (the gate) sends our sync frame (buildAWDLSyncProbe: Apple's MI or
+//              a PSF) every 45 ms idle / 100 ms while data moves, pumps awdl0's packets (buildAWDLTransmit) through the
+//              cell while it has room, and completes them (serviceAWDLTransmit). Every 2 ms while data moves, else 20 ms.
+//  Nothing here starts or stops the cell; with no cell the timer idles and frames are not sent. What Intel's listener
+//  context does on its own (promiscuous RX, a station per peer, aggregation) is the cell's business (K6 WBM tap, TDLS
+//  peers) and later slices.
 //
 //  Copyright (c) 2026. GPL-2.0-or-later (see LICENSE).
 //
-#include <ItlAWDLTargets.hpp>
-#include <stdint.h>
-#include <pexpert/pexpert.h>
+#include "AirportItlwmV2.hpp"
+#if defined(ITL_AWDL_NATIVE)
+#include "QwzAWDLInterface.hpp"
+#include <AWDLFrameParser.hpp>
+#include <AWDLProbePolicy.hpp>
+#include "qwz_mon.h"
+#include "qwz_log.h"
+#include <sys/mbuf.h>
 
-/* The channel our sync frames name and the data path uses. F2: the station's channel in same-channel mode. */
+extern IO80211WorkQueue *_fWorkloop;
+
+/* The channel our sync frames name: the cell's while it runs, else 149 (the frames are not sent then anyway). */
 unsigned itlAWDLFixedChannel()
 {
-	return 149;
+	const int cell = qwz_mon_status();
+	return cell > 0 ? unsigned(cell) : 149;
 }
 
-/* 128 = "80 MHz on 149" in our channel-sequence TLV (as the phone's), 0 = 20 MHz. F2: the lane's real width. */
+/* 128 would claim 80 MHz on 149; the cell is HT20, so 0. */
 unsigned itlAWDLChannelClass()
 {
 	return 0;
 }
+
+namespace {
+constexpr uint64_t kDataActiveUS = 1000000;		/* data moved in the last second: fast pacing */
+constexpr uint64_t kSyncDataIntervalUS = 100000;	/* sync frame every 100 ms while data moves */
+constexpr unsigned kPumpBudget = 16;			/* awdl0 packets per tick at most */
+constexpr unsigned kScratchBytes = 2400 + 4;		/* QWZ_MONTX_MAXFRAME plus the four bytes the hand-off expects */
+
+uint64_t nowUS()
+{
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000;
+}
+}
+
+void AirportItlwm::awdlNativeRadioStart()
+{
+	int value = 0;
+
+	if (awdlNativeTimer != nullptr)
+		return;
+	awdlNativeRssiFallback = -60;
+	if (PE_parse_boot_argn("itlawdlrssi", &value, sizeof(value)) && value <= -20 && value >= -95)
+		awdlNativeRssiFallback = value;
+	memset(&awdlNativeStats, 0, sizeof(awdlNativeStats));
+	awdlNativeLastSyncUS = awdlNativeLastDataUS = awdlNativeLastPublishUS = 0;
+	if (awdlNativeScratch == nullptr)
+		awdlNativeScratch = static_cast<uint8_t *>(IOMalloc(kScratchBytes));
+	awdlNativeTimer = IOTimerEventSource::timerEventSource(this, awdlNativeTimerFired);
+	if (awdlNativeTimer == nullptr || getWorkLoop()->addEventSource(awdlNativeTimer) != kIOReturnSuccess) {
+		OSSafeReleaseNULL(awdlNativeTimer);
+		qwz_log("airport: awdl0: native radio: no timer; nothing will be sent\n");
+		qwz_log_publish();
+		return;
+	}
+	qwz_mon_set_native_rx(awdlNativeRadioRx, this);
+	awdlNativeTimer->setTimeoutMS(50);
+	setProperty("QwzAWDLRadio", "started");
+	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
+	qwz_log_publish();
+}
+
+void AirportItlwm::awdlNativeRadioStop()
+{
+	qwz_mon_set_native_rx(nullptr, nullptr);
+	if (awdlNativeTimer != nullptr) {
+		awdlNativeTimer->cancelTimeout();
+		getWorkLoop()->removeEventSource(awdlNativeTimer);
+		OSSafeReleaseNULL(awdlNativeTimer);
+	}
+	if (awdlNativeScratch != nullptr) {
+		IOFree(awdlNativeScratch, kScratchBytes);
+		awdlNativeScratch = nullptr;
+	}
+	setProperty("QwzAWDLRadio", "stopped");
+}
+
+/* The capture path's second consumer (qwz_mon.h): the gate is held by every emitter, which the hand-offs require. */
+void AirportItlwm::awdlNativeRadioRx(void *arg, const uint8_t *frame, size_t len, uint16_t flags, uint8_t chan, int8_t rssi)
+{
+	static_cast<AirportItlwm *>(arg)->awdlNativeRadioInput(frame, len, flags, chan, rssi);
+}
+
+void AirportItlwm::awdlNativeRadioInput(const uint8_t *frame, size_t len, uint16_t flags, uint8_t chan, int8_t rssi)
+{
+	auto &st = awdlNativeStats;
+
+	if (frame == nullptr || len < 24 || !awdlInterfaceTest || fAWDLInterface == nullptr || !awdlManagementInputEnabled)
+		return;
+	if (_fWorkloop == nullptr || !_fWorkloop->inGate()) {
+		++st.rxNotInGate;
+		return;
+	}
+	const bool fcs = (flags & QWZ_MONCAP_F_FCS) != 0;
+	const size_t body = fcs && len >= 28 ? len - 4 : len;
+	const uint8_t type = (frame[0] >> 2) & 3;
+	if (type == 0) {
+		if (frame[0] != 0xd0)	/* only action frames go to the peer manager */
+			return;
+		++st.rxAction;
+		size_t frameLength = fcs ? body : ItlAWDL::trimZeroPadding(frame, body);
+		if (frameLength != body)
+			++st.rxActionTrimmed;
+		if (rssi == 0) {
+			rssi = int8_t(awdlNativeRssiFallback);
+			++st.rssiFallbacks;
+		}
+		if (frameLength + 4 > 2048) {
+			++st.rxActionTooLong;
+			return;
+		}
+		mbuf_t m = nullptr;
+		if (mbuf_getpacket(MBUF_DONTWAIT, &m) || m == nullptr) {
+			++st.rxNoMbuf;
+			return;
+		}
+		if (mbuf_maxlen(m) < frameLength + 4) {
+			mbuf_freem(m);
+			++st.rxActionTooLong;
+			return;
+		}
+		memcpy(mbuf_data(m), frame, frameLength);
+		memset(static_cast<uint8_t *>(mbuf_data(m)) + frameLength, 0, 4);
+		mbuf_setlen(m, frameLength + 4);
+		mbuf_pkthdr_setlen(m, frameLength + 4);
+		const IOReturn r = receiveAWDLActionFrame(m, frameLength, chan, rssi);
+		mbuf_freem(m);
+		if (r == kIOReturnSuccess)
+			++st.rxActionHanded;
+		else {
+			++st.rxActionRefused;
+			st.rxActionLastError = uint32_t(r);
+		}
+		return;
+	}
+	if (type == 2) {
+		++st.rxData;
+		const uint8_t *buf = frame;
+		size_t n = len;
+		if (!fcs) {	/* the hand-off parses with the FCS included: give it four bytes */
+			if (awdlNativeScratch == nullptr || len + 4 > kScratchBytes) {
+				++st.rxDataTooLong;
+				return;
+			}
+			memcpy(awdlNativeScratch, frame, len);
+			memset(awdlNativeScratch + len, 0, 4);
+			buf = awdlNativeScratch;
+			n = len + 4;
+		}
+		observeAWDLDataFrame(buf, n);
+		++st.rxDataHanded;
+		awdlNativeLastDataUS = nowUS();
+	}
+}
+
+void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
+{
+	auto *self = OSDynamicCast(AirportItlwm, owner);
+	if (self == nullptr || self->awdlNativeTimer == nullptr)
+		return;
+	auto &st = self->awdlNativeStats;
+	++st.timerTicks;
+	const bool ready = self->awdlInterfaceTest && self->fAWDLInterface != nullptr && self->awdlManagementInputEnabled;
+	const int cell = ready ? qwz_mon_status() : 0;
+	const uint64_t now = nowUS();
+	bool pending = false;
+	if (cell > 0) {
+		st.cellTimerTicks++;
+		const bool dataActive = self->awdlNativeLastDataUS != 0 && now - self->awdlNativeLastDataUS < kDataActiveUS;
+		const uint64_t sinceSync = now - self->awdlNativeLastSyncUS;
+		if (self->awdlNativeLastSyncUS == 0 || sinceSync >= (dataActive ? kSyncDataIntervalUS : ItlAWDL::kSyncIdleIntervalUS)) {
+			mbuf_t m = nullptr;
+			const IOReturn built = self->buildAWDLSyncProbe(&m, now);
+			if (built == kIOReturnSuccess && m != nullptr) {
+				const int err = qwz_mon_tx_raw(static_cast<const uint8_t *>(mbuf_data(m)), mbuf_len(m));
+				if (err == 0) {
+					++st.syncSent;
+					self->awdlNativeLastSyncUS = now;
+				} else {
+					++st.syncTxErrors;
+					st.syncLastTxError = uint32_t(err);
+				}
+			} else {
+				++st.syncBuildFailures;
+				st.syncLastBuild = uint32_t(built);
+			}
+			if (m != nullptr)
+				mbuf_freem(m);
+		}
+		unsigned budget = kPumpBudget;
+		int room = qwz_mon_tx_room();
+		while (budget > 0 && room > 0) {
+			mbuf_t m = nullptr;
+			if (self->buildAWDLTransmit(&m) != kIOReturnSuccess || m == nullptr)
+				break;
+			const int err = qwz_mon_tx_raw(static_cast<const uint8_t *>(mbuf_data(m)), mbuf_len(m));
+			mbuf_freem(m);
+			--budget;
+			--room;
+			if (err == 0) {
+				++st.dataSent;
+				self->awdlNativeLastDataUS = now;
+			} else {
+				++st.dataTxErrors;
+				st.dataLastTxError = uint32_t(err);
+				if (err == ENOSPC || err == EAGAIN)
+					break;
+			}
+		}
+		pending = self->serviceAWDLTransmit();
+		st.queued = self->queuedAWDLTransmit();
+	}
+	if (now - self->awdlNativeLastPublishUS >= 1000000) {
+		self->awdlNativeLastPublishUS = now;
+		OSDictionary *d = OSDictionary::withCapacity(24);
+		if (d != nullptr) {
+			auto put = [d](const char *k, uint64_t v) {
+				if (OSNumber *n = OSNumber::withNumber(v, 64)) { d->setObject(k, n); n->release(); }
+			};
+			put("cell", uint64_t(cell)); put("ticks", st.timerTicks); put("cellTicks", st.cellTimerTicks);
+			put("rxAction", st.rxAction); put("rxActionHanded", st.rxActionHanded); put("rxActionRefused", st.rxActionRefused);
+			put("rxActionLastError", st.rxActionLastError); put("rxActionTrimmed", st.rxActionTrimmed); put("rxActionTooLong", st.rxActionTooLong);
+			put("rxData", st.rxData); put("rxDataHanded", st.rxDataHanded); put("rxDataTooLong", st.rxDataTooLong);
+			put("rxNotInGate", st.rxNotInGate); put("rxNoMbuf", st.rxNoMbuf); put("rssiFallbacks", st.rssiFallbacks);
+			put("syncSent", st.syncSent); put("syncBuildFailures", st.syncBuildFailures); put("syncLastBuild", st.syncLastBuild);
+			put("syncTxErrors", st.syncTxErrors); put("syncLastTxError", st.syncLastTxError);
+			put("dataSent", st.dataSent); put("dataTxErrors", st.dataTxErrors); put("dataLastTxError", st.dataLastTxError);
+			put("queued", st.queued);
+			self->setProperty("QwzAWDLRadioStats", d);
+			d->release();
+		}
+	}
+	const bool dataActive = self->awdlNativeLastDataUS != 0 && now - self->awdlNativeLastDataUS < kDataActiveUS;
+	self->awdlNativeTimer->setTimeoutMS(cell <= 0 ? 200 : (dataActive || pending) ? 2 : 20);
+}
+#else
+unsigned itlAWDLFixedChannel() { return 149; }
+unsigned itlAWDLChannelClass() { return 0; }
+#endif /* ITL_AWDL_NATIVE */

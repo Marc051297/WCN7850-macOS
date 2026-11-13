@@ -205,6 +205,8 @@ bool AirportItlwm::init(OSDictionary *properties)
         awdlCreateRequests = 0;
         awdlManagementInputEnabled = false;
         awdlManagementActive = 0;
+        awdlNativeTimer = nullptr;
+        awdlNativeScratch = nullptr;
         setProperty("ItlwmAWDLInterfaceBuild", QWZ_AWDL_NATIVE_BUILD);
         setProperty("ItlwmAWDLInterfaceTestEnabled", awdlInterfaceTest ? kOSBooleanTrue : kOSBooleanFalse);
     }

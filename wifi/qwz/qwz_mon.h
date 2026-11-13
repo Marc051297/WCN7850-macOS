@@ -147,6 +147,18 @@ int	qwz_mon_awdlif(const char *cmd);
  * (the firmware's filter-pass class), and the flags above build on it. Empty: own MAC. */
 extern char qwz_mon_bssid_str[32];	/* room for the terminator sysctl(8) sends */
 
+/*
+ * F2 (native AWDL, docs/forbiddenitlwm-port-map-2026-11-13.md): a second consumer of every captured frame. Called from the
+ * capture emitters in their own context (the command-gate work loop: WMI events, the REO and WBM taps, the cell's ring
+ * timer), before the frame goes to the userspace ring, with the record's flags (QWZ_MONCAP_F_FCS: the FCS is included),
+ * channel and RSSI (0 when the path has none). NULL unregisters. Plain stores; the consumer must be cheap and never sleep.
+ */
+typedef void (*qwz_mon_native_rx_fn)(void *arg, const uint8_t *frame, size_t len, uint16_t flags, uint8_t chan, int8_t rssi);
+void	qwz_mon_set_native_rx(qwz_mon_native_rx_fn fn, void *arg);
+/* F2: free transmit slots on the cell for data frames right now (0 when no cell, the firmware is unavailable or TX is blocked). */
+int	qwz_mon_tx_room(void);
+/* F2: send one 802.11 frame (no FCS) from the cell, the gate held by the caller; errno (ENOSPC: no slot, try later). */
+int	qwz_mon_tx_raw(const uint8_t *frame, size_t len);
 /* qwz_attach(): allocates the capture ring and remembers the softc. */
 void	qwz_mon_attach(struct qwz_softc *);
 /* ItlQwz::detachGated (merge glue F): ends a cell host-only, frees the capture buffers, the lock and the 64 maps, forgets the softc. */

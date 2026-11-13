@@ -808,6 +808,52 @@ qwz_mon_txframe_gated(OSObject *, void *arg0, void *arg1, void *arg2, void *)
 	return kIOReturnSuccess;
 }
 
+/* F2 (native AWDL): free slots for data frames on the cell, the same limits qwz_mon_tx_bytes applies (ring reservation, monqmax). */
+int
+qwz_mon_tx_room(void)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	struct qwz_vif *vif;
+	int room, qroom;
+
+	if (sc == NULL || !sc->mon_active || sc->mon_coex_halt || qwz_mon_fw_unavail(sc) || qwz_mon_tx_blocked(sc))
+		return 0;
+	vif = &sc->sc_monvif;
+	if (!vif->is_up || !qwz_mon_have_maps(sc))
+		return 0;
+	room = (int)nitems(vif->txmgmt.data) - 1 - (sc->mon_coex ? QWZ_MON_COEX_STA_SLOTS : 0) - vif->txmgmt.queued;
+	if (qwz_monqmax != 0) {
+		qroom = (int)(qwz_monqmax > 63U ? 63U : qwz_monqmax) - (int)sc->mon_stats.ufr_inflight;
+		if (qroom < room)
+			room = qroom;
+	}
+	return room > 0 ? room : 0;
+}
+
+/* F2 (native AWDL): one frame from the cell, no per-frame header, the gate held by the caller. */
+int
+qwz_mon_tx_raw(const uint8_t *frame, size_t len)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	uint8_t type, kind;
+	int ret;
+
+	if (sc == NULL)
+		return ENXIO;
+	if (len < 10)
+		return EINVAL;
+	type = (frame[0] >> 2) & 3;
+	kind = type == 0 ? 1 : type == 2 ? 2 : 3;
+	ret = qwz_mon_tx_bytes(sc, frame, len, kind);
+	if (ret == 0)
+		sc->mon_stats.ufr_sent++;
+	else if (ret == ENOSPC)
+		sc->mon_stats.ufr_full++;
+	else
+		sc->mon_stats.ufr_fail++;
+	return ret;
+}
+
 int
 qwz_mon_tx_frame(const void *buf, size_t len)
 {
@@ -1028,17 +1074,31 @@ moncap_free(void)
 	return (moncap_tail + QWZ_MONCAP_SIZE - moncap_head - 1) % QWZ_MONCAP_SIZE;
 }
 
+/* F2 (native AWDL): the second consumer of every captured frame (qwz_mon.h). */
+static qwz_mon_native_rx_fn qwz_mon_native_rx;
+static void *qwz_mon_native_rx_arg;
+
+void
+qwz_mon_set_native_rx(qwz_mon_native_rx_fn fn, void *arg)
+{
+	__atomic_store_n(&qwz_mon_native_rx_arg, arg, __ATOMIC_RELEASE);
+	__atomic_store_n(&qwz_mon_native_rx, fn, __ATOMIC_RELEASE);
+}
+
 static void
 moncap_put(const uint8_t *frame, size_t len, uint16_t flags, uint8_t decap,
     uint8_t chan, int8_t rssi, uint8_t rate)
 {
 	struct qwz_moncap_hdr hdr;
 	size_t rec = sizeof(hdr) + ((len + 3) & ~(size_t)3), need = rec;
+	qwz_mon_native_rx_fn native = __atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE);
 
 	if (qwz_mon_sc != NULL) {	/* K1 W2b: bytes received through the cell (every frame that reaches the capture path) */
 		qwz_mon_sc->mon_lat.rx_bytes += len;
 		qwz_mon_sc->mon_lat.rx_frames++;
 	}
+	if (native != NULL)	/* F2: the native AWDL path sees the frame first; the userspace ring is unaffected */
+		native(__atomic_load_n(&qwz_mon_native_rx_arg, __ATOMIC_ACQUIRE), frame, len, flags, chan, rssi);
 	if (moncap_ring == NULL)
 		return;
 	IOLockLock(moncap_lock);

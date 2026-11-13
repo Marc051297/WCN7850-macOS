@@ -348,6 +348,7 @@ IOReturn itlAWDLBuildSyncProbe(IOEthernetController *owner, mbuf_t *packet, uint
 
 void AirportItlwm::teardownAWDLInterface()
 {
+    awdlNativeRadioStop();	/* F2-1: no more hand-offs or sends before the interface goes */
     if (fAWDLInterface) {
         // terminate() needs the live native controller context and invokes our
         // stop() while dismantling the published service. Do not stop it first.
