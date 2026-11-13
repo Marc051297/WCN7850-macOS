@@ -1824,8 +1824,9 @@ qwz_mon_vdev_start(struct qwz_softc *sc, int chan, uint32_t freq)
 	 */
 	if (QWZ_MON_COEX_ON(sc) && ic->ic_bss != NULL && ic->ic_bss->ni_chan != NULL) {
 		struct ieee80211_node *bn = ic->ic_bss;
+		const int mcc = qwz_moncoexmcc != 0 && ieee80211_chan2ieee(ic, bn->ni_chan) != chan;	/* F2-2: another channel: the HT20 block above, never the station's chandef */
 
-		if (qwz_moncoexmode == 0) {
+		if (qwz_moncoexmode == 0 && !mcc) {
 			qwz_mac_vdev_chan_args(sc, bn, &arg);
 			arg.channel.min_power = 0;
 			arg.channel.max_power = 20;
@@ -2022,11 +2023,13 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 			return EBUSY;
 		}
 		stachan = ieee80211_chan2ieee(cic, cic->ic_bss->ni_chan);
-		if (stachan != chan || !(chan == 6 || chan == 44 || chan == 149) || (chan >= 52 && chan <= 144)) {
-			printf("qwz: mon: coex: refused: the station is on channel %d, the cell asked for %d (the cell runs only on the station's channel, 6, 44 or 149, never 52 to 144)\n",
+		if ((stachan != chan && !qwz_moncoexmcc) || !(chan == 6 || chan == 44 || chan == 149) || (chan >= 52 && chan <= 144)) {
+			printf("qwz: mon: coex: refused: the station is on channel %d, the cell asked for %d (the cell runs only on the station's channel, 6, 44 or 149, never 52 to 144; debug.qwz.moncoexmcc=1 allows another channel)\n",
 			    stachan, chan);
 			return EBUSY;
 		}
+		if (stachan != chan)	/* F2-2: two channels, the firmware's scheduler shares the radio (as STA+AP on Android) */
+			printf("qwz: mon: coex: mcc: the station stays on channel %d, the cell starts on %d (HT20)\n", stachan, chan);
 		if (qwz_mon_flags & QWZ_MON_F_DELETE_STA) {
 			printf("qwz: mon: coex: refused: monflags has DELETE_STA, which deletes the station vdev (clear 0x20 first)\n");
 			return EBUSY;
@@ -2666,7 +2669,7 @@ qwz_mon_coex_probe(struct qwz_softc *sc)
 		if (sc->mon_coex_halt || sc->mon_coex_task_why != 0)
 			return;
 		if (ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL || ic->ic_bss->ni_chan == NULL ||
-		    ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan) != sc->mon_chan) {
+		    (qwz_moncoexmcc == 0 && ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan) != sc->mon_chan)) {	/* F2-2: with mcc the channels differ by design */
 			printf("qwz: mon: coex: the station left RUN or changed channel (state %d): stopping the cell\n", (int)ic->ic_state);
 			__atomic_fetch_or(&sc->mon_coex_task_why, 1, __ATOMIC_ACQ_REL);
 			task_add(systq, &sc->mon_coex_task);
