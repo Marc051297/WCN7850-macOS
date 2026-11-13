@@ -1,0 +1,13 @@
+Files in this directory, include/AWDL*.hpp, include/ItlAWDLTargets.hpp,
+include/Airport/macOS26/{IOSkywalkQueueFactories,IOSkywalkPacketView,IO80211ManagementBuffer}.h,
+tests/awdl_*.cpp and tools/abi/{audit_vtable.py,native-vtables.json} were copied on 2026-11-13 from
+retropineaple/ForbiddenItlwm, commit 59ff7bf (2026-11-12), GPL-2.0 (same licence as this tree),
+and are being adapted for the WCN7850 (docs/forbiddenitlwm-port-map-2026-11-13.md). Their copyright
+notices are kept; changes are marked "WCN7850:" in the files.
+
+F1 (2026-11-13): AirportAWDLInterface.hpp became QwzAWDLInterface.hpp (class renamed QwzAWDLInterface);
+QwzAWDLInterface.cpp = ForbiddenItlwm/AirportItlwmV2.cpp lines 53-908 (the class's methods) and
+QwzAWDLController.cpp = lines 911-1239 (the controller's AWDL methods and the itlAWDL* boundary functions),
+both renamed and otherwise unchanged; QwzAWDLRadio.cpp is ours (the radio-side answers, stubs in F1).
+Boot-args keep ForbiddenItlwm's names (-itlawdl*) so the two trees stay comparable; the one new switch is
+-qwzawdlnative, which replaces -itlawdliface as the master switch.

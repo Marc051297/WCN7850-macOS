@@ -38,6 +38,8 @@
 /* awdl0's class is in the AWDL kext (AirportWCN7850AWDLBridge.h); this kext only calls Apple's base. */
 #include "macOS26/IO80211VirtualInterface.h"
 #include "AirportWCN7850AWDLBridge.h"
+/* F1 (native AWDL): defines ITL_AWDL_NATIVE for Tahoe WCL builds (from ForbiddenItlwm). */
+#include <ItlAWDLTargets.hpp>
 
 enum
 {
@@ -395,6 +397,28 @@ public:
      * on request, never torn down before a reboot.
      */
     int awdlCreate();
+    /*
+     * F1 (native AWDL, docs/forbiddenitlwm-port-map-2026-11-13.md): Apple's AWDL engine on a QwzAWDLInterface inside
+     * this kext, with real Skywalk pools and queues, behind -qwzawdlnative. Ported from ForbiddenItlwm
+     * (airport/awdlnative/QwzAWDLController.cpp). Mutually exclusive with awdlCreate() above.
+     */
+    IO80211VirtualInterface *awdlNativeCreateVirtualInterface(ether_addr *ether, UInt role);
+    IOReturn receiveAWDLActionFrame(mbuf_t, size_t, uint32_t, int32_t);
+    void observeAWDLDataFrame(const uint8_t*, size_t);
+    IOReturn buildAWDLSyncProbe(mbuf_t*, uint64_t);
+    IOReturn buildAWDLTransmit(mbuf_t*, const uint8_t *holdPayloadFor = nullptr, bool holdEverySize = false);
+    bool serviceAWDLTransmit();
+    unsigned queuedAWDLTransmit();
+    unsigned heldShortAWDLTransmit();
+    void teardownAWDLInterface();
+    IO80211VirtualInterface *fAWDLInterface;
+    bool awdlInterfaceTest;		/* -qwzawdlnative and the build guard agreed: the native path is on */
+    bool awdlExtendFrames;		/* -itlawdlelicit */
+    bool awdlHideInfra;			/* -itlawdlhideinfra */
+    uint16_t awdlProbeSequence;
+    bool awdlManagementInputEnabled;
+    UInt32 awdlManagementActive;
+    UInt32 awdlCreateRequests;
     static int awdlSysctl(void *arg, int value);
     static IOReturn awdlLinkGated(OSObject *target, void *arg0, void *, void *, void *);
     /* AWDL action frames from qwz (ItlQwz::setAwdlRx) into the AWDL engine, while awdl0's link is up. */

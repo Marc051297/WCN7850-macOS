@@ -13,6 +13,7 @@
 #include <net80211/ieee80211_var.h>
 
 #include "AirportItlwmSkywalkInterface.hpp"
+#include "awdlnative/QwzAWDLInterface.hpp"	/* F1 (native AWDL) */
 #include "qwz_log.h"
 #include "qwz_sysctl.h"
 #include "qwz_life.h"
@@ -64,6 +65,7 @@ void AirportItlwm::roleTimerFired(OSObject *owner, IOTimerEventSource *sender)
 
 void AirportItlwm::releaseAll()
 {
+    teardownAWDLInterface();	/* F1 (native AWDL): idempotent; stop() normally did it already */
     quiescePM();
     /* M0 (C14): quiescePM already ended the sentinel; again, idempotently, before fHalService is released below (the sentinel calls the HAL once a second) */
     stopSentinel();
@@ -186,6 +188,26 @@ bool AirportItlwm::init(OSDictionary *properties)
     XYLog("%s\n", __PRETTY_FUNCTION__);
     bool ret = super::init(properties);
     awdlSyncEnable = true;
+    /* F1 (native AWDL): the master switch and the build guard (airport/awdlnative/AWDLBuildGuard.cpp). */
+    {
+        extern bool itlAWDLBuildAllowed();
+        extern const char *itlAWDLBuildStatus();
+        extern bool qwzAwdlRawSamples;
+        int awdlBootValue = 0;
+        fAWDLInterface = nullptr;
+        awdlInterfaceTest = itlAWDLBuildAllowed() &&
+            PE_parse_boot_argn("-qwzawdlnative", &awdlBootValue, sizeof(awdlBootValue));
+        setProperty("ItlwmAWDLBuildCheck", itlAWDLBuildStatus());
+        qwzAwdlRawSamples = PE_parse_boot_argn("-itlawdlsamples", &awdlBootValue, sizeof(awdlBootValue));
+        awdlExtendFrames = PE_parse_boot_argn("-itlawdlelicit", &awdlBootValue, sizeof(awdlBootValue));
+        awdlHideInfra = PE_parse_boot_argn("-itlawdlhideinfra", &awdlBootValue, sizeof(awdlBootValue));
+        awdlProbeSequence = 0;
+        awdlCreateRequests = 0;
+        awdlManagementInputEnabled = false;
+        awdlManagementActive = 0;
+        setProperty("ItlwmAWDLInterfaceBuild", QWZ_AWDL_NATIVE_BUILD);
+        setProperty("ItlwmAWDLInterfaceTestEnabled", awdlInterfaceTest ? kOSBooleanTrue : kOSBooleanFalse);
+    }
     power_state = 0;
     memset(geo_location_cc, 0, sizeof(geo_location_cc));
     return ret;
@@ -591,6 +613,7 @@ bool AirportItlwm::start(IOService *provider)
         fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;
 #ifdef AIRPORT_WCL
     qwz_log("qwz: trace: AirportItlwm::start: registerService\n");
+    awdlManagementInputEnabled = true;	/* F1 (native AWDL): hand-offs to the peer manager may start */
     bsdInterface->registerService();
 #endif
     registerService();
@@ -643,6 +666,19 @@ void AirportItlwm::systemWillShutdown(IOOptionBits specifier)
 void AirportItlwm::stop(IOService *provider)
 {
     qwz_logc("qwz: stop: enter\n");
+#if defined(ITL_AWDL_NATIVE)
+    /* F1 (native AWDL, from ForbiddenItlwm): no new hand-offs, drain the active ones, then stop the peer manager before super::stop(). */
+    if (_fWorkloop) {
+        _fWorkloop->runAction([](OSObject *owner, void*, void*, void*, void*) -> IOReturn {
+            auto *controller = static_cast<AirportItlwm *>(owner);
+            controller->awdlManagementInputEnabled = false;
+            while (controller->awdlManagementActive)
+                _fWorkloop->commandSleep(&controller->awdlManagementActive, 0);
+            return kIOReturnSuccess;
+        }, this, nullptr, nullptr, nullptr, nullptr);
+    }
+    teardownAWDLInterface();
+#endif
     qwz_sysctl_set_awdl(NULL, NULL);
     qwz_sysctl_set_m0(NULL, NULL);		/* M0 (C32): the sysctl nodes answer ENXIO from here on */
     static_cast<ItlQwz *>(fHalService)->setAwdlRx(NULL, NULL);
@@ -5029,7 +5065,7 @@ int AirportItlwm::awdlSysctl(void *arg, int value)
     IOReturn ret;
 
     if (value == 1)
-        return self->awdlCreate();
+        return self->awdlInterfaceTest ? EBUSY : self->awdlCreate();	/* F1: the native awdl0 owns the role while -qwzawdlnative is set */
     if (value == 20 || value == 22 || value == 26) {
         /*
          * M2a WP2: a setPEER_CACHE_CONTROL op (add 20, delete 22, update 26: the engine's op + 20) for a fixed test address, through awdlPeerCb as the
@@ -5110,6 +5146,9 @@ AirportItlwm::createVirtualInterface(ether_addr *ether, UInt role)
 {
     qwz_log("airport: AWDL createVirtualInterface role=%u\n", role);
     qwz_log_publish();
+    /* F1 (native AWDL): with -qwzawdlnative the AWDL role gets our QwzAWDLInterface (QwzAWDLController.cpp). */
+    if (IO80211VirtualInterface *native = awdlNativeCreateVirtualInterface(ether, role))
+        return native;
 
     /* Let the superclass handle it — on Tahoe, IO80211Controller's
      * attachVirtualInterface does the allocation internally when

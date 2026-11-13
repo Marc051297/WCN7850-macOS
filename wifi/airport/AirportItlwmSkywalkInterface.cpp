@@ -7,6 +7,7 @@
 //
 #include "AirportItlwmV2.hpp"
 #include "AirportItlwmSkywalkInterface.hpp"
+#include "awdlnative/QwzAWDLInterface.hpp"	/* F1 (native AWDL) */
 #include "qwz_log.h"
 
 /* The first few calls of a link getter go to the log ring: what is asked, what is answered. */
@@ -1372,6 +1373,49 @@ setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
 
     if (!data)
         return kIOReturnBadArgument;
+#if defined(ITL_AWDL_NATIVE)
+    /*
+     * F1 (native AWDL, from ForbiddenItlwm AirportItlwmSkywalkInterface.cpp setVIRTUAL_IF_CREATE): with -qwzawdlnative,
+     * attach our QwzAWDLInterface for the AWDL role (the controller's createVirtualInterface makes it) and give it its
+     * Skywalk pools, queues and registration before anything is published. Registry keys as upstream's.
+     */
+    if (instance && instance->awdlInterfaceTest && data->role == APPLE80211_VIF_AWDL) {
+        auto publish = [](AirportItlwm *controller, const char *key, UInt64 value) {
+            OSNumber *number = OSNumber::withNumber(value, 64);
+            if (number) {
+                controller->setProperty(key, number);
+                number->release();
+            }
+        };
+        publish(instance, "ItlwmAWDLCreateRequests", __sync_add_and_fetch(&instance->awdlCreateRequests, 1));
+        publish(instance, "ItlwmAWDLCreateRole", data->role);
+        if (instance->fAWDLInterface) {
+            publish(instance, "ItlwmAWDLCreateResult", kIOReturnSuccess);
+            return kIOReturnSuccess;
+        }
+        ether_addr address;
+        memcpy(address.octet, data->mac, sizeof(address.octet));
+        qwz_log("airport: awdl0: native create: role %u mac %02x:%02x:%02x:%02x:%02x:%02x\n", data->role,
+                data->mac[0], data->mac[1], data->mac[2], data->mac[3], data->mac[4], data->mac[5]);
+        qwz_log_publish();
+        const bool attached = instance->attachVirtualInterface(&instance->fAWDLInterface, &address, data->role, false);
+        IOReturn result = attached ? kIOReturnSuccess : kIOReturnError;
+        if (attached) {
+            result = static_cast<QwzAWDLInterface *>(instance->fAWDLInterface)->initializeNetwork(
+                instance, instance->getWorkQueue(), address);
+            if (result != kIOReturnSuccess) {
+                /* initializeNetwork unwinds an unpublished object; detach this unpublished service directly. */
+                instance->fAWDLInterface->detach(instance);
+                instance->fAWDLInterface->release();
+                instance->fAWDLInterface = nullptr;
+            }
+        }
+        qwz_log("airport: awdl0: native create: attached %d result 0x%x\n", attached, result);
+        qwz_log_publish();
+        publish(instance, "ItlwmAWDLCreateResult", result);
+        return result;
+    }
+#endif
 
     if (++requests <= 8 || (requests & 63) == 0) {
         qwz_log("airport: AWDL VIRTUAL_IF_CREATE #%u version=%u role=%u unk1=0x%x "
