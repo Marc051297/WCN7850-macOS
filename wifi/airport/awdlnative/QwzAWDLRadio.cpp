@@ -66,6 +66,7 @@ void AirportItlwm::awdlNativeRadioStart()
 		awdlNativeRssiFallback = value;
 	memset(&awdlNativeStats, 0, sizeof(awdlNativeStats));
 	awdlNativeLastSyncUS = awdlNativeLastDataUS = awdlNativeLastPublishUS = 0;
+	awdlNativeLastRxBytes = awdlNativeLastAckedBytes = 0;
 	if (awdlNativeScratch == nullptr)
 		awdlNativeScratch = static_cast<uint8_t *>(IOMalloc(kScratchBytes));
 	awdlNativeTimer = IOTimerEventSource::timerEventSource(this, awdlNativeTimerFired);
@@ -80,7 +81,7 @@ void AirportItlwm::awdlNativeRadioStart()
 	qwz_mon_native_auto_enable(!PE_parse_boot_argn("-qwzawdlmanual", &manual, sizeof(manual)));
 	awdlNativeTimer->setTimeoutMS(50);
 	setProperty("QwzAWDLRadio", "started");
-	setProperty("QwzAWDLRadioBuild", "f2j-auto-join-state");
+	setProperty("QwzAWDLRadioBuild", "f2k-tx-backpressure");
 	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
 	qwz_log_publish();
 }
@@ -176,6 +177,7 @@ void AirportItlwm::awdlNativeRadioInput(const uint8_t *frame, size_t len, uint16
 		}
 		observeAWDLDataFrame(buf, n);
 		++st.rxDataHanded;
+		st.rxDataBytes += body;
 		awdlNativeLastDataUS = nowUS();
 	}
 }
@@ -226,6 +228,8 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 				break;
 			const int err = qwz_mon_tx_raw(static_cast<const uint8_t *>(mbuf_data(m)), mbuf_len(m));
 			st.dataLastTxError = uint32_t(err);
+			if (err == 0)
+				st.txSubmittedBytes += mbuf_len(m);
 			mbuf_freem(m);
 			--budget;
 			if (err == 0) {
@@ -244,6 +248,15 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 		st.queued = self->queuedAWDLTransmit();
 	}
 	if (now - self->awdlNativeLastPublishUS >= 1000000) {
+		const uint64_t intervalUS = self->awdlNativeLastPublishUS ? now - self->awdlNativeLastPublishUS : 0;
+		qwz_mon_native_tx_stats tx = {};
+		qwz_mon_native_get_tx_stats(&tx);
+		const uint64_t txRate = intervalUS && tx.acked_bytes >= self->awdlNativeLastAckedBytes ?
+		    (tx.acked_bytes - self->awdlNativeLastAckedBytes) * 1000000 / intervalUS : 0;
+		const uint64_t rxRate = intervalUS ?
+		    (st.rxDataBytes - self->awdlNativeLastRxBytes) * 1000000 / intervalUS : 0;
+		self->awdlNativeLastAckedBytes = tx.acked_bytes;
+		self->awdlNativeLastRxBytes = st.rxDataBytes;
 		self->awdlNativeLastPublishUS = now;
 		OSDictionary *d = OSDictionary::withCapacity(24);
 		if (d != nullptr) {
@@ -260,6 +273,10 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 			put("syncTxErrors", st.syncTxErrors); put("syncLastTxError", st.syncLastTxError);
 			put("dataSent", st.dataSent); put("dataTxErrors", st.dataTxErrors); put("dataLastTxError", st.dataLastTxError);
 			put("queued", st.queued);
+			put("txSubmittedBytes", st.txSubmittedBytes); put("rxDataBytes", st.rxDataBytes);
+			put("txDataAckedBytes", tx.acked_bytes); put("txDataAcked", tx.acked); put("txDataFailed", tx.failed);
+			put("txDataNoAck", tx.noack); put("txInflight", tx.inflight);
+			put("txAckedBytesPerSecond", txRate); put("rxBytesPerSecond", rxRate);
 			self->setProperty("QwzAWDLRadioStats", d);
 			self->setProperty("QwzAWDLRadioAuto", qwz_mon_native_auto_state());
 			d->release();

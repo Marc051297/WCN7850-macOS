@@ -45,6 +45,7 @@ static int qwz_mon_tx_raw(const uint8_t *,size_t) {
 }
 struct Stats {
     uint64_t dataSent=0,dataTxErrors=0,syncSent=0,syncTxErrors=0,syncBuildFailures=0;
+    uint64_t txSubmittedBytes=0;
     uint32_t dataLastTxError=28,syncLastTxError=28,syncLastBuild=1;
 };
 struct MockSelf {
@@ -87,6 +88,7 @@ int main() {
     pump(&self,600);
     assert(sent==20 && self.queued==20);
     assert(!self.awdlNativeStats.dataTxErrors && dequeued==freed);
+    assert(self.awdlNativeStats.txSubmittedBytes==self.awdlNativeStats.dataSent);
     // Sync's credit is spent before the data pump checks room.
     ready=1; closeAfterSend=0; credits=2;
     syncFrame(&self,100000);

@@ -2411,6 +2411,8 @@ struct qwz_softc {
 		/* Frames handed in from userspace (M2), by 802.11 type. */
 		uint32_t ufr_sent, ufr_full, ufr_fail;
 		uint32_t ufr_mgmt_ok, ufr_mgmt_bad, ufr_data_ok, ufr_data_bad, ufr_ctrl_ok, ufr_ctrl_bad;
+		uint64_t ufr_data_acked_bytes;
+		uint32_t ufr_data_noack;
 		uint32_t ufr_inflight;	/* K2b (W1b): user DATA and CONTROL frames (kind 2, 3) in flight in the capture TX ring, the number monqmax is compared with; management frames are never counted */
 		uint32_t ufr_nocred, ufr_qmax;	/* K1 (W1): refused early with ENOSPC by monnocred (no credit) and by monqmax; both are also counted in ufr_full */
 		uint32_t ufr_reaped, ufr_livefull;	/* K2c (C2): slots freed by the stale-slot reaper (debug.qwz.monreap); sends refused because the next slot was still occupied */

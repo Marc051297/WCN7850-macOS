@@ -428,12 +428,14 @@ public:
     IOTimerEventSource *awdlNativeTimer;
     uint8_t *awdlNativeScratch;
     uint64_t awdlNativeLastSyncUS, awdlNativeLastDataUS, awdlNativeLastPublishUS;
+    uint64_t awdlNativeLastRxBytes, awdlNativeLastAckedBytes;
     int awdlNativeRssiFallback;		/* itlawdlrssi=N (dBm) stands in when the capture path has no RSSI; default -60 */
     struct {
         uint64_t timerTicks, cellTimerTicks;
         uint64_t rxAction, rxActionHanded, rxActionRefused, rxActionTrimmed, rxActionTooLong;
         uint64_t rxData, rxDataHanded, rxDataTooLong, rxNotInGate, rxNoMbuf, rssiFallbacks;
         uint64_t syncSent, syncBuildFailures, syncTxErrors, dataSent, dataTxErrors, queued;
+        uint64_t rxDataBytes, txSubmittedBytes;
         uint32_t rxActionLastError, syncLastBuild, syncLastTxError, dataLastTxError;
     } awdlNativeStats;
     static int awdlSysctl(void *arg, int value);

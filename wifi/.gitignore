@@ -5,6 +5,7 @@ build-debug/
 build-f2h/
 build-f2i/
 build-f2j/
+build-f2k/
 deps/
 .DS_Store
 build-fixes/

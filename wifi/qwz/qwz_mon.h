@@ -181,6 +181,13 @@ int	qwz_mon_native_pause(struct ieee80211com *);
 int	qwz_mon_user_set(int chan);	/* explicit sysctl override suspends auto mode */
 /* F2: send one 802.11 frame (no FCS) from the cell, the gate held by the caller; errno (ENOSPC: no slot, try later). */
 int	qwz_mon_tx_raw(const uint8_t *frame, size_t len);
+/* Firmware completions, distinct from successful host submissions. Reset with
+ * the listener cell. Bytes include the 802.11/AWDL header, exclude FCS. */
+struct qwz_mon_native_tx_stats {
+	uint64_t acked_bytes;
+	uint32_t acked, failed, noack, inflight;
+};
+void	qwz_mon_native_get_tx_stats(struct qwz_mon_native_tx_stats *);
 /* qwz_attach(): allocates the capture ring and remembers the softc. */
 void	qwz_mon_attach(struct qwz_softc *);
 /* ItlQwz::detachGated (merge glue F): ends a cell host-only, frees the capture buffers, the lock and the 64 maps, forgets the softc. */

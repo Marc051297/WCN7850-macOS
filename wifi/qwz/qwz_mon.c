@@ -580,6 +580,12 @@ qwz_mon_tx_compl(struct qwz_softc *sc, struct wmi_mgmt_tx_compl_event *ev)
 		    getnsecuptime() - sc->mon_lat.tx_ns[ev->desc_id]);
 		sc->mon_lat.tx_ns[ev->desc_id] = 0;
 	}
+	if (sc->mon_tx_kind[ev->desc_id] == 2) {
+		if (ev->status == 0)
+			sc->mon_stats.ufr_data_acked_bytes += M_PKTLEN(td->m);
+		else if (ev->status == 3)
+			sc->mon_stats.ufr_data_noack++;
+	}
 	bus_dmamap_unload(sc->sc_dmat, td->map);
 	m_freem(td->m);
 	td->m = NULL;
@@ -866,6 +872,20 @@ qwz_mon_tx_raw(const uint8_t *frame, size_t len)
 	else
 		sc->mon_stats.ufr_fail++;
 	return ret;
+}
+
+void
+qwz_mon_native_get_tx_stats(struct qwz_mon_native_tx_stats *out)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	memset(out, 0, sizeof(*out));
+	if (sc == NULL || !sc->mon_active)
+		return;
+	out->acked_bytes = sc->mon_stats.ufr_data_acked_bytes;
+	out->acked = sc->mon_stats.ufr_data_ok;
+	out->failed = sc->mon_stats.ufr_data_bad;
+	out->noack = sc->mon_stats.ufr_data_noack;
+	out->inflight = sc->mon_stats.ufr_inflight;
 }
 
 int

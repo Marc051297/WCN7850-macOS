@@ -140,7 +140,8 @@ private:
     // Only under the shared gate. Each frame is a copy, so no packet waits on the radio.
     struct TransmitFrame { uint16_t length; uint8_t bytes[1514]; };
     // itlawdltxqueue=N, 128 to 4096: frames held while the radio can't send, such as while the
-    // peer is on another channel. A full queue drops, and the sender's transport reads that as loss.
+    // peer is on another channel. On Tahoe a full queue leaves packet ownership
+    // with Skywalk; serviceTransmit requests another dequeue when space returns.
     // Set once, before the frames are allocated (about 1.5 KB each).
     static constexpr unsigned transmitFrameCapacity = 4096, transmitFrameDefault = 128;
     unsigned transmitFrameCount = transmitFrameDefault;
@@ -150,6 +151,8 @@ private:
     unsigned transmitPopped = 0, transmitHeldMark = 0;
     IOSkywalkPacket *transmitDone[transmitFrameCapacity] = {};
     unsigned transmitDoneCount = 0, transmitCompleted = 0, transmitLastPublished = 0;
+    bool transmitBackpressured = false;
+    unsigned transmitBackpressureEvents = 0, transmitResumeRequests = 0;
     void drainTransmitDone();
     uint32_t transmitDepthBins[9] = {};
     uint16_t transmitSequence = 0;

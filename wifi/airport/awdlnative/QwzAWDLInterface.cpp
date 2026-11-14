@@ -416,12 +416,19 @@ void QwzAWDLInterface::noteTransmit(IOSkywalkPacket *const *packets, UInt32 coun
     }
 }
 
-// Accepts every packet it can hold for completion, so the ring never stalls on the
-// radio. Frames that don't fit the queue or aren't ours are dropped, like a full NIC.
+// A short accepted count leaves the remaining packets owned by Skywalk. Do not
+// complete and discard valid packets just because the radio FIFO is full.
 UInt32 QwzAWDLInterface::acceptTransmit(IOSkywalkPacket *const *packets, UInt32 count)
 {
     UInt32 accepted = 0;
     for (; accepted < count && transmitDoneCount < transmitFrameCount; ++accepted) {
+#if __IO80211_TARGET == __MAC_26_0
+        if (transmitQueued >= transmitFrameCount) {
+            if (!transmitBackpressured) ++transmitBackpressureEvents;
+            transmitBackpressured = true;
+            break;
+        }
+#endif
         auto *packet = reinterpret_cast<ItlSkywalkPacketView *>(packets[accepted]);
         const UInt32 length = packet ? packet->getDataLength() : 0;
         const auto *base = packet && packet->getPacketBufferCount() ?
@@ -438,6 +445,12 @@ UInt32 QwzAWDLInterface::acceptTransmit(IOSkywalkPacket *const *packets, UInt32 
         if (!queued) ++transmitDropped;
         transmitDone[transmitDoneCount++] = packets[accepted];
     }
+#if __IO80211_TARGET == __MAC_26_0
+    if (accepted < count && !transmitBackpressured) {
+        ++transmitBackpressureEvents;
+        transmitBackpressured = true;
+    }
+#endif
     transmitAccepted += accepted;
     return accepted;
 }
@@ -488,17 +501,35 @@ bool QwzAWDLInterface::serviceTransmit()
             setProperty("ItlwmAWDLTxCompleteLastError", result, 32);
         }
     }
+#if __IO80211_TARGET == __MAC_26_0
+    if (transmitBackpressured && transmitQueued < transmitFrameCount &&
+        transmitDoneCount < transmitFrameCount && dataTransmitEnabled &&
+        addedQueues > 1 && packetQueues[0]) {
+        // Clear before the request: native dequeue may synchronously call back
+        // and fill the FIFO again. Never clear a new backpressure indication.
+        transmitBackpressured = false;
+        const IOReturn result = itlTxRequestDequeue(packetQueues[0], nullptr, 1);
+        if (result == kIOReturnSuccess)
+            ++transmitResumeRequests;
+        else {
+            transmitBackpressured = true;
+            setProperty("ItlwmAWDLTxResumeLastError", result, 32);
+        }
+    }
+#endif
     if (transmitCompleted != transmitLastPublished) {
         transmitLastPublished = transmitCompleted;
         setProperty("ItlwmAWDLTxAccepted", transmitAccepted, 32);
         setProperty("ItlwmAWDLTxCompleted", transmitCompleted, 32);
         setProperty("ItlwmAWDLTxDropped", transmitDropped, 32);
+        setProperty("ItlwmAWDLTxBackpressureEvents", transmitBackpressureEvents, 32);
+        setProperty("ItlwmAWDLTxResumeRequests", transmitResumeRequests, 32);
         if (auto *depths = OSData::withBytes(transmitDepthBins, sizeof(transmitDepthBins))) {
             setProperty("ItlwmAWDLTxDepthBins", depths);
             depths->release();
         }
     }
-    return transmitQueued || transmitDoneCount;
+    return transmitQueued || transmitDoneCount || transmitBackpressured;
 }
 
 UInt32 QwzAWDLInterface::rejectTransmit(OSObject *owner, IOSkywalkTxSubmissionQueue*,
@@ -562,6 +593,7 @@ void QwzAWDLInterface::releaseNetworkResources()
         }, this);
     transmitQueued = 0;
     transmitHead = 0;
+    transmitBackpressured = false;
     if (registrationAttempted) {
         registrationAttempted = false;
         deregisterEthernetInterface(0);

@@ -50,6 +50,11 @@ extern "C" unsigned short itlPacketGetDataOffset(const ItlSkywalkPacketView *)
 // below the queue's capacity. On error nothing has been consumed.
 extern "C" IOReturn itlTxComplete(void *, void *const *, unsigned int, unsigned int)
     __asm__("__ZN26IOSkywalkTxCompletionQueue14enqueuePacketsEPKP15IOSkywalkPacketjj");
+// Revisit packets left in the submission queue after a short/zero acceptance.
+// Tahoe's checkForWork requires a new dequeue request counter, not just a
+// work-loop wakeup. Flags bit 0 means the caller already holds the queue gate.
+extern "C" IOReturn itlTxRequestDequeue(void *, void *, unsigned int)
+    __asm__("__ZN26IOSkywalkTxSubmissionQueue14requestDequeueEPvj");
 class ItlSkywalkPoolView : public OSObject {
     ItlSkywalkPoolView();
     virtual void _initSlot1(); // 0x118
