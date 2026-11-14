@@ -26496,6 +26496,12 @@ qwz_mon_dwell_start(struct qwz_softc *sc, uint32_t freq, int dwell_ms)
 	arg->scan_req_id = QWZ_MON_DWELL_REQ_ID;
 	arg->scan_priority = WMI_SCAN_PRIORITY_HIGH;
 	arg->scan_flags |= WMI_SCAN_FLAG_PASSIVE;
+	if (qwz_moncoexdwellflags & 1)	/* F2f: without this the firmware forwards only beacons and probe responses during a scan */
+		arg->scan_f_promisc_mode = 1;
+	if (qwz_moncoexdwellflags & 2)
+		arg->scan_f_offchan_mgmt_tx = 1;
+	if (qwz_moncoexdwellflags & 4)
+		arg->scan_f_offchan_data_tx = 1;
 	arg->dwell_time_passive = dwell_ms;
 	arg->dwell_time_active = dwell_ms;
 	arg->max_scan_time = dwell_ms + 1000;

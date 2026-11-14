@@ -101,7 +101,7 @@ extern uint32_t qwz_mon_flags;
 extern int qwz_moncoex, qwz_moncoexmode, qwz_moncoexpassive, qwz_moncoexfilter, qwz_moncoexscan, qwz_moncoexcred, qwz_moncoexfw, qwz_moncoexnss, qwz_moncoexjoin;
 /* K6 (K6-1): debug.qwz.moncoexwbm, default 1, acts only while a coex cell runs (moncoex defaults to 0): the WBM error path hands the cell's peer-less data frames to the capture; read live */
 extern int qwz_moncoexwbm;
-extern int qwz_moncoexdwell, qwz_moncoexrest;	/* F2e */
+extern int qwz_moncoexdwell, qwz_moncoexrest, qwz_moncoexdwellflags;	/* F2e */
 #define QWZ_MON_DWELL_SCAN_ID	0xA0D1	/* F2e: scan id of a dwell visit (ATH12K_SCAN_ID is 0xA000) */
 #define QWZ_MON_DWELL_REQ_ID	2	/* the station's scans use 1 */
 int	qwz_mon_dwell_start(struct qwz_softc *, uint32_t freq, int dwell_ms);	/* qwz.c: sends the scan; may sleep for a WMI credit */
