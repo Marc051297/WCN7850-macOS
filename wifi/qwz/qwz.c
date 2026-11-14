@@ -12506,6 +12506,11 @@ qwz_scan_event(struct qwz_softc *sc, struct mbuf *m)
 #ifdef notyet
 	rcu_read_lock();
 #endif
+	if (scan_ev.scan_id == QWZ_MON_DWELL_SCAN_ID || scan_ev.scan_req_id == QWZ_MON_DWELL_REQ_ID) {
+		/* F2e: a dwell visit's events never touch the station's scan state machine */
+		qwz_mon_dwell_event(sc, scan_ev.event_type, scan_ev.channel_freq, scan_ev.reason);
+		return;
+	}
 	if (arvif->vdev_id != scan_ev.vdev_id &&
 	    !(sc->sc_awdltest_vdev_on &&
 	    scan_ev.vdev_id == sc->sc_awdltest_vdev_id)) {
@@ -26465,6 +26470,47 @@ qwz_start_scan(struct qwz_softc *sc, struct scan_req_params *arg)
 	spin_lock_bh(&ar->data_lock);
 	spin_unlock_bh(&ar->data_lock);
 #endif
+	return ret;
+}
+
+/*
+ * F2e: one visit to the coex cell's channel, the way Linux does remain-on-channel on this chip family: a passive scan of exactly one channel
+ * on the station vdev. The firmware tells the AP the station sleeps, tunes to freq for dwell_ms, forwards what it hears through the WMI
+ * management-RX event (the K5 claim test takes the AWDL frames by their frequency), and returns. Own scan id and request id: the events go
+ * to qwz_mon_dwell_event and sc->scan.state is never touched. Refused while a real scan runs.
+ */
+int
+qwz_mon_dwell_start(struct qwz_softc *sc, uint32_t freq, int dwell_ms)
+{
+	struct scan_req_params *arg;
+	int ret;
+
+	if (sc->scan.state != ATH12K_SCAN_IDLE || sc->sc_awdltest_active || !sc->sc_vif.is_started || QWZ_CRASHED(sc) || !sc->fw_initialized)
+		return EBUSY;
+	arg = malloc(sizeof(*arg), M_DEVBUF, M_ZERO | M_NOWAIT);
+	if (arg == NULL)
+		return ENOMEM;
+	qwz_wmi_start_scan_init(sc, arg);
+	arg->vdev_id = sc->sc_vif.vdev_id;
+	arg->scan_id = QWZ_MON_DWELL_SCAN_ID;
+	arg->scan_req_id = QWZ_MON_DWELL_REQ_ID;
+	arg->scan_priority = WMI_SCAN_PRIORITY_HIGH;
+	arg->scan_flags |= WMI_SCAN_FLAG_PASSIVE;
+	arg->dwell_time_passive = dwell_ms;
+	arg->dwell_time_active = dwell_ms;
+	arg->max_scan_time = dwell_ms + 1000;
+	arg->notify_scan_events = WMI_SCAN_EVENT_STARTED | WMI_SCAN_EVENT_COMPLETED | WMI_SCAN_EVENT_BSS_CHANNEL | WMI_SCAN_EVENT_FOREIGN_CHAN |
+	    WMI_SCAN_EVENT_DEQUEUED | WMI_SCAN_EVENT_START_FAILED | WMI_SCAN_EVENT_PREEMPTED;
+	arg->num_chan = 1;
+	arg->chan_list = mallocarray(1, sizeof(*arg->chan_list), M_DEVBUF, M_NOWAIT | M_ZERO);
+	if (arg->chan_list == NULL) {
+		free(arg, M_DEVBUF, sizeof(*arg));
+		return ENOMEM;
+	}
+	arg->chan_list[0] = freq;
+	ret = qwz_wmi_send_scan_start_cmd(sc, arg);
+	free(arg->chan_list, M_DEVBUF, sizeof(*arg->chan_list));
+	free(arg, M_DEVBUF, sizeof(*arg));
 	return ret;
 }
 

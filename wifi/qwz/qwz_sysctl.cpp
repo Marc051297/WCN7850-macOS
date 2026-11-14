@@ -50,6 +50,7 @@ int qwz_monfmt = 0;		/* K4 (M1): debug.qwz.monfmt, see qwz_life.h */
 int qwz_moncoexmcc = 0;
 int qwz_moncoexquota = 0;	/* F2-3: percent of radio time the firmware's scheduler gives the cell's channel while an mcc cell runs (0 = leave the firmware's adaptive scheduler alone); read at cell start */	/* F2-2: the coex cell on its own channel beside the station (the firmware's MCC scheduler); 0 = K5 rule (same channel only) */
 int qwz_moncoex = 0, qwz_moncoexmode = 0, qwz_moncoexpassive = 0, qwz_moncoexfilter = 0, qwz_moncoexscan = 1, qwz_moncoexcred = 1, qwz_moncoexfw = 0, qwz_moncoexnss = 0, qwz_moncoexjoin = 0;
+int qwz_moncoexdwell = 0, qwz_moncoexrest = 100;	/* F2e: ms on the cell's channel per visit (0 = off) and ms back on the station's channel between visits; read live */
 int qwz_moncoexmac = -1;	/* F2d: with moncoexfilter 3, the rx_mac_buf_ring that gets the monitor filter: -1 = by band from the firmware's phy table (2.4 GHz cell = ring 0, 5 GHz cell = ring 1 when the table does not decide), 0 or 1 = that ring; read at cell start */
 int qwz_moncoexwbm = 1;	/* K6 (K6-1): debug.qwz.moncoexwbm, see qwz_mon.h; no effect unless a coex cell runs (moncoex defaults to 0) */
 int qwz_awdlcell = 0;	/* K5 (K5-00 banner, L2-C2): debug.qwz.awdlcell, see qwz_mon.h; no consumer yet (the receive-only tee is not built), the value is only reported in the K5 banner */
@@ -729,6 +730,10 @@ SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexpassive, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_moncoexpassive, 0, "K5 L1-C1: coex cell vdev-start passive flag: 0 = the K4 cell's rule (default), 1 = copy the station vdev's passive flag; read when the cell starts");
 SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexfilter, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_moncoexfilter, 0, "K5 L1-C1/C10: coex cell receive filter: 0 = never swap the station's filter (default, KEEP_FILTER forced), 1 = honour debug.qwz.monflags (swap, filter-pass plus monitor-other), 2 = swap with filter-pass only; F2d: 3 = monitor filter (filter-pass plus monitor-other) on the cell's own rx_mac_buf_ring only (debug.qwz.moncoexmac), the station's ring untouched, KEEP_FILTER ignored; read when the cell starts");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexdwell, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexdwell, 0, "F2e: while a coex cell runs on another channel than the station, the driver itself takes the radio there: a single-channel passive scan of this many ms (20..1000) on the station vdev, again and again; 0 = off (default); read live");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexrest, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexrest, 100, "F2e: ms on the station's channel between two moncoexdwell visits (20..5000, default 100); read live");
 SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexmac, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_moncoexmac, -1, "F2d: with moncoexfilter 3, which rx_mac_buf_ring (MAC) carries the monitor filter: -1 = by band from the firmware's phy table of the configured hardware mode (default; a 2.4 GHz cell beside a 5 GHz station = ring 0), 0 or 1 = that ring; read when the cell starts; the start line names the ring");
 SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexwbm, CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -920,6 +925,8 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexpassive);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexfilter);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexmac);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexdwell);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexrest);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexwbm);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexscan);
 	sysctl_register_oid(&sysctl__debug_qwz_moncoexcred);
@@ -988,6 +995,8 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexpassive);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexfilter);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexmac);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexdwell);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexrest);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexwbm);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexscan);
 	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexcred);

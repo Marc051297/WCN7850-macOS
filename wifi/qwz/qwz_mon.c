@@ -1539,6 +1539,19 @@ qwz_mon_reap(void *arg)
 		return;
 	n = qwz_mon_reap_ring(sc);
 	now = getnsecuptime();
+	if (sc->mon_coex && qwz_moncoexdwell > 0 && sc->sc_ic.ic_bss != NULL && sc->sc_ic.ic_bss->ni_chan != NULL &&
+	    sc->sc_ic.ic_bss->ni_chan->ic_freq != sc->mon_freq) {
+		/* F2e: the next visit to the cell's channel is due; the scan command is sent by the task (it may wait for a WMI credit) */
+		if (sc->mon_dwell_inflight && now - sc->mon_dwell_sent_ns > 4000000000ULL) {
+			sc->mon_dwell_inflight = 0;	/* no completion in 4 s: count it and go on */
+			sc->mon_stats.dwell_lost++;
+		}
+		if (!sc->mon_dwell_inflight && now >= sc->mon_dwell_next_ns) {
+			sc->mon_dwell_inflight = 1;
+			sc->mon_dwell_sent_ns = now;
+			task_add(systq, &sc->mon_dwell_task);
+		}
+	}
 	{	/* K2c (C2), debug.qwz.monreap: every 100 ms free the capture TX slots whose frame is older than 3 s; this timer runs on the command-gate work loop, like the ring work above */
 		static uint64_t reap_last_ns;
 
@@ -1563,6 +1576,9 @@ qwz_mon_reap(void *arg)
 			    sc->mon_stats.coex_drop, qwz_moncoexcred, (unsigned int)sc->wmi.wmi[sc->pdevs[0].pdev_id].eid < (unsigned int)ATH12K_HTC_EP_COUNT ?
 			    (int)sc->htc.endpoint[sc->wmi.wmi[sc->pdevs[0].pdev_id].eid].tx_credits : -1, qwz_moncoexfilter,
 			    sc->mon_coex_swap_ring, sc->mon_stats.coex_awdl_otherfreq);	/* F2d: the swapped ring (-1 none) and the other-frequency count */
+		if (sc->mon_coex && (qwz_moncoexdwell > 0 || sc->mon_stats.dwell_start))	/* F2e */
+			printf("qwz: mon: coex: dwell: asked %u onchan %u done %u fail %u lost %u; dwell %d ms rest %d ms\n", sc->mon_stats.dwell_start,
+			    sc->mon_stats.dwell_onchan, sc->mon_stats.dwell_done, sc->mon_stats.dwell_fail, sc->mon_stats.dwell_lost, qwz_moncoexdwell, qwz_moncoexrest);
 		if (sc->mon_coex)	/* K6 (K6-1): the WBM error ring tap, adjacent additive line */
 			printf("qwz: mon: coex: wbm counters taken %u skipped %u badhdr %u wbm_err %u; moncoexwbm %d\n",
 			    sc->mon_stats.coex_wbm_taken, sc->mon_stats.coex_wbm_skipped, sc->mon_stats.coex_wbm_badhdr, sc->mon_stats.wbm_err, qwz_moncoexwbm);
@@ -2192,6 +2208,8 @@ k5_coex_guards_done:	/* K5 (L1-C2) */
 		goto fail;
 	if (coex) {
 		sc->mon_coex_swap_ring = -1;
+		sc->mon_dwell_inflight = 0;	/* F2e */
+		sc->mon_dwell_next_ns = 0;
 		if (qwz_moncoexfilter == 3) {
 			/*
 			 * F2d: the cell on another band runs on its own MAC (DBS), and the firmware forwards only that AP vdev's own frames from there
@@ -2655,11 +2673,70 @@ qwz_mon_capture_mgmt_mbuf(struct qwz_softc *sc, struct mbuf *m, int rssi,
 
 static void qwz_mon_coex_task_fn(void *);
 
+static int
+qwz_mon_dwell_clamp(int v, int lo, int hi)
+{
+	return v < lo ? lo : v > hi ? hi : v;
+}
+
+/* F2e: sends one visit (systq, in the gate, may sleep). A refusal (a real scan running, no credit) is retried after 300 ms. */
+static void
+qwz_mon_dwell_task_fn(void *arg)
+{
+	struct qwz_softc *sc = (struct qwz_softc *)arg;
+	int ret;
+
+	if (sc == NULL || sc != qwz_mon_sc || !sc->mon_dwell_inflight)
+		return;
+	if (!sc->mon_active || !sc->mon_coex || sc->mon_coex_halt || qwz_moncoexdwell <= 0) {
+		sc->mon_dwell_inflight = 0;
+		return;
+	}
+	ret = qwz_mon_dwell_start(sc, sc->mon_freq, qwz_mon_dwell_clamp(qwz_moncoexdwell, 20, 1000));
+	if (ret) {
+		if (++sc->mon_stats.dwell_fail == 1)
+			printf("qwz: mon: coex: dwell: first visit not sent: %d\n", ret);
+		sc->mon_dwell_next_ns = getnsecuptime() + 300000000ULL;
+		sc->mon_dwell_inflight = 0;
+		return;
+	}
+	if (++sc->mon_stats.dwell_start == 1)
+		printf("qwz: mon: coex: dwell: first visit to %u MHz sent (%d ms there, %d ms rest)\n", sc->mon_freq, qwz_moncoexdwell, qwz_moncoexrest);
+}
+
+/* F2e: a visit's scan events (qwz_scan_event). The arrival on the cell's channel is counted; any end of the scan schedules the next visit. */
+void
+qwz_mon_dwell_event(struct qwz_softc *sc, uint32_t type, uint32_t freq, uint32_t reason)
+{
+	switch (type) {
+	case WMI_SCAN_EVENT_FOREIGN_CHAN:
+		if (++sc->mon_stats.dwell_onchan == 1)
+			printf("qwz: mon: coex: dwell: the radio is on %u MHz (first arrival)\n", freq);
+		break;
+	case WMI_SCAN_EVENT_START_FAILED:
+	case WMI_SCAN_EVENT_PREEMPTED:
+		if (++sc->mon_stats.dwell_fail == 1)
+			printf("qwz: mon: coex: dwell: first visit refused by the firmware (event 0x%x reason %u)\n", type, reason);
+		/* FALLTHROUGH */
+	case WMI_SCAN_EVENT_COMPLETED:
+	case WMI_SCAN_EVENT_DEQUEUED:
+		if (type == WMI_SCAN_EVENT_COMPLETED)
+			sc->mon_stats.dwell_done++;
+		sc->mon_dwell_next_ns = getnsecuptime() + (uint64_t)qwz_mon_dwell_clamp(qwz_moncoexrest, 20, 5000) * 1000000ULL;
+		sc->mon_dwell_inflight = 0;
+		break;
+	default:
+		break;
+	}
+}
+
 void
 qwz_mon_attach(struct qwz_softc *sc)
 {
 	qwz_mon_sc = sc;
 	task_set(&sc->mon_coex_task, qwz_mon_coex_task_fn, sc, "qwzcoex");	/* K5 (L1-C13, C14) */
+	task_set(&sc->mon_dwell_task, qwz_mon_dwell_task_fn, sc, "qwzdwell");	/* F2e */
+	sc->mon_dwell_inflight = 0;
 	sc->mon_coex_task_why = 0;
 	if (moncap_lock == NULL)
 		moncap_lock = IOLockAlloc();
@@ -2706,6 +2783,7 @@ qwz_mon_detach(struct qwz_softc *sc)
 	if (sc == NULL)
 		return;
 	task_del(systq, &sc->mon_coex_task);	/* K5 (L1-C13, C14) */
+	task_del(systq, &sc->mon_dwell_task);	/* F2e */
 	qwz_mon_epoch_reset(sc);
 	q = &sc->sc_monvif.txmgmt;
 	for (i = 0; i < (int)nitems(q->data); i++)
