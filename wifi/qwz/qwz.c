@@ -11727,6 +11727,35 @@ qwz_wmi_ignore_num_extra_rules(struct wmi_regulatory_ext_rule *wmi_reg_rule,
 	return num_invalid_5ghz_rules;
 }
 
+/* Rule counts describe an adjacent ARRAY_STRUCT TLV, not arbitrary bytes
+ * following the fixed header. Check both the TLV and mbuf bounds first. */
+static const void *
+qwz_reg_rule_array(struct mbuf *m, const void *header, size_t fixed_size,
+    uint32_t count, size_t rule_size)
+{
+	const uint8_t *base = mtod(m, const uint8_t *);
+	const uint8_t *p = (const uint8_t *)header;
+	size_t offset = p - base, remaining = M_PKTLEN(m);
+	uint32_t tlv;
+	if (offset < sizeof(tlv) || offset > remaining)
+		return NULL;
+	memcpy(&tlv, p - sizeof(tlv), sizeof(tlv));
+	size_t header_size = FIELD_GET(WMI_TLV_LEN, tlv);
+	if (header_size < fixed_size || header_size > remaining - offset)
+		return NULL;
+	offset += header_size;
+	if (remaining - offset < sizeof(tlv))
+		return NULL;
+	memcpy(&tlv, base + offset, sizeof(tlv));
+	offset += sizeof(tlv);
+	size_t length = FIELD_GET(WMI_TLV_LEN, tlv);
+	if (FIELD_GET(WMI_TLV_TAG, tlv) != WMI_TAG_ARRAY_STRUCT ||
+	    length > remaining - offset || !rule_size ||
+	    count > length / rule_size)
+		return NULL;
+	return base + offset;
+}
+
 int
 qwz_pull_reg_chan_list_update_ev(struct qwz_softc *sc, struct mbuf *m,
     struct cur_regulatory_info *reg_info)
@@ -11757,12 +11786,25 @@ qwz_pull_reg_chan_list_update_ev(struct qwz_softc *sc, struct mbuf *m,
 
 	reg_info->num_2ghz_reg_rules = chan_list_event_hdr->num_2ghz_reg_rules;
 	reg_info->num_5ghz_reg_rules = chan_list_event_hdr->num_5ghz_reg_rules;
+	/* Even rejected requests may have no rule arrays. Preserve the reply
+	 * metadata so a rejection is not misreported as a request timeout. */
+	memcpy(reg_info->alpha2, &chan_list_event_hdr->alpha2, REG_ALPHA2_LEN);
+	reg_info->phy_id = chan_list_event_hdr->phy_id;
+	reg_info->status_code = qwz_wmi_cc_setting_code_to_reg(
+	    (enum wmi_reg_cc_setting_code)chan_list_event_hdr->status_code);
+	qwz_log("qwz: regulatory reply: cc %.2s phy %u status %u rules 2g %u 5g %u bytes %u\n",
+	    reg_info->alpha2, reg_info->phy_id, reg_info->status_code,
+	    reg_info->num_2ghz_reg_rules, reg_info->num_5ghz_reg_rules, (unsigned)M_PKTLEN(m));
+	if (reg_info->status_code != REG_SET_CC_STATUS_PASS) {
+		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+		return 0;
+	}
 
 	if (!(reg_info->num_2ghz_reg_rules + reg_info->num_5ghz_reg_rules)) {
 		printf("%s: No regulatory rules available in the event info\n",
 		    __func__);
 		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
-		return EINVAL;
+		return ENODATA;
 	}
 
 	memcpy(reg_info->alpha2, &chan_list_event_hdr->alpha2, REG_ALPHA2_LEN);
@@ -11799,9 +11841,14 @@ qwz_pull_reg_chan_list_update_ev(struct qwz_softc *sc, struct mbuf *m,
 	    "%s: num_2ghz_reg_rules %d num_5ghz_reg_rules %d\n", __func__,
 	    num_2ghz_reg_rules, num_5ghz_reg_rules);
 
-	wmi_reg_rule = (struct wmi_regulatory_rule_struct *)
-	    ((uint8_t *)chan_list_event_hdr + sizeof(*chan_list_event_hdr)
-	    + sizeof(struct wmi_tlv));
+	wmi_reg_rule = (struct wmi_regulatory_rule_struct *)qwz_reg_rule_array(m,
+	    chan_list_event_hdr, sizeof(*chan_list_event_hdr),
+	    num_2ghz_reg_rules + num_5ghz_reg_rules, sizeof(*wmi_reg_rule));
+	if (num_2ghz_reg_rules > MAX_REG_RULES ||
+	    num_5ghz_reg_rules > MAX_REG_RULES || !wmi_reg_rule) {
+		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+		return EPROTO;
+	}
 
 	if (num_2ghz_reg_rules) {
 		reg_info->reg_rules_2ghz_ptr = qwz_create_reg_rules_from_wmi(
@@ -11870,6 +11917,17 @@ qwz_pull_reg_chan_list_ext_update_ev(struct qwz_softc *sc, struct mbuf *m,
 
 	reg_info->num_2ghz_reg_rules = chan_list_event_hdr->num_2ghz_reg_rules;
 	reg_info->num_5ghz_reg_rules = chan_list_event_hdr->num_5ghz_reg_rules;
+	memcpy(reg_info->alpha2, &chan_list_event_hdr->alpha2, REG_ALPHA2_LEN);
+	reg_info->phy_id = chan_list_event_hdr->phy_id;
+	reg_info->status_code = qwz_wmi_cc_setting_code_to_reg(
+	    (enum wmi_reg_cc_setting_code)chan_list_event_hdr->status_code);
+	qwz_log("qwz: regulatory ext reply: cc %.2s phy %u status %u rules 2g %u 5g %u bytes %u\n",
+	    reg_info->alpha2, reg_info->phy_id, reg_info->status_code,
+	    reg_info->num_2ghz_reg_rules, reg_info->num_5ghz_reg_rules, (unsigned)M_PKTLEN(m));
+	if (reg_info->status_code != REG_SET_CC_STATUS_PASS) {
+		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+		return 0;
+	}
 
 	if (reg_info->num_2ghz_reg_rules > MAX_REG_RULES ||
 	    reg_info->num_5ghz_reg_rules > MAX_REG_RULES) {
@@ -11885,7 +11943,7 @@ qwz_pull_reg_chan_list_ext_update_ev(struct qwz_softc *sc, struct mbuf *m,
 		printf("%s: No 2 GHz/5 GHz regulatory rules available in "
 		    "the ext event info\n", __func__);
 		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
-		return EINVAL;
+		return ENODATA;
 	}
 
 	memcpy(reg_info->alpha2, &chan_list_event_hdr->alpha2, REG_ALPHA2_LEN);
@@ -11918,9 +11976,13 @@ qwz_pull_reg_chan_list_ext_update_ev(struct qwz_softc *sc, struct mbuf *m,
 	    "%s: num_2ghz_reg_rules %d num_5ghz_reg_rules %d\n", __func__,
 	    num_2ghz_reg_rules, num_5ghz_reg_rules);
 
-	wmi_reg_rule = (struct wmi_regulatory_ext_rule *)
-	    ((uint8_t *)chan_list_event_hdr + sizeof(*chan_list_event_hdr)
-	    + sizeof(struct wmi_tlv));
+	wmi_reg_rule = (struct wmi_regulatory_ext_rule *)qwz_reg_rule_array(m,
+	    chan_list_event_hdr, sizeof(*chan_list_event_hdr),
+	    num_2ghz_reg_rules + num_5ghz_reg_rules, sizeof(*wmi_reg_rule));
+	if (!wmi_reg_rule) {
+		free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
+		return EPROTO;
+	}
 
 	if (num_2ghz_reg_rules) {
 		reg_info->reg_rules_2ghz_ptr =
@@ -12176,10 +12238,20 @@ qwz_reg_chan_list_event(struct qwz_softc *sc, struct mbuf *m,
 	else
 		ret = qwz_pull_reg_chan_list_ext_update_ev(sc, m, reg_info);
 
+	if (ret == ENODATA) {
+		/* A status-only response acknowledges country, without replacing
+		 * the current channel permissions with an empty/world table. */
+		if (!sc->reg_country_rules_valid)
+			qwz_init_channels_world(sc);
+		qwz_reg_country_event(sc, reg_info);
+		ret = 0;
+		goto mem_free;
+	}
 	if (ret) {
 		printf("%s: failed to extract regulatory info from "
 		    "received event\n", sc->sc_dev.dv_xname);
-		qwz_init_channels_world(sc);
+		if (!sc->reg_country_rules_valid)
+			qwz_init_channels_world(sc);
 		goto fallback;
 	}
 
@@ -12192,12 +12264,14 @@ qwz_reg_chan_list_event(struct qwz_softc *sc, struct mbuf *m,
 		 */
 		printf("%s: Failed to set the requested Country "
 		    "regulatory setting\n", __func__);
-		qwz_init_channels_world(sc);
+		if (!sc->reg_country_rules_valid)
+			qwz_init_channels_world(sc);
 		qwz_reg_country_event(sc, reg_info);
 		goto mem_free;
 	}
 
 	qwz_init_channels(sc, reg_info);
+	sc->reg_country_rules_valid = 1;
 	qwz_reg_country_event(sc, reg_info);
 	/* M0 (C29): what the firmware's regulatory event carried (6 GHz rule counts show whether it reports 6 GHz at all) */
 	qwz_log("qwz: dossier: regulatory: cc %.2s dfs %u rules 2g %u 5g %u 6g ap %u client %u ext %d status %d\n",
@@ -12684,8 +12758,10 @@ qwz_chan_info_event(struct qwz_softc *sc, struct mbuf *m)
 	switch (sc->scan.state) {
 	case ATH12K_SCAN_IDLE:
 	case ATH12K_SCAN_STARTING:
-		printf("%s: received chan info event without a scan request, "
-		    "ignoring\n", sc->sc_dev.dv_xname);
+		/* Native ROC reports are expected while the infrastructure scan
+		 * state is idle. Keep them from flooding the diagnostic ring. */
+		if (!sc->mon_coex && qwz_log_ratelimit(&sc->sc_log_evt, 4, 256))
+			qwz_log("qwz: chan info without infrastructure scan, ignoring\n");
 		goto exit;
 	case ATH12K_SCAN_RUNNING:
 	case ATH12K_SCAN_ABORTING:
@@ -20543,6 +20619,7 @@ qwz_core_start(struct qwz_softc *sc)
 	sc->reg_country_pending = sc->reg_country_request_error = 0;
 	sc->reg_country_status = UINT32_MAX;
 	sc->reg_country_updates = 0;
+	sc->reg_country_rules_valid = 0;
 
 	ret = qwz_wmi_attach(sc);
 	if (ret) {

@@ -91,6 +91,7 @@ static int rw_enter_write(rwlock *l) {if(l->held)return EBUSY;l->held=1;return 0
 '''
 
 names = ["qwz_mon_set_native_rx", "qwz_mon_native_auto_enable", "qwz_mon_native_auto_state",
+         "qwz_mon_native_set_preferred_channel", "qwz_mon_native_preferred_channel",
          "qwz_mon_native_auto_allowed", "qwz_mon_native_auto_channel", "qwz_mon_native_auto_tick",
          "qwz_mon_native_auto_start", "qwz_mon_gated", "qwz_mon_native_pause"]
 main = r'''
@@ -201,10 +202,15 @@ int main() {
     qwz_mon_set_native_rx(nullptr,nullptr); qwz_mon_stop(&preferred);
     qwz_mon_set_native_rx(rx,&preferred); qwz_mon_native_auto_enable(1);
     qwz_mon_native_auto_start(&preferred); assert(chosen==44);
-    // A changed regulatory table still wins over the remembered hint.
+    // Explicit tuning matches the working manual profile on passive-scan
+    // channels; it must never silently retarget this preference to channel 6.
     qwz_mon_stop(&preferred);
     preferred.sc_ic.ic_channels[44].ic_flags=IEEE80211_CHAN_PASSIVE;
-    qwz_mon_native_auto_start(&preferred); assert(chosen==149);
+    qwz_mon_native_auto_start(&preferred); assert(chosen==44);
+    qwz_mon_stop(&preferred);
+    preferred.sc_ic.ic_channels[44].ic_flags=IEEE80211_CHAN_DFS;
+    const int beforeDfs=starts;
+    qwz_mon_native_auto_start(&preferred); assert(starts==beforeDfs && !preferred.mon_active);
     // Explicit stop clears the hint and remains stopped across timer ticks.
     qwz_mon_gated(nullptr,nullptr,&selected,(void*)1,nullptr);
     assert(!preferred.mon_active && preferred.mon_native_manual && !preferred.mon_native_preferred_channel);
@@ -215,6 +221,31 @@ int main() {
     qwz_mon_native_auto_enable(1); start_result=EIO;
     qwz_mon_gated(nullptr,(void*)(intptr_t)149,&selected,(void*)1,nullptr);
     assert(selected==EIO && preferred.mon_native_manual && !preferred.mon_native_owned);
+    assert(qwz_mon_native_set_preferred_channel(149)==0);
+    assert(qwz_mon_native_preferred_channel()==149);
+    assert(qwz_mon_native_set_preferred_channel(7)==EINVAL && qwz_mon_native_preferred_channel()==149);
+    assert(qwz_mon_native_set_preferred_channel(0)==0 && !qwz_mon_native_preferred_channel());
+    // Reproduce the shipped plist profile on world/passive firmware: boot,
+    // failed hotspot attempt, normal rejoin, and firmware sleep/wake.
+    qwz_softc boot;qwz_mon_sc=&boot;
+    boot.attached=boot.sc_vif.is_up=boot.sc_vif.is_started=boot.sc_awdl_addr_valid=1;
+    boot.sc_ic.ic_state=IEEE80211_S_RUN;boot.sc_ic.ic_bss=&preferredBss;
+    boot.sc_ic.ic_channels[149]={5745,IEEE80211_CHAN_PASSIVE};
+    boot.sc_ic.ic_chan_active[149/8]|=1U<<(149%8);
+    boot.sc_ic.ic_channels[6]={2437,0};boot.sc_ic.ic_chan_active[6/8]|=1U<<(6%8);
+    qwz_mon_set_native_rx(rx,&boot);
+    assert(qwz_mon_native_set_preferred_channel(149)==0);
+    qwz_mon_native_auto_enable(1);start_result=0;
+    qwz_mon_native_auto_start(&boot);assert(chosen==149 && boot.mon_active);
+    assert(qwz_mon_native_pause(&boot.sc_ic)==0 && boot.mon_native_auto);
+    now+=13000000000ULL;
+    qwz_mon_native_auto_start(&boot);assert(chosen==149 && boot.mon_active);
+    boot.unavailable=1;qwz_mon_stop(&boot);
+    const int sleepingStarts=starts;
+    qwz_mon_native_auto_start(&boot);assert(starts==sleepingStarts);
+    boot.unavailable=0;
+    qwz_mon_set_native_rx(rx,&boot);qwz_mon_native_auto_enable(1);
+    qwz_mon_native_auto_start(&boot);assert(chosen==149 && boot.mon_native_owned);
     puts("ok: automatic start waits for Wi-Fi, uses deferred work, respects manual stop and channel availability, cancels safely");
 }
 '''

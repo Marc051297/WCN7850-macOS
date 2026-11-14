@@ -2127,6 +2127,7 @@ struct qwz_softc {
 	int			fw_initialized;
 	char			reg_country[3], reg_country_requested[3];
 	int			reg_country_pending, reg_country_request_error;
+	int			reg_country_rules_valid;
 	uint32_t		reg_country_status, reg_country_updates;
 	int			fw_started;	/* macOS: a firmware ran since the last qwz_hal_srng_init */
 	int			ce_initialized;

@@ -77,11 +77,16 @@ void AirportItlwm::awdlNativeRadioStart()
 		return;
 	}
 	qwz_mon_set_native_rx(awdlNativeRadioRx, this);
+	if (auto *channel = OSDynamicCast(OSNumber, getProperty("QwzAWDLPreferredChannel"))) {
+		const int configured = int(channel->unsigned32BitValue());
+		const int error = qwz_mon_native_set_preferred_channel(configured);
+		setProperty("QwzAWDLConfiguredChannelError", uint64_t(error), 32);
+	}
 	int manual = 0;
 	qwz_mon_native_auto_enable(!PE_parse_boot_argn("-qwzawdlmanual", &manual, sizeof(manual)));
 	awdlNativeTimer->setTimeoutMS(50);
 	setProperty("QwzAWDLRadio", "started");
-	setProperty("QwzAWDLRadioBuild", "f2l-country-and-resume");
+	setProperty("QwzAWDLRadioBuild", "f2m-persistent-listener");
 	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
 	qwz_log_publish();
 }
@@ -200,7 +205,7 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 	if (cell > 0 && qwz_mon_native_tx_ready()) {
 		const bool dataActive = self->awdlNativeLastDataUS != 0 && now - self->awdlNativeLastDataUS < kDataActiveUS;
 		const uint64_t sinceSync = now - self->awdlNativeLastSyncUS;
-		if (self->awdlNativeLastSyncUS == 0 || sinceSync >= (dataActive ? kSyncDataIntervalUS : ItlAWDL::kSyncIdleIntervalUS)) {
+		if (qwz_mon_tx_room() > 0 && (self->awdlNativeLastSyncUS == 0 || sinceSync >= (dataActive ? kSyncDataIntervalUS : ItlAWDL::kSyncIdleIntervalUS))) {
 			mbuf_t m = nullptr;
 			const IOReturn built = self->buildAWDLSyncProbe(&m, now);
 			st.syncLastBuild = uint32_t(built);
@@ -243,7 +248,7 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 		}
 	}
 	// Return completed Skywalk packets even while waiting for a radio window.
-	if (cell > 0) {
+	if (ready) {
 		pending = self->serviceAWDLTransmit();
 		st.queued = self->queuedAWDLTransmit();
 	}
@@ -284,7 +289,7 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 		}
 	}
 	const bool dataActive = self->awdlNativeLastDataUS != 0 && now - self->awdlNativeLastDataUS < kDataActiveUS;
-	self->awdlNativeTimer->setTimeoutMS(cell <= 0 ? 200 : (dataActive || pending) ? 2 : 20);
+	self->awdlNativeTimer->setTimeoutMS(cell <= 0 ? (pending ? 20 : 200) : (dataActive || pending) ? 1 : 20);
 }
 #else
 unsigned itlAWDLFixedChannel() { return 149; }

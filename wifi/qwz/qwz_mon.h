@@ -176,6 +176,7 @@ void	qwz_mon_native_auto_enable(int enable);
 void	qwz_mon_native_auto_tick(void);
 const char *qwz_mon_native_auto_state(void);
 int	qwz_mon_native_preferred_channel(void);
+int	qwz_mon_native_set_preferred_channel(int);
 /* WCL holds the main gate. Pause native AWDL for a directed scan/join,
  * preserving automatic restart; ENOTSUP means this is not the native path. */
 int	qwz_mon_native_pause(struct ieee80211com *);

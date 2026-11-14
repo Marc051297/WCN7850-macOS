@@ -19,7 +19,7 @@ def block(marker):
 
 
 pump = block("while (budget > 0")
-sync = block("if (self->awdlNativeLastSyncUS == 0")
+sync = block("if (qwz_mon_tx_room() > 0")
 prefix = r'''
 #include <cassert>
 #include <cerrno>
@@ -31,7 +31,12 @@ constexpr int kIOReturnSuccess=0, kIOReturnNotReady=1;
 struct Packet { uint8_t byte; };
 using mbuf_t=Packet *;
 static int credits=2, reserve=1, ready=1, sent, freed, dequeued, roomChecks;
-static int closeAfterSend, syncResult;
+static int closeAfterSend, syncResult, syncCalls;
+static int cell=149,autoTicks,services;
+static uint64_t mockNow=1000000;
+static uint64_t nowUS() {return mockNow;}
+static void qwz_mon_native_auto_tick() {++autoTicks;}
+static int qwz_mon_status() {return cell;}
 static bool qwz_mon_native_tx_ready() { return ready; }
 static int qwz_mon_tx_room() { ++roomChecks; return credits>reserve ? 60 : 0; }
 static void *mbuf_data(mbuf_t p) { return p; }
@@ -46,29 +51,47 @@ static int qwz_mon_tx_raw(const uint8_t *,size_t) {
 struct Stats {
     uint64_t dataSent=0,dataTxErrors=0,syncSent=0,syncTxErrors=0,syncBuildFailures=0;
     uint64_t txSubmittedBytes=0;
+    uint64_t cellTimerTicks=0,queued=0;
     uint32_t dataLastTxError=28,syncLastTxError=28,syncLastBuild=1;
 };
 struct MockSelf {
     Stats awdlNativeStats;
     uint64_t awdlNativeLastDataUS=0,awdlNativeLastSyncUS=0;
     int queued=40;
+    bool awdlInterfaceTest=true,awdlManagementInputEnabled=true;
+    void *fAWDLInterface=this;
+    bool serviceAWDLTransmit() {++services;return queued>0;}
+    unsigned queuedAWDLTransmit() {return queued;}
     IOReturn buildAWDLTransmit(mbuf_t *p) {
         if(!queued) return kIOReturnNotReady;
         --queued; ++dequeued; *p=new Packet{}; return kIOReturnSuccess;
     }
     IOReturn buildAWDLSyncProbe(mbuf_t *p,uint64_t) {
+        ++syncCalls;
         if(syncResult==0) *p=new Packet{};
         return syncResult;
     }
 };
 namespace ItlAWDL { constexpr uint64_t kSyncIdleIntervalUS=45000; }
 constexpr uint64_t kSyncDataIntervalUS=100000;
+constexpr uint64_t kDataActiveUS=1000000;
+constexpr unsigned kPumpBudget=16;
 '''
 code = prefix + "\nstatic void pump(MockSelf *self,uint64_t now) { auto &st=self->awdlNativeStats; unsigned budget=16;\n" + pump + "\n}\n"
 code += "static void syncFrame(MockSelf *self,uint64_t now) { auto &st=self->awdlNativeStats; bool dataActive=false; uint64_t sinceSync=now-self->awdlNativeLastSyncUS;\n" + sync + "\n}\n"
+tick_start = source.index("const bool ready = self->awdlInterfaceTest")
+tick_end = source.index("\n\tif (now - self->awdlNativeLastPublishUS", tick_start)
+code += "static bool tick(MockSelf *self) { auto &st=self->awdlNativeStats;\n" + source[tick_start:tick_end] + "\nreturn pending;\n}\n"
 code += r'''
 int main() {
     MockSelf self;
+    // Wi-Fi join/hotspot pause removes the cell but must not strand native
+    // packet completions or dequeue resumption behind the radio condition.
+    cell=0;
+    assert(tick(&self) && services==1 && autoTicks==1 && !dequeued && !syncCalls);
+    self.awdlManagementInputEnabled=false;
+    assert(!tick(&self) && services==1 && autoTicks==1);
+    self.awdlManagementInputEnabled=true;cell=149;
     // One available credit with many free slots: dequeue only one packet.
     pump(&self,100);
     assert(sent==1 && dequeued==1 && freed==1 && self.queued==39);
@@ -90,6 +113,9 @@ int main() {
     assert(!self.awdlNativeStats.dataTxErrors && dequeued==freed);
     assert(self.awdlNativeStats.txSubmittedBytes==self.awdlNativeStats.dataSent);
     // Sync's credit is spent before the data pump checks room.
+    ready=1; closeAfterSend=0; credits=reserve;
+    syncFrame(&self,100000);
+    assert(!syncCalls && !self.awdlNativeLastSyncUS);
     ready=1; closeAfterSend=0; credits=2;
     syncFrame(&self,100000);
     const int before=dequeued;

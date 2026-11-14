@@ -3085,6 +3085,17 @@ qwz_mon_native_preferred_channel(void)
 	return qwz_mon_sc != NULL ? qwz_mon_sc->mon_native_preferred_channel : 0;
 }
 
+int
+qwz_mon_native_set_preferred_channel(int channel)
+{
+	if (qwz_mon_sc == NULL)
+		return ENXIO;
+	if (channel != 0 && channel != 6 && channel != 44 && channel != 149)
+		return EINVAL;
+	qwz_mon_sc->mon_native_preferred_channel = channel;
+	return 0;
+}
+
 static int
 qwz_mon_native_auto_allowed(struct qwz_softc *sc)
 {
@@ -3107,6 +3118,17 @@ static int
 qwz_mon_native_auto_channel(struct qwz_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
+	if (sc->mon_native_preferred_channel > 0) {
+		const unsigned ch = (unsigned)sc->mon_native_preferred_channel;
+		if (ch >= nitems(ic->ic_channels))
+			return 0;
+		const struct ieee80211_channel *c = &ic->ic_channels[ch];
+		// An explicit native channel uses the existing manual tuning policy.
+		// PASSIVE controls probe scanning; do not silently replace a requested
+		// listener channel with 6. Firmware still accepts/rejects vdev/ROC/TX.
+		return c->ic_freq != 0 && isset(ic->ic_chan_active, ch) &&
+		    !(c->ic_flags & (IEEE80211_CHAN_DFS | IEEE80211_CHAN_NOADHOC)) ? (int)ch : 0;
+	}
 	const unsigned candidates[] = {(unsigned)sc->mon_native_preferred_channel, 149, 6};
 	for (unsigned i = 0; i < nitems(candidates); ++i) {
 		const unsigned ch = candidates[i];
