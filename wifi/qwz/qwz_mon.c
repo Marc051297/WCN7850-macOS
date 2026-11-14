@@ -70,6 +70,7 @@ int	qwz_init(struct ifnet *);
 static void qwz_mon_sender_peer(struct qwz_softc *, const uint8_t *, int);
 static void qwz_mon_coex_quota_apply(struct qwz_softc *, int);	/* F2-3 */
 static void qwz_mon_coex_quota_clear(struct qwz_softc *);
+static void qwz_mon_native_auto_start(struct qwz_softc *);
 static int qwz_mon_parse_mac(const char *, uint8_t *);
 static struct qwz_softc *qwz_mon_sc;	/* the one softc; set by qwz_mon_attach() */
 
@@ -1090,10 +1091,19 @@ moncap_free(void)
 /* F2 (native AWDL): the second consumer of every captured frame (qwz_mon.h). */
 static qwz_mon_native_rx_fn qwz_mon_native_rx;
 static void *qwz_mon_native_rx_arg;
+static const char *qwz_mon_native_state = "disabled";
 
 void
 qwz_mon_set_native_rx(qwz_mon_native_rx_fn fn, void *arg)
 {
+	if (fn == NULL && qwz_mon_sc != NULL) {
+		qwz_mon_sc->mon_native_auto = 0;
+		qwz_mon_native_state = "stopped";
+		if (qwz_mon_sc->mon_native_owned) {
+			__atomic_fetch_or(&qwz_mon_sc->mon_coex_task_why, 1, __ATOMIC_ACQ_REL);
+			task_add(systq, &qwz_mon_sc->mon_coex_task);
+		}
+	}
 	__atomic_store_n(&qwz_mon_native_rx_arg, arg, __ATOMIC_RELEASE);
 	__atomic_store_n(&qwz_mon_native_rx, fn, __ATOMIC_RELEASE);
 }
@@ -2493,6 +2503,12 @@ qwz_mon_stop(struct qwz_softc *sc)
 		return;
 	}
 	sc->mon_active = 0;
+	sc->mon_native_owned = 0;
+	if (sc->mon_dwell_inflight) {
+		const int stopped = qwz_mon_dwell_cancel(sc);
+		if (stopped)
+			printf("qwz: mon: dwell cancellation failed: %d\n", stopped);
+	}
 	sc->mon_dwell_onchannel = 0;
 	sc->mon_dwell_inflight = 0;
 	timeout_del(&sc->mon_cell_timer);
@@ -2589,6 +2605,7 @@ qwz_mon_epoch_reset(struct qwz_softc *sc)
 		printf("qwz: mon: capture cell ended by a firmware teardown (epoch %u)\n", sc->sc_fw_epoch);
 	sc->mon_active = 0;
 	sc->mon_coex = 0;		/* K5 (L1-C2): a firmware teardown ends a coex cell too */
+	sc->mon_native_owned = 0;
 	sc->mon_dwell_inflight = 0;
 	sc->mon_dwell_onchannel = 0;
 	sc->mon_dwell_arrived_ns = 0;
@@ -2895,7 +2912,7 @@ qwz_mon_detach(struct qwz_softc *sc)
 }
 
 static IOReturn
-qwz_mon_gated(OSObject *, void *arg0, void *arg1, void *, void *)
+qwz_mon_gated(OSObject *, void *arg0, void *arg1, void *user, void *)
 {
 	struct qwz_softc *sc = qwz_mon_sc;
 	int chan = (int)(intptr_t)arg0;
@@ -2911,6 +2928,10 @@ qwz_mon_gated(OSObject *, void *arg0, void *arg1, void *, void *)
 		*errp = ret;
 		return kIOReturnSuccess;
 	}
+	if (user != NULL) {
+		sc->mon_native_manual = 1;
+		qwz_mon_native_state = "manual";
+	}
 	if (chan == 0) {
 		qwz_mon_stop(sc);
 		*errp = 0;
@@ -2921,6 +2942,29 @@ qwz_mon_gated(OSObject *, void *arg0, void *arg1, void *, void *)
 	}
 	rw_exit(&sc->ioctl_rwl);
 	return kIOReturnSuccess;
+}
+
+int
+qwz_mon_native_pause(struct ieee80211com *ic)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	if (sc == NULL || ic != &sc->sc_ic ||
+	    __atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE) == NULL)
+		return ENOTSUP;
+	// Give the tether scan/retry/join sequence time to finish. Further
+	// directed requests renew this window, without changing manual policy.
+	sc->mon_native_next_ns = getnsecuptime() + 12000000000ULL;
+	sc->mon_native_pause_until_ns = sc->mon_native_next_ns;
+	qwz_mon_native_state = "paused-for-wifi";
+	if (sc->mon_coex_setup)
+		return EBUSY;
+	if (!sc->mon_active)
+		return 0;
+	if (!sc->mon_coex)
+		return EBUSY;
+	int result = 0;
+	qwz_mon_gated(NULL, NULL, &result, NULL, NULL);
+	return result;
 }
 
 /*
@@ -2980,6 +3024,124 @@ qwz_mon_coex_task_fn(void *arg)
 			ret = qwz_wmi_vdev_up(sc, sc->sc_vif.vdev_id, sc->pdevs[0].pdev_id, sc->sc_vif.aid, sc->sc_vif.bssid, NULL, 0, 0);
 		printf("qwz: mon: coex: step 3: station vdev restarted and brought up: %d\n", ret);
 	}
+	if ((why & 8) && !(why & 7))
+		qwz_mon_native_auto_start(sc);
+}
+
+void
+qwz_mon_native_auto_enable(int enable)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	if (sc == NULL)
+		return;
+	sc->mon_native_auto = enable != 0;
+	sc->mon_native_manual = 0;
+	sc->mon_native_next_ns = 0;
+	sc->mon_native_pause_until_ns = 0;
+	qwz_mon_native_state = enable ? "waiting-for-wifi" : "manual";
+}
+
+const char *
+qwz_mon_native_auto_state(void)
+{
+	return qwz_mon_native_state;
+}
+
+static int
+qwz_mon_native_auto_allowed(struct qwz_softc *sc)
+{
+	return sc != NULL && sc == qwz_mon_sc && sc->mon_native_auto && !sc->mon_native_manual &&
+	    getnsecuptime() >= sc->mon_native_pause_until_ns &&
+	    __atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE) != NULL &&
+	    __atomic_load_n(&sc->sc_awdl_addr_valid, __ATOMIC_ACQUIRE) &&
+	    sc->attached && !qwz_mon_fw_unavail(sc) && !sc->mon_active && !sc->mon_coex_setup &&
+	    sc->sc_ic.ic_state == IEEE80211_S_RUN && sc->sc_vif.is_up && sc->sc_vif.is_started &&
+	    sc->sc_ic.ic_bss != NULL && sc->sc_ic.ic_bss->ni_chan != NULL &&
+	    !sc->sc_ic.ic_wcl_join_requested && !sc->sc_ic.ic_wcl_scan_requested &&
+	    sc->scan.state == ATH12K_SCAN_IDLE;
+}
+
+/* Use only active channels that permit initiating traffic. The verified setup
+ * is 149/HT20; 6 is the fallback, as for the Intel listener. */
+static int
+qwz_mon_native_auto_channel(struct qwz_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	const unsigned candidates[] = {149, 6};
+	for (unsigned i = 0; i < nitems(candidates); ++i) {
+		const unsigned ch = candidates[i];
+		const struct ieee80211_channel *c = &ic->ic_channels[ch];
+		if (c->ic_freq != 0 && isset(ic->ic_chan_active, ch) &&
+		    !(c->ic_flags & (IEEE80211_CHAN_PASSIVE | IEEE80211_CHAN_DFS | IEEE80211_CHAN_NOADHOC)))
+			return (int)ch;
+	}
+	return 0;
+}
+
+void
+qwz_mon_native_auto_tick(void)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	if (sc == NULL || !sc->mon_native_auto || sc->mon_native_manual)
+		return;
+	if (sc->mon_active) {
+		qwz_mon_native_state = sc->mon_native_owned ? "running" : "manual";
+		return;
+	}
+	if (getnsecuptime() < sc->mon_native_pause_until_ns) {
+		qwz_mon_native_state = "paused-for-wifi";
+		return;
+	}
+	if (!qwz_mon_native_auto_allowed(sc)) {
+		qwz_mon_native_state = "waiting-for-wifi";
+		return;
+	}
+	const uint64_t now = getnsecuptime();
+	if (now < sc->mon_native_next_ns)
+		return;
+	sc->mon_native_next_ns = now + 5000000000ULL;
+	qwz_mon_native_state = "queued";
+	__atomic_fetch_or(&sc->mon_coex_task_why, 8, __ATOMIC_ACQ_REL);
+	task_add(systq, &sc->mon_coex_task);
+}
+
+/* systq worker, under the gate. Never wait for another ioctl's lock: it may
+ * be doing a Wi-Fi transition. All prerequisites are checked again here. */
+static void
+qwz_mon_native_auto_start(struct qwz_softc *sc)
+{
+	if (!qwz_mon_native_auto_allowed(sc))
+		return;
+	if (rw_enter(&sc->ioctl_rwl, RW_WRITE | RW_NOSLEEP) != 0) {
+		qwz_mon_native_state = "waiting-for-ioctl";
+		return;
+	}
+	const int channel = qwz_mon_native_auto_channel(sc);
+	if (channel == 0) {
+		qwz_mon_native_state = "no-active-channel";
+		rw_exit(&sc->ioctl_rwl);
+		return;
+	}
+	qwz_moncoex = qwz_moncoexmcc = 1;
+	qwz_moncoexjoin = 1;
+	qwz_moncoexquota = qwz_moncoexfilter = 0;
+	qwz_mon_flags = QWZ_MON_F_OFFSETS | QWZ_MON_F_RXMON | QWZ_MON_F_KEEP_FILTER | QWZ_MON_F_REO | QWZ_MON_F_AP;
+	qwz_moncoexdwell = qwz_moncoexrest = 100;
+	qwz_moncoexdwellflags = 7;
+	const int result = qwz_mon_start(sc, channel);
+	// Start releases the gate while awaiting firmware. Cancellation during
+	// that wait must not leave an automatically created cell behind.
+	if (result == 0 && (!sc->mon_native_auto || sc->mon_native_manual ||
+	    getnsecuptime() < sc->mon_native_pause_until_ns ||
+	    __atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE) == NULL)) {
+		qwz_mon_stop(sc);
+		qwz_mon_native_state = "stopped";
+	} else {
+		sc->mon_native_owned = result == 0;
+		qwz_mon_native_state = result == 0 ? "running" : "retrying";
+	}
+	printf("qwz: mon: native auto: channel %d start result %d (%s)\n", channel, result, qwz_mon_native_state);
+	rw_exit(&sc->ioctl_rwl);
 }
 
 /*
@@ -3051,8 +3213,8 @@ qwz_mon_coex_probe(struct qwz_softc *sc)
 	}
 }
 
-int
-qwz_mon_set(int chan)
+static int
+qwz_mon_set_kind(int chan, int user)
 {
 	IOCommandGate *gate = qwz_compat_gate();
 	int err = ENXIO;
@@ -3061,8 +3223,20 @@ qwz_mon_set(int chan)
 		return ENXIO;
 	if (chan < 0 || (chan != 0 && qwz_mon_chan_freq(chan) == 0))
 		return EINVAL;
-	gate->runAction(qwz_mon_gated, (void *)(intptr_t)chan, &err);
+	gate->runAction(qwz_mon_gated, (void *)(intptr_t)chan, &err, user ? (void *)1 : NULL);
 	return err;
+}
+
+int
+qwz_mon_set(int chan)
+{
+	return qwz_mon_set_kind(chan, 0);
+}
+
+int
+qwz_mon_user_set(int chan)
+{
+	return qwz_mon_set_kind(chan, 1);
 }
 
 static IOReturn

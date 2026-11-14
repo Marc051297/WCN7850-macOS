@@ -68,7 +68,10 @@ struct qwz_softc {
              dwell_onchan, dwell_fail, dwell_done, ufr_sent, ufr_full, ufr_fail; } mon_stats;
     struct { int state; } scan;
     int sc_awdltest_active, crashed, fw_initialized;
+    struct { uint32_t pdev_id; } pdevs[1];
 };
+constexpr int WLAN_SCAN_CANCEL_SINGLE=1;
+struct scan_cancel_param {uint32_t requester,scan_id,req_type,vdev_id,pdev_id;};
 struct wmi_scan_event { uint32_t scan_id, scan_req_id, vdev_id, event_type, channel_freq, reason; };
 struct scan_req_params {
     uint32_t vdev_id, scan_id, scan_req_id, scan_priority, scan_f_passive,
@@ -99,6 +102,11 @@ static void bsd_free(void *p,int,size_t) { if(p) { --live_alloc; free(p); } }
 static scan_req_params last_request;
 static uint32_t last_frequency;
 static int submit_result;
+static int cancels;
+static scan_cancel_param last_cancel;
+static int qwz_wmi_send_scan_stop_cmd(qwz_softc *,scan_cancel_param *p) {
+    ++cancels; last_cancel=*p; return submit_result;
+}
 static void qwz_wmi_start_scan_init(qwz_softc *,scan_req_params *) {}
 static int qwz_wmi_send_scan_start_cmd(qwz_softc *,scan_req_params *p) {
     last_request=*p; last_frequency=p->chan_list[0]; return submit_result;
@@ -109,6 +117,7 @@ functions = "\n".join(function(MON, name) for name in (
     "qwz_mon_native_identity", "qwz_mon_native_tx_ready", "qwz_mon_tx_raw",
     "qwz_mon_dwell_clamp", "qwz_mon_dwell_event"))
 functions += "\n" + function(QWZ, "qwz_mon_dwell_start")
+functions += "\n" + function(QWZ, "qwz_mon_dwell_cancel")
 functions += "\nstatic int station_events;\nstatic void dispatch(qwz_softc *sc, wmi_scan_event scan_ev) {\n"
 functions += dispatch + "\n++station_events;\n}\n"
 functions += "\nstatic uint32_t frequency(qwz_softc *sc,qwz_vif *arvif) { struct {uint32_t chanfreq;} result, *cmd=&result;\n"
@@ -203,6 +212,15 @@ int main() {
     sc.scan.state=1;
     assert(qwz_mon_dwell_start(&sc,5745,100)==EBUSY && live_alloc==0);
     sc.scan.state=0;
+    // Yielding to a tether scan cancels only the outstanding ROC visit.
+    sc.mon_dwell_inflight=0;
+    assert(qwz_mon_dwell_cancel(&sc)==0 && cancels==0);
+    sc.mon_dwell_inflight=1; submit_result=0; sc.pdevs[0].pdev_id=0;
+    assert(qwz_mon_dwell_cancel(&sc)==0 && cancels==1);
+    assert(last_cancel.scan_id==sc.mon_dwell_scan_id && last_cancel.requester==2);
+    assert(last_cancel.req_type==WLAN_SCAN_CANCEL_SINGLE && last_cancel.vdev_id==sc.sc_vif.vdev_id);
+    submit_result=EIO; assert(qwz_mon_dwell_cancel(&sc)==EIO && cancels==2);
+    submit_result=0;
 
     // Same-channel mode doesn't require ROC. Stop, a changed address or
     // failed firmware always closes admission.

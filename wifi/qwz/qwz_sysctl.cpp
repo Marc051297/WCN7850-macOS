@@ -495,7 +495,7 @@ qwz_sysctl_mon(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req 
 
 	if (err || req->newptr == USER_ADDR_NULL)
 		return err;
-	return qwz_mon_set(v);
+	return qwz_mon_user_set(v);
 }
 
 /* debug.qwz.scanraw (K1 W2c; K2c C6): the value is a plain int as before; a write also bumps qwz_scanraw_gen, which re-arms the per-boot evidence budgets */

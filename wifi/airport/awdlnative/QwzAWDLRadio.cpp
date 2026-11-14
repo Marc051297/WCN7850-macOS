@@ -76,9 +76,11 @@ void AirportItlwm::awdlNativeRadioStart()
 		return;
 	}
 	qwz_mon_set_native_rx(awdlNativeRadioRx, this);
+	int manual = 0;
+	qwz_mon_native_auto_enable(!PE_parse_boot_argn("-qwzawdlmanual", &manual, sizeof(manual)));
 	awdlNativeTimer->setTimeoutMS(50);
 	setProperty("QwzAWDLRadio", "started");
-	setProperty("QwzAWDLRadioBuild", "f2h-native-listener");
+	setProperty("QwzAWDLRadioBuild", "f2i-auto-credit-pacing");
 	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
 	qwz_log_publish();
 }
@@ -186,6 +188,8 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 	auto &st = self->awdlNativeStats;
 	++st.timerTicks;
 	const bool ready = self->awdlInterfaceTest && self->fAWDLInterface != nullptr && self->awdlManagementInputEnabled;
+	if (ready)
+		qwz_mon_native_auto_tick();
 	const int cell = ready ? qwz_mon_status() : 0;
 	const uint64_t now = nowUS();
 	bool pending = false;
@@ -197,38 +201,38 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 		if (self->awdlNativeLastSyncUS == 0 || sinceSync >= (dataActive ? kSyncDataIntervalUS : ItlAWDL::kSyncIdleIntervalUS)) {
 			mbuf_t m = nullptr;
 			const IOReturn built = self->buildAWDLSyncProbe(&m, now);
+			st.syncLastBuild = uint32_t(built);
 			if (built == kIOReturnSuccess && m != nullptr) {
 				const int err = qwz_mon_tx_raw(static_cast<const uint8_t *>(mbuf_data(m)), mbuf_len(m));
+				st.syncLastTxError = uint32_t(err);
 				if (err == 0) {
 					++st.syncSent;
 					self->awdlNativeLastSyncUS = now;
 				} else {
 					++st.syncTxErrors;
-					st.syncLastTxError = uint32_t(err);
 				}
 			} else {
 				++st.syncBuildFailures;
-				st.syncLastBuild = uint32_t(built);
 			}
 			if (m != nullptr)
 				mbuf_freem(m);
 		}
 		unsigned budget = kPumpBudget;
-		int room = qwz_mon_tx_room();
-		while (budget > 0 && room > 0) {
+		// A send spends a WMI credit. Recheck before dequeuing each packet;
+		// the slot count alone can outlive the available transport credit.
+		while (budget > 0 && qwz_mon_native_tx_ready() && qwz_mon_tx_room() > 0) {
 			mbuf_t m = nullptr;
 			if (self->buildAWDLTransmit(&m) != kIOReturnSuccess || m == nullptr)
 				break;
 			const int err = qwz_mon_tx_raw(static_cast<const uint8_t *>(mbuf_data(m)), mbuf_len(m));
+			st.dataLastTxError = uint32_t(err);
 			mbuf_freem(m);
 			--budget;
-			--room;
 			if (err == 0) {
 				++st.dataSent;
 				self->awdlNativeLastDataUS = now;
 			} else {
 				++st.dataTxErrors;
-				st.dataLastTxError = uint32_t(err);
 				if (err == ENOSPC || err == EAGAIN)
 					break;
 			}
@@ -257,6 +261,7 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 			put("dataSent", st.dataSent); put("dataTxErrors", st.dataTxErrors); put("dataLastTxError", st.dataLastTxError);
 			put("queued", st.queued);
 			self->setProperty("QwzAWDLRadioStats", d);
+			self->setProperty("QwzAWDLRadioAuto", qwz_mon_native_auto_state());
 			d->release();
 		}
 	}

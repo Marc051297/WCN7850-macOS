@@ -105,6 +105,7 @@ extern int qwz_moncoexdwell, qwz_moncoexrest, qwz_moncoexdwellflags;	/* F2e */
 /* F2h: each dwell uses 0xA001..0xAfff, request id 2. Ordinary scans use 0xA000, request id 1. */
 #define QWZ_MON_DWELL_REQ_ID	2	/* the station's scans use 1 */
 int	qwz_mon_dwell_start(struct qwz_softc *, uint32_t freq, int dwell_ms);	/* qwz.c: sends the scan; may sleep for a WMI credit */
+int	qwz_mon_dwell_cancel(struct qwz_softc *);
 void	qwz_mon_dwell_event(struct qwz_softc *, uint32_t type, uint32_t freq, uint32_t reason);	/* qwz_mon.c: the visit's scan events */
 extern int qwz_moncoexmac;	/* F2d: the ring moncoexfilter 3 swaps (-1 by band) */
 /* F2-2: debug.qwz.moncoexmcc, default 0: the coex cell on its own channel (6, 44 or 149) beside a station on another channel; read at cell start and by the probe. */
@@ -170,6 +171,14 @@ int	qwz_mon_tx_room(void);
 /* Native frames wait for the matching listener address and, during ROC,
  * the firmware's arrival on the requested channel. Does not consume packets. */
 int	qwz_mon_native_tx_ready(void);
+/* Timer-safe scheduler; firmware start/stop work runs on systq, never the timer. */
+void	qwz_mon_native_auto_enable(int enable);
+void	qwz_mon_native_auto_tick(void);
+const char *qwz_mon_native_auto_state(void);
+/* WCL holds the main gate. Pause native AWDL for a directed scan/join,
+ * preserving automatic restart; ENOTSUP means this is not the native path. */
+int	qwz_mon_native_pause(struct ieee80211com *);
+int	qwz_mon_user_set(int chan);	/* explicit sysctl override suspends auto mode */
 /* F2: send one 802.11 frame (no FCS) from the cell, the gate held by the caller; errno (ENOSPC: no slot, try later). */
 int	qwz_mon_tx_raw(const uint8_t *frame, size_t len);
 /* qwz_attach(): allocates the capture ring and remembers the softc. */

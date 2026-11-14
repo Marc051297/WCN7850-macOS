@@ -340,6 +340,18 @@ getSSID(struct apple80211_ssid_data *sd)
     return 6;
 }
 
+IOReturn AirportItlwmSkywalkInterface::noteRangingUnsupported(const char *operation)
+{
+    static uint32_t calls;
+    const uint32_t count = __atomic_add_fetch(&calls, 1u, __ATOMIC_RELAXED);
+    if (count <= 4 || (count & (count - 1)) == 0) {
+        setProperty("QwzRangingLastUnsupported", operation);
+        setProperty("QwzRangingUnsupportedRequests", count, 32);
+        qwz_log("airport: ranging: %s unsupported (request %u)\n", operation, count);
+    }
+    return kIOReturnUnsupported;
+}
+
 IOReturn AirportItlwmSkywalkInterface::
 getAUTH_TYPE(struct apple80211_authtype_data *ad)
 {

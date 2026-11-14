@@ -401,6 +401,15 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         scanLog("Busy", "gate state AUTH/ASSOC");
     if (!(ic->ic_if.if_flags & IFF_RUNNING))
         return kIOReturnNotReady;
+    if (AirportWCL::scanNeedsRadio(scan, request, 0x1550)) {
+        const int paused = qwz_mon_native_pause(ic);
+        if (paused != 0 && paused != ENOTSUP) {
+            scanLog("Busy", "native AWDL pause failed");
+            return kIOReturnBusy;
+        }
+        if (paused == 0)
+            scanLog("directed", "native AWDL paused for firmware scan");
+    }
     if (qwz_mon_scan_hold(ic) && !qwz_mon_holding(ic)) {
         // K5 (L1-C11): a coex cell shares the radio with the running station (debug.qwz.moncoexscan 1): no firmware scan may take the radio off the
         // cell's channel, so the scan completes at once and the node table keeps the results it has. Same completion as the hold below.
@@ -804,6 +813,13 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *r
         return kIOReturnNotReady; // M3 hold: no station to join with
     }
     if (qwz_mon_coex_running_ic(fHalService->get80211Controller())) {
+        const int paused = qwz_mon_native_pause(fHalService->get80211Controller());
+        if (paused == 0)
+            return startWCLJoin(join);
+        if (paused != ENOTSUP) {
+            explicit_bzero(&join, sizeof(join));
+            return kIOReturnBusy;
+        }
         // K5 (L1-C12): a coex cell shares the radio with the running station.
         if (qwz_moncoexjoin == 0) {
             static unsigned int coexRefused;

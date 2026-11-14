@@ -2379,6 +2379,8 @@ struct qwz_softc {
 	 * mon_coex_sta_addr is the station's own address; mon_coex_stopped_ns is when the last coex cell stopped.
 	 */
 	int				 mon_coex, mon_coex_setup, mon_coex_base_vdevs, mon_coex_base_peers, mon_coex_halt, mon_coex_swapped, mon_coex_probe;
+	int				 mon_native_auto, mon_native_manual, mon_native_owned;
+	uint64_t			 mon_native_next_ns, mon_native_pause_until_ns;
 	/* F2e: host-paced visits to the cell's channel (debug.qwz.moncoexdwell): one single-channel passive scan at a time on the station vdev */
 	struct task			 mon_dwell_task;
 	int				 mon_dwell_inflight, mon_dwell_onchannel;

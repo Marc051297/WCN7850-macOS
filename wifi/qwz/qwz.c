@@ -26533,6 +26533,20 @@ qwz_mon_dwell_start(struct qwz_softc *sc, uint32_t freq, int dwell_ms)
 	return ret;
 }
 
+int
+qwz_mon_dwell_cancel(struct qwz_softc *sc)
+{
+	if (!sc->mon_dwell_inflight || !sc->mon_dwell_scan_id)
+		return 0;
+	struct scan_cancel_param arg = {};
+	arg.req_type = WLAN_SCAN_CANCEL_SINGLE;
+	arg.scan_id = sc->mon_dwell_scan_id;
+	arg.requester = QWZ_MON_DWELL_REQ_ID;
+	arg.vdev_id = sc->sc_vif.vdev_id;
+	arg.pdev_id = sc->pdevs[0].pdev_id;
+	return qwz_wmi_send_scan_stop_cmd(sc, &arg);
+}
+
 #define ATH12K_MAC_SCAN_CMD_EVT_OVERHEAD		200 /* in msecs */
 
 int

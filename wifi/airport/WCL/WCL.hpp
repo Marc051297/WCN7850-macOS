@@ -462,6 +462,17 @@ inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsign
     return !restricted || (channel < 256 && (channels[channel / 8] & (1U << (channel % 8))));
 }
 
+// List-bearing tether scans have an empty primary SSID. The list's count is
+// independently known at +0x1318; its payload layout is handled separately.
+inline bool scanNeedsRadio(const ScanRequest &scan, const void *buffer, size_t length) {
+    if (scan.ssidLength)
+        return true;
+    if (!buffer || length < 0x131c)
+        return false;
+    const auto *p = static_cast<const uint8_t *>(buffer);
+    return read32(p + 0x1318) != 0;
+}
+
 inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
     if (!buffer || length < 0x58)
         return false;
