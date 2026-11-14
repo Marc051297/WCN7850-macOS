@@ -56,6 +56,9 @@
 
 #include "qwz_compat.h"	/* macOS: replaces the OpenBSD kernel headers */
 #include "qwz_mon.h"	/* monitor-mode capture (debug.qwz.mon) */
+#ifdef __APPLE__
+#include <pexpert/pexpert.h>
+#endif
 #define QWZ_TRACE(fmt, ...)	qwz_log("qwz: trace: " fmt "\n", ##__VA_ARGS__)
 #ifdef AIRPORT_WCL
 #include "WCL/WCL.hpp"	/* AirportWCN7850: scan helpers (scanUsesProbes, scanChannelSelected) */
@@ -196,6 +199,7 @@ void qwz_power_down(struct qwz_softc *);
 void qwz_core_init_cleanup(struct qwz_softc *, int);
 int qwz_qmi_event_server_arrive(struct qwz_softc *);
 int qwz_mac_register(struct qwz_softc *);
+static void qwz_apply_boot_country(struct qwz_softc *);
 int qwz_mac_start(struct qwz_softc *);
 void qwz_mac_setup_ht_vht_cap(struct qwz_softc *, struct qwz_pdev *);
 void qwz_mac_setup_he_cap(struct qwz_softc *, struct qwz_pdev *);
@@ -635,6 +639,9 @@ full_init:
 		goto fail;
 	core_ready = 1;
 	QWZ_CRUMB("init:qmi-done");
+	/* Apply the existing explicit country hint before the first station scan.
+	 * Only firmware's reply changes channel permissions. Failure is nonfatal. */
+	qwz_apply_boot_country(sc);
 
 	if (sc->attached) {
 		/* Update MAC in case the upper layers changed it. */
@@ -12123,6 +12130,28 @@ qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info)
 	}
 }
 
+static void
+qwz_reg_country_event(struct qwz_softc *sc, const struct cur_regulatory_info *info)
+{
+	sc->reg_country_status = info->status_code;
+	if (info->status_code == REG_SET_CC_STATUS_PASS) {
+		memcpy(sc->reg_country, info->alpha2, 2);
+		sc->reg_country[2] = 0;
+		++sc->reg_country_updates;
+	}
+	if (sc->reg_country_pending &&
+	    (info->status_code != REG_SET_CC_STATUS_PASS ||
+	    memcmp(info->alpha2, sc->reg_country_requested, 2) == 0)) {
+		sc->reg_country_pending = 0;
+		if (info->status_code != REG_SET_CC_STATUS_PASS)
+			sc->reg_country_request_error = EIO;
+		wakeup(&sc->reg_country_pending);
+	}
+	qwz_compat_publish_country(sc->reg_country_requested, sc->reg_country,
+	    sc->reg_country_pending, sc->reg_country_request_error, sc->reg_country_status,
+	    sc->sc_ic.ic_channels[149].ic_flags, sc->sc_ic.ic_channels[149].ic_freq);
+}
+
 int
 qwz_reg_chan_list_event(struct qwz_softc *sc, struct mbuf *m,
     enum wmi_reg_chan_list_cmd_type id)
@@ -12164,10 +12193,12 @@ qwz_reg_chan_list_event(struct qwz_softc *sc, struct mbuf *m,
 		printf("%s: Failed to set the requested Country "
 		    "regulatory setting\n", __func__);
 		qwz_init_channels_world(sc);
+		qwz_reg_country_event(sc, reg_info);
 		goto mem_free;
 	}
 
 	qwz_init_channels(sc, reg_info);
+	qwz_reg_country_event(sc, reg_info);
 	/* M0 (C29): what the firmware's regulatory event carried (6 GHz rule counts show whether it reports 6 GHz at all) */
 	qwz_log("qwz: dossier: regulatory: cc %.2s dfs %u rules 2g %u 5g %u 6g ap %u client %u ext %d status %d\n",
 	    (const char *)reg_info->alpha2, reg_info->dfs_region, reg_info->num_2ghz_reg_rules, reg_info->num_5ghz_reg_rules,
@@ -18428,6 +18459,72 @@ qwz_wmi_cmd_send(struct qwz_pdev_wmi *wmi, struct mbuf *m, uint32_t cmd_id)
 	return ret;
 }
 
+/* ath12k's ALPHA_IS_SET form of WMI_SET_INIT_COUNTRY_CMDID. This asks
+ * firmware to evaluate a country; it does not grant host-side channel flags. */
+static int
+qwz_wmi_set_init_country(struct qwz_softc *sc, const char country[3])
+{
+	const uint32_t pdev_id = sc->pdevs[0].pdev_id;
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[pdev_id];
+	struct wmi_init_country_cmd *cmd;
+	struct mbuf *m = qwz_wmi_alloc_mbuf(sizeof(*cmd));
+	int ret;
+	if (m == NULL)
+		return ENOMEM;
+	cmd = (struct wmi_init_country_cmd *)(mtod(m, uint8_t *) +
+	    sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr));
+	memset(cmd, 0, sizeof(*cmd));
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_SET_INIT_COUNTRY_CMD) |
+	    FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->pdev_id = pdev_id;
+	cmd->init_cc_type = WMI_COUNTRY_INFO_TYPE_ALPHA;
+	memcpy(&cmd->cc_info.alpha2, country, 2);
+	ret = qwz_wmi_cmd_send(wmi, m, WMI_SET_INIT_COUNTRY_CMDID);
+	if (ret)
+		m_freem(m);
+	return ret;
+}
+
+static void
+qwz_apply_boot_country(struct qwz_softc *sc)
+{
+#ifdef __APPLE__
+	char value[8] = {};
+	int ret;
+	if (!PE_parse_boot_argn("itlwm_cc", value, sizeof(value)))
+		return;
+	for (unsigned i = 0; i < 2; ++i)
+		if (value[i] >= 'a' && value[i] <= 'z')
+			value[i] -= 'a' - 'A';
+	if (value[0] < 'A' || value[0] > 'Z' || value[1] < 'A' || value[1] > 'Z' ||
+	    value[2] != 0 || memcmp(value, "ZZ", 2) == 0)
+		return;
+	memcpy(sc->reg_country_requested, value, 3);
+	if (memcmp(sc->reg_country, value, 2) == 0) {
+		qwz_compat_publish_country(sc->reg_country_requested, sc->reg_country, 0,
+		    sc->reg_country_request_error, sc->reg_country_status,
+		    sc->sc_ic.ic_channels[149].ic_flags, sc->sc_ic.ic_channels[149].ic_freq);
+		return;
+	}
+	sc->reg_country_pending = 1;
+	sc->reg_country_request_error = 0;
+	ret = qwz_wmi_set_init_country(sc, value);
+	if (ret == 0 && sc->reg_country_pending)
+		ret = tsleep_nsec(&sc->reg_country_pending, 0, "qwzcountry", SEC_TO_NSEC(1));
+	if (ret == 0 && (sc->reg_country_pending || memcmp(sc->reg_country, value, 2) != 0))
+		ret = EIO;
+	if (ret && sc->reg_country_request_error == 0)
+		sc->reg_country_request_error = ret;
+	sc->reg_country_pending = 0;
+	qwz_compat_publish_country(sc->reg_country_requested, sc->reg_country, 0,
+	    sc->reg_country_request_error, sc->reg_country_status,
+	    sc->sc_ic.ic_channels[149].ic_flags, sc->sc_ic.ic_channels[149].ic_freq);
+	qwz_log("qwz: regulatory: requested %.2s firmware %.2s status %u error %d; ch149 freq %u flags 0x%x\n",
+	    value, sc->reg_country, sc->reg_country_status, sc->reg_country_request_error,
+	    sc->sc_ic.ic_channels[149].ic_freq, sc->sc_ic.ic_channels[149].ic_flags);
+#endif
+}
+
 int
 qwz_wmi_pdev_set_param(struct qwz_softc *sc, uint32_t param_id,
     uint32_t param_value, uint8_t pdev_id)
@@ -20441,6 +20538,11 @@ int
 qwz_core_start(struct qwz_softc *sc)
 {
 	int ret;
+	memset(sc->reg_country, 0, sizeof(sc->reg_country));
+	memset(sc->reg_country_requested, 0, sizeof(sc->reg_country_requested));
+	sc->reg_country_pending = sc->reg_country_request_error = 0;
+	sc->reg_country_status = UINT32_MAX;
+	sc->reg_country_updates = 0;
 
 	ret = qwz_wmi_attach(sc);
 	if (ret) {

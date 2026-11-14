@@ -175,10 +175,11 @@ int	qwz_mon_native_tx_ready(void);
 void	qwz_mon_native_auto_enable(int enable);
 void	qwz_mon_native_auto_tick(void);
 const char *qwz_mon_native_auto_state(void);
+int	qwz_mon_native_preferred_channel(void);
 /* WCL holds the main gate. Pause native AWDL for a directed scan/join,
  * preserving automatic restart; ENOTSUP means this is not the native path. */
 int	qwz_mon_native_pause(struct ieee80211com *);
-int	qwz_mon_user_set(int chan);	/* explicit sysctl override suspends auto mode */
+int	qwz_mon_user_set(int chan);	/* native coex start remembers a preference; explicit 0 suspends auto */
 /* F2: send one 802.11 frame (no FCS) from the cell, the gate held by the caller; errno (ENOSPC: no slot, try later). */
 int	qwz_mon_tx_raw(const uint8_t *frame, size_t len);
 /* Firmware completions, distinct from successful host submissions. Reset with

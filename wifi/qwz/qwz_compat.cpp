@@ -1370,6 +1370,34 @@ qwz_compat_set_controller(IOService *controller)
 	qwz_controller = controller;
 }
 
+void
+qwz_compat_publish_country(const char *requested, const char *firmware,
+    int pending, int error, uint32_t status, uint32_t flags149, uint32_t frequency149)
+{
+	if (qwz_controller == nullptr)
+		return;
+	OSDictionary *d = OSDictionary::withCapacity(7);
+	if (d == nullptr)
+		return;
+	auto number = [d](const char *key, uint32_t value) {
+		if (OSNumber *n = OSNumber::withNumber(value, 32)) {
+			d->setObject(key, n);
+			n->release();
+		}
+	};
+	if (OSString *s = OSString::withCString(requested[0] ? requested : "<unset>")) {
+		d->setObject("requested", s); s->release();
+	}
+	if (OSString *s = OSString::withCString(firmware[0] ? firmware : "<unset>")) {
+		d->setObject("firmware", s); s->release();
+	}
+	number("pending", pending != 0); number("requestError", error);
+	number("firmwareStatus", status); number("channel149Flags", flags149);
+	number("channel149Frequency", frequency149);
+	qwz_controller->setProperty("QwzRegulatory", d);
+	d->release();
+}
+
 int
 qwz_compat_publish_blob(const char *key, const void *buf, size_t len)
 {

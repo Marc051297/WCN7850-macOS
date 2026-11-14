@@ -48,6 +48,7 @@ struct qwz_softc {
     ieee80211com sc_ic;
     struct {int is_up=0,is_started=0;} sc_vif;
     int mon_native_auto=0,mon_native_manual=0,mon_native_owned=0;
+    int mon_native_preferred_channel=0;
     int sc_awdl_addr_valid=0,attached=0,mon_active=0,mon_coex=0,mon_coex_setup=0,mon_coex_task_why=0;
     uint64_t mon_native_next_ns=0,mon_native_pause_until_ns=0;
     struct {int state=0;} scan;
@@ -173,6 +174,47 @@ int main() {
     qwz_mon_native_auto_start(&sc); assert(starts==canceled);
     qwz_mon_set_native_rx(rx,&sc); qwz_mon_native_auto_enable(0);
     qwz_mon_native_auto_tick(); assert(starts==canceled);
+    // A positive native coex selection must resume after Hotspot/ordinary
+    // Wi-Fi transitions. It must not share explicit-stop's manual policy.
+    qwz_softc preferred; qwz_mon_sc=&preferred;
+    preferred.attached=preferred.sc_vif.is_up=preferred.sc_vif.is_started=preferred.sc_awdl_addr_valid=1;
+    preferred.sc_ic.ic_state=IEEE80211_S_RUN;
+    ieee80211_node preferredBss{&home}; preferred.sc_ic.ic_bss=&preferredBss;
+    const unsigned preferredChannels[]={44,149,6};
+    for(unsigned ch:preferredChannels) {
+        preferred.sc_ic.ic_channels[ch]={ch==6?2437U:ch==44?5220U:5745U,0};
+        preferred.sc_ic.ic_chan_active[ch/8]|=1U<<(ch%8);
+    }
+    qwz_mon_set_native_rx(rx,&preferred); qwz_mon_native_auto_enable(1);
+    int selected=-1;
+    qwz_mon_gated(nullptr,(void*)(intptr_t)44,&selected,(void*)1,nullptr);
+    assert(selected==0 && preferred.mon_native_preferred_channel==44);
+    assert(preferred.mon_native_owned && !preferred.mon_native_manual);
+    assert(qwz_mon_native_pause(&preferred.sc_ic)==0 && !preferred.mon_active);
+    assert(preferred.mon_native_preferred_channel==44 && !preferred.mon_native_manual);
+    const int pausedStarts=starts;
+    qwz_mon_native_auto_start(&preferred); assert(starts==pausedStarts);
+    now+=13000000000ULL;
+    qwz_mon_native_auto_start(&preferred);
+    assert(starts==pausedStarts+1 && chosen==44 && preferred.mon_native_owned);
+    // The hint survives native interface teardown/re-registration too.
+    qwz_mon_set_native_rx(nullptr,nullptr); qwz_mon_stop(&preferred);
+    qwz_mon_set_native_rx(rx,&preferred); qwz_mon_native_auto_enable(1);
+    qwz_mon_native_auto_start(&preferred); assert(chosen==44);
+    // A changed regulatory table still wins over the remembered hint.
+    qwz_mon_stop(&preferred);
+    preferred.sc_ic.ic_channels[44].ic_flags=IEEE80211_CHAN_PASSIVE;
+    qwz_mon_native_auto_start(&preferred); assert(chosen==149);
+    // Explicit stop clears the hint and remains stopped across timer ticks.
+    qwz_mon_gated(nullptr,nullptr,&selected,(void*)1,nullptr);
+    assert(!preferred.mon_active && preferred.mon_native_manual && !preferred.mon_native_preferred_channel);
+    const int stoppedStarts=starts,stoppedAdds=preferred.mon_coex_task.adds;
+    now+=13000000000ULL; qwz_mon_native_auto_tick(); qwz_mon_native_auto_start(&preferred);
+    assert(starts==stoppedStarts && preferred.mon_coex_task.adds==stoppedAdds);
+    // A failed user request must not automatically arm a new radio profile.
+    qwz_mon_native_auto_enable(1); start_result=EIO;
+    qwz_mon_gated(nullptr,(void*)(intptr_t)149,&selected,(void*)1,nullptr);
+    assert(selected==EIO && preferred.mon_native_manual && !preferred.mon_native_owned);
     puts("ok: automatic start waits for Wi-Fi, uses deferred work, respects manual stop and channel availability, cancels safely");
 }
 '''

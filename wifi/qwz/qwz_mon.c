@@ -2950,6 +2950,8 @@ qwz_mon_gated(OSObject *, void *arg0, void *arg1, void *user, void *)
 	}
 	if (user != NULL) {
 		sc->mon_native_manual = 1;
+		if (chan == 0)
+			sc->mon_native_preferred_channel = 0;
 		qwz_mon_native_state = "manual";
 	}
 	if (chan == 0) {
@@ -2959,6 +2961,16 @@ qwz_mon_gated(OSObject *, void *arg0, void *arg1, void *user, void *)
 		if (sc->mon_active)
 			qwz_mon_stop(sc);
 		*errp = qwz_mon_start(sc, chan);
+	}
+	if (user != NULL && chan > 0 && *errp == 0 && sc->mon_native_auto && sc->mon_coex &&
+	    __atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE) != NULL) {
+		// A successful native coex channel selection is a preference, not
+		// an instruction to leave AWDL disabled after the next Wi-Fi join.
+		// Explicit channel 0 and legacy/exclusive monitoring stay manual.
+		sc->mon_native_preferred_channel = chan;
+		sc->mon_native_manual = 0;
+		sc->mon_native_owned = 1;
+		qwz_mon_native_state = "running";
 	}
 	rw_exit(&sc->ioctl_rwl);
 	return kIOReturnSuccess;
@@ -2975,7 +2987,7 @@ qwz_mon_native_pause(struct ieee80211com *ic)
 	// directed requests renew this window, without changing manual policy.
 	sc->mon_native_next_ns = getnsecuptime() + 12000000000ULL;
 	sc->mon_native_pause_until_ns = sc->mon_native_next_ns;
-	qwz_mon_native_state = "paused-for-wifi";
+	qwz_mon_native_state = sc->mon_native_manual ? "manual" : "paused-for-wifi";
 	if (sc->mon_coex_setup)
 		return EBUSY;
 	if (!sc->mon_active)
@@ -3067,6 +3079,12 @@ qwz_mon_native_auto_state(void)
 	return qwz_mon_native_state;
 }
 
+int
+qwz_mon_native_preferred_channel(void)
+{
+	return qwz_mon_sc != NULL ? qwz_mon_sc->mon_native_preferred_channel : 0;
+}
+
 static int
 qwz_mon_native_auto_allowed(struct qwz_softc *sc)
 {
@@ -3089,9 +3107,11 @@ static int
 qwz_mon_native_auto_channel(struct qwz_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
-	const unsigned candidates[] = {149, 6};
+	const unsigned candidates[] = {(unsigned)sc->mon_native_preferred_channel, 149, 6};
 	for (unsigned i = 0; i < nitems(candidates); ++i) {
 		const unsigned ch = candidates[i];
+		if (ch == 0 || ch >= nitems(ic->ic_channels))
+			continue;
 		const struct ieee80211_channel *c = &ic->ic_channels[ch];
 		if (c->ic_freq != 0 && isset(ic->ic_chan_active, ch) &&
 		    !(c->ic_flags & (IEEE80211_CHAN_PASSIVE | IEEE80211_CHAN_DFS | IEEE80211_CHAN_NOADHOC)))

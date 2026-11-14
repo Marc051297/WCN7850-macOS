@@ -2125,6 +2125,9 @@ struct qwz_softc {
 
 	int			attached;
 	int			fw_initialized;
+	char			reg_country[3], reg_country_requested[3];
+	int			reg_country_pending, reg_country_request_error;
+	uint32_t		reg_country_status, reg_country_updates;
 	int			fw_started;	/* macOS: a firmware ran since the last qwz_hal_srng_init */
 	int			ce_initialized;
 	int			powered;
@@ -2380,6 +2383,7 @@ struct qwz_softc {
 	 */
 	int				 mon_coex, mon_coex_setup, mon_coex_base_vdevs, mon_coex_base_peers, mon_coex_halt, mon_coex_swapped, mon_coex_probe;
 	int				 mon_native_auto, mon_native_manual, mon_native_owned;
+	int				 mon_native_preferred_channel;
 	uint64_t			 mon_native_next_ns, mon_native_pause_until_ns;
 	/* F2e: host-paced visits to the cell's channel (debug.qwz.moncoexdwell): one single-channel passive scan at a time on the station vdev */
 	struct task			 mon_dwell_task;

@@ -81,7 +81,7 @@ void AirportItlwm::awdlNativeRadioStart()
 	qwz_mon_native_auto_enable(!PE_parse_boot_argn("-qwzawdlmanual", &manual, sizeof(manual)));
 	awdlNativeTimer->setTimeoutMS(50);
 	setProperty("QwzAWDLRadio", "started");
-	setProperty("QwzAWDLRadioBuild", "f2k-tx-backpressure");
+	setProperty("QwzAWDLRadioBuild", "f2l-country-and-resume");
 	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
 	qwz_log_publish();
 }
@@ -264,6 +264,7 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 				if (OSNumber *n = OSNumber::withNumber(v, 64)) { d->setObject(k, n); n->release(); }
 			};
 			put("cell", uint64_t(cell)); put("ticks", st.timerTicks); put("cellTicks", st.cellTimerTicks);
+			put("preferredCell", qwz_mon_native_preferred_channel());
 			put("txReady", qwz_mon_native_tx_ready());
 			put("rxAction", st.rxAction); put("rxActionHanded", st.rxActionHanded); put("rxActionRefused", st.rxActionRefused);
 			put("rxActionLastError", st.rxActionLastError); put("rxActionTrimmed", st.rxActionTrimmed); put("rxActionTooLong", st.rxActionTooLong);

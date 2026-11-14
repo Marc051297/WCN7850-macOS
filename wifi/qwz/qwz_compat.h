@@ -504,5 +504,7 @@ void	qwz_stage_set_parked(void);
 /* Debug: attach a copy of `buf` to the controller as an IORegistry property. */
 int	qwz_compat_publish_blob(const char *, const void *, size_t);
 void	qwz_compat_set_controller(IOService *);
+void	qwz_compat_publish_country(const char *, const char *, int, int,
+    uint32_t, uint32_t, uint32_t);
 
 #endif /* QWZ_COMPAT_H */

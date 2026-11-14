@@ -1568,7 +1568,10 @@ ItlQwz::supportedFeatures()
 const char *
 ItlQwz::getFirmwareCountryCode()
 {
-	return "ZZ";
+	// Firmware world domains such as "00" are not a country. Keep the HAL's
+	// unknown sentinel so macOS can still use its geolocation fallback.
+	return sc != nullptr && sc->reg_country[0] >= 'A' && sc->reg_country[0] <= 'Z' &&
+	    sc->reg_country[1] >= 'A' && sc->reg_country[1] <= 'Z' ? sc->reg_country : "ZZ";
 }
 
 uint32_t
