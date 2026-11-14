@@ -228,8 +228,15 @@ qwz_mon_is_station_frame(struct qwz_softc *sc, const uint8_t *f, size_t len)
 int
 qwz_mon_claims_mgmt(struct qwz_softc *sc, const uint8_t *f, size_t len, uint32_t chan_freq)
 {
-	if (len < 24 || chan_freq != sc->mon_freq)
+	if (len < 24)
 		return 0;
+	if (chan_freq != sc->mon_freq) {
+		/* F2d: evidence only. An AWDL-BSS frame the firmware tagged with another frequency is refused as before, but counted and shown once. */
+		if (IEEE80211_ADDR_EQ(f + 16, qwz_awdl_bssid) && ++sc->mon_stats.coex_awdl_otherfreq == 1)
+			printf("qwz: mon: coex: first AWDL-BSS management frame reported on %u MHz while the cell is on %u MHz (refused; sender %s)\n",
+			    chan_freq, sc->mon_freq, ether_sprintf((uint8_t *)(f + 10)));
+		return 0;
+	}
 	if (IEEE80211_ADDR_EQ(f + 16, qwz_awdl_bssid))
 		return 1;
 	if (sc->mon_bssid_set && IEEE80211_ADDR_EQ(f + 16, sc->mon_bssid))
@@ -1208,14 +1215,14 @@ qwz_mon_chan_freq(int chan)
  * the descriptor getters expect; QWZ_MON_F_OFFSETS turns that off.
  */
 static int
-qwz_mon_rx_filter(struct qwz_softc *sc, int enable)
+qwz_mon_rx_filter_mask(struct qwz_softc *sc, int enable, unsigned int mask)
 {
 	struct qwz_dp *dp = &sc->dp;
 	struct htt_rx_ring_tlv_filter f;
 	int i, ret;
 
 	if (!enable)
-		return qwz_dp_rxdma_ring_sel_config_wcn7850(sc);
+		return qwz_dp_rxdma_ring_sel_config_wcn7850(sc);	/* every ring back to the station's filter, whatever was swapped */
 
 	memset(&f, 0, sizeof(f));
 	f.rx_filter = HTT_RX_MON_FILTER_TLV_FLAGS_MON_DEST_RING;
@@ -1258,6 +1265,8 @@ qwz_mon_rx_filter(struct qwz_softc *sc, int enable)
 	}
 
 	for (i = 0; i < sc->hw_params.num_rxmda_per_pdev; i++) {
+		if (!(mask & (1u << i)))	/* F2d: moncoexfilter 3 swaps the cell's ring only */
+			continue;
 		ret = qwz_dp_tx_htt_rx_filter_setup(sc, dp->rx_mac_buf_ring[i].ring_id,
 		    i, HAL_RXDMA_BUF, DP_RXDMA_REFILL_RING_SIZE, &f);
 		if (ret) {
@@ -1266,6 +1275,45 @@ qwz_mon_rx_filter(struct qwz_softc *sc, int enable)
 		}
 	}
 	return 0;
+}
+
+/* Every ring (the K4 cell and moncoexfilter 1 and 2); the restore is the same call with enable 0. */
+static int
+qwz_mon_rx_filter(struct qwz_softc *sc, int enable)
+{
+	return qwz_mon_rx_filter_mask(sc, enable, ~0U);
+}
+
+/*
+ * F2d: the rx_mac_buf_ring the cell's frames arrive on when the firmware runs the cell on its own MAC (DBS: one MAC per band; HTT ring i is lmac i,
+ * as qwz_dp_rxdma_ring_sel_config_wcn7850 programs them). debug.qwz.moncoexmac 0 or 1 decides; -1 picks by band from the firmware's phy table of the
+ * configured hardware mode: the lmac whose bands hold the cell's band and not the station's. When the table does not decide (same band, or no
+ * table), ring 0 for a 2.4 GHz cell (the only MAC with 2.4 GHz on this card) and ring 1 for a 5 GHz one. The table is printed so the ring shows the basis.
+ */
+static int
+qwz_mon_coex_pick_ring(struct qwz_softc *sc, uint32_t cell_freq, uint32_t sta_freq)
+{
+	const int cell2g = cell_freq < 3000, sta2g = sta_freq != 0 && sta_freq < 3000;
+	const uint32_t mode = (sc->hwm_map_have_ev && sc->hwm_map_tlen >= 16) ? sc->hwm_map_index : (uint32_t)(sc->hwm_asked_set ? sc->hwm_asked : 1);
+	const int nrings = sc->hw_params.num_rxmda_per_pdev > 0 ? sc->hw_params.num_rxmda_per_pdev : 1;
+	int k, pick = -1;
+
+	for (k = 0; k < sc->hwm_nphys; k++) {
+		const uint32_t b = sc->hwm_phys[k].bands;
+
+		if (sc->hwm_phys[k].hw_mode_id != mode)
+			continue;
+		printf("qwz: mon: coex: hw mode %u phy %u: lmac %u pdev %u bands 0x%x (2.4 GHz %s, 5 GHz %s)\n", mode, sc->hwm_phys[k].phy_id,
+		    sc->hwm_phys[k].lmac_id, sc->hwm_phys[k].pdev_id, b, (b & WMI_HOST_WLAN_2G_CAP) ? "yes" : "no", (b & WMI_HOST_WLAN_5G_CAP) ? "yes" : "no");
+		if (pick < 0 && sta_freq != 0 && cell2g != sta2g && (b & (cell2g ? WMI_HOST_WLAN_2G_CAP : WMI_HOST_WLAN_5G_CAP)) &&
+		    !(b & (sta2g ? WMI_HOST_WLAN_2G_CAP : WMI_HOST_WLAN_5G_CAP)) && sc->hwm_phys[k].lmac_id < (uint32_t)nrings)
+			pick = (int)sc->hwm_phys[k].lmac_id;
+	}
+	if (qwz_moncoexmac >= 0 && qwz_moncoexmac < nrings)
+		return qwz_moncoexmac;
+	if (pick >= 0)
+		return pick;
+	return cell2g ? 0 : (nrings > 1 ? 1 : 0);
 }
 
 /* ---- reaping the RXDMA error destination ring ---------------------------- */
@@ -1510,10 +1558,11 @@ qwz_mon_reap(void *arg)
 		    sc->mon_stats.badcookie, sc->mon_stats.nolink, sc->mon_stats.duplink,
 		    sc->mon_stats.linkret_fail, moncap_dropped, sc->mon_stats.wmi_mgmt_rx_events, sc->mon_stats.ring_mgmt_frames);
 		if (sc->mon_coex)	/* K5 (L1-C15): totals since the cell started of what the claim tests did, plus the credit reserve, the credits left and the filter mode */
-			printf("qwz: mon: coex: counters st_mgmt %u cell_mgmt %u st_data %u cell_data %u drop %u; resv %d credits_left %d filter %d\n",
+			printf("qwz: mon: coex: counters st_mgmt %u cell_mgmt %u st_data %u cell_data %u drop %u; resv %d credits_left %d filter %d ring %d otherfreq %u\n",
 			    sc->mon_stats.coex_st_mgmt, sc->mon_stats.coex_cell_mgmt, sc->mon_stats.coex_st_data, sc->mon_stats.coex_cell_data,
 			    sc->mon_stats.coex_drop, qwz_moncoexcred, (unsigned int)sc->wmi.wmi[sc->pdevs[0].pdev_id].eid < (unsigned int)ATH12K_HTC_EP_COUNT ?
-			    (int)sc->htc.endpoint[sc->wmi.wmi[sc->pdevs[0].pdev_id].eid].tx_credits : -1, qwz_moncoexfilter);
+			    (int)sc->htc.endpoint[sc->wmi.wmi[sc->pdevs[0].pdev_id].eid].tx_credits : -1, qwz_moncoexfilter,
+			    sc->mon_coex_swap_ring, sc->mon_stats.coex_awdl_otherfreq);	/* F2d: the swapped ring (-1 none) and the other-frequency count */
 		if (sc->mon_coex)	/* K6 (K6-1): the WBM error ring tap, adjacent additive line */
 			printf("qwz: mon: coex: wbm counters taken %u skipped %u badhdr %u wbm_err %u; moncoexwbm %d\n",
 			    sc->mon_stats.coex_wbm_taken, sc->mon_stats.coex_wbm_skipped, sc->mon_stats.coex_wbm_badhdr, sc->mon_stats.wbm_err, qwz_moncoexwbm);
@@ -2142,6 +2191,26 @@ k5_coex_guards_done:	/* K5 (L1-C2) */
 	if (ret)
 		goto fail;
 	if (coex) {
+		sc->mon_coex_swap_ring = -1;
+		if (qwz_moncoexfilter == 3) {
+			/*
+			 * F2d: the cell on another band runs on its own MAC (DBS), and the firmware forwards only that AP vdev's own frames from there
+			 * (every cell beside the station on another channel heard nothing with the filter kept). Its rx_mac_buf_ring gets the K4 cell's
+			 * monitor filter (filter-pass plus monitor-other); the station's ring is not touched, so the station keeps its descriptors.
+			 * KEEP_FILTER in monflags does not veto this one. mon_coex_swapped 2 = one ring; the stop restores both rings as for 1.
+			 */
+			const uint32_t sta_freq = (sc->sc_ic.ic_bss != NULL && sc->sc_ic.ic_bss->ni_chan != NULL) ? sc->sc_ic.ic_bss->ni_chan->ic_freq : 0;
+			const int ring = qwz_mon_coex_pick_ring(sc, freq, sta_freq);
+
+			sc->mon_coex_swapped = 2;	/* before the command: a failed swap is restored by the fail path */
+			sc->mon_coex_swap_ring = ring;
+			ret = qwz_mon_rx_filter_mask(sc, 1, 1u << ring);
+			if (ret)
+				goto fail;
+			printf("qwz: mon: coex: filter 3: monitor filter on rx_mac_buf_ring %d only (cell %u MHz, station %u MHz, moncoexmac %d); the station's ring is untouched when the firmware runs it on the other MAC. If the ping dies now, the station shares this ring: debug.qwz.mon=0, then debug.qwz.moncoexmac=%d and start again\n",
+			    ring, freq, sta_freq, qwz_moncoexmac, ring ? 0 : 1);
+			goto k5_coex_filter_kept;
+		}
 		/* K5 (L1-C10): beside the station the filter is never swapped (KEEP_FILTER forced) unless moncoexfilter says 1 or 2; remember the swap so the stop restores exactly then */
 		sc->mon_coex_swapped = (qwz_moncoexfilter != 0 && !(qwz_mon_flags & QWZ_MON_F_KEEP_FILTER)) ? 1 : 0;
 		if (!sc->mon_coex_swapped)

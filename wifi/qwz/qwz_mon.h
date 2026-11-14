@@ -101,6 +101,7 @@ extern uint32_t qwz_mon_flags;
 extern int qwz_moncoex, qwz_moncoexmode, qwz_moncoexpassive, qwz_moncoexfilter, qwz_moncoexscan, qwz_moncoexcred, qwz_moncoexfw, qwz_moncoexnss, qwz_moncoexjoin;
 /* K6 (K6-1): debug.qwz.moncoexwbm, default 1, acts only while a coex cell runs (moncoex defaults to 0): the WBM error path hands the cell's peer-less data frames to the capture; read live */
 extern int qwz_moncoexwbm;
+extern int qwz_moncoexmac;	/* F2d: the ring moncoexfilter 3 swaps (-1 by band) */
 /* F2-2: debug.qwz.moncoexmcc, default 0: the coex cell on its own channel (6, 44 or 149) beside a station on another channel; read at cell start and by the probe. */
 extern int qwz_moncoexmcc;
 /* F2-3: debug.qwz.moncoexquota, default 0: percent of radio time for the cell's channel while an mcc cell runs (firmware channel time quota). */

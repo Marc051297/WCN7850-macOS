@@ -13457,6 +13457,62 @@ qwz_hwmode_map_note(struct qwz_softc *sc, struct mbuf *m)
 		    sc->hwm_map_declared, (unsigned int)sc->hwm_map_n, sc->hwm_map_trailing);
 }
 
+/*
+ * F2d (log and evidence only): WMI_PDEV_HW_MODE_TRANSITION_EVENTID. The firmware sends it when it changes the hardware mode itself (for example a
+ * vdev on another band starting beside the station). Layout as Qualcomm's fw-api: a fixed TLV (WMI_TAG_PDEV_HW_MODE_TRANSITION_EVENT: old_hw_mode_index,
+ * new_hw_mode_index, num_vdev_mac_entries), then the array of entries (WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_VDEV_MAC_ENTRY: vdev_id, pdev_id = the MAC).
+ * Bounds-checked copies as qwz_hwmode_map_note; nothing decides on it.
+ */
+static void
+qwz_hwmode_transition_note(struct qwz_softc *sc, struct mbuf *m)
+{
+	const uint8_t *p, *end;
+	uint32_t len, k;
+	int have_ev = 0;
+
+	sc->hwm_trans_n = 0;
+	sc->hwm_trans_old = sc->hwm_trans_new = sc->hwm_trans_declared = 0;
+	if (m == NULL)
+		return;
+	p = mtod(m, const uint8_t *);
+	len = M_LEN(m) > 0 ? (uint32_t)M_LEN(m) : 0;
+	end = p + len;
+	while ((size_t)(end - p) >= sizeof(struct wmi_tlv)) {
+		uint32_t hdr, tlen, tag;
+		const uint8_t *body;
+
+		memcpy(&hdr, p, sizeof(hdr));
+		tag = FIELD_GET(WMI_TLV_TAG, hdr);
+		tlen = FIELD_GET(WMI_TLV_LEN, hdr);
+		body = p + sizeof(struct wmi_tlv);
+		if (tlen > (size_t)(end - body))
+			break;
+		if (tag == WMI_TAG_PDEV_HW_MODE_TRANSITION_EVENT && !have_ev && tlen >= 12) {
+			memcpy(&sc->hwm_trans_old, body, 4);
+			memcpy(&sc->hwm_trans_new, body + 4, 4);
+			memcpy(&sc->hwm_trans_declared, body + 8, 4);
+			have_ev = 1;
+		} else if (tag == WMI_TAG_PDEV_SET_HW_MODE_RESPONSE_VDEV_MAC_ENTRY && tlen >= 8 && sc->hwm_trans_n < nitems(sc->hwm_trans)) {
+			memcpy(&sc->hwm_trans[sc->hwm_trans_n].vdev_id, body, 4);
+			memcpy(&sc->hwm_trans[sc->hwm_trans_n].mac_id, body + 4, 4);
+			sc->hwm_trans_n++;
+		}
+		if (tag == WMI_TAG_ARRAY_STRUCT)
+			p = body;
+		else
+			p = body + tlen;
+	}
+	sc->hwm_trans_seen++;
+	if (!have_ev) {
+		qwz_log("qwz: hwmode: transition event without its fixed TLV (len %u)\n", len);
+		return;
+	}
+	qwz_log("qwz: hwmode: transition %u: old index %u (%s) -> new index %u (%s), %u vdev-mac entries\n", sc->hwm_trans_seen,
+	    sc->hwm_trans_old, qwz_hwm_idname(sc->hwm_trans_old), sc->hwm_trans_new, qwz_hwm_idname(sc->hwm_trans_new), sc->hwm_trans_declared);
+	for (k = 0; k < sc->hwm_trans_n; k++)
+		qwz_log("qwz: hwmode: transition entry %u: vdev %u -> mac %u\n", k, sc->hwm_trans[k].vdev_id, sc->hwm_trans[k].mac_id);
+}
+
 void
 qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 {
@@ -13603,6 +13659,9 @@ qwz_wmi_tlv_op_rx(struct qwz_softc *sc, struct mbuf *m)
 #endif
 	case WMI_UPDATE_FW_MEM_DUMP_EVENTID:
 		DPRINTF("%s: 0x%x: update fw mem dump\n", __func__, id);
+		break;
+	case WMI_PDEV_HW_MODE_TRANSITION_EVENTID:
+		qwz_hwmode_transition_note(sc, m);	/* F2d: log only (old and new mode, vdev-to-mac entries) */
 		break;
 	case WMI_PDEV_SET_HW_MODE_RESP_EVENTID:
 		qwz_hwmode_resp_note(sc, m);	/* K1 W2a: keep the payload for the dossier; changes nothing below */
@@ -17291,7 +17350,14 @@ qwz_dp_rx_process_received_packets(struct qwz_softc *sc,
 			if (M_LEN(msdu->m) >= 24 && qwz_mon_claims_data(sc, mtod(msdu->m, const uint8_t *) + 4, mtod(msdu->m, const uint8_t *) + 10,
 			    mtod(msdu->m, const uint8_t *) + 16))
 				sc->mon_stats.coex_cell_data++;
-			else {
+			else if (sc->mon_coex_swapped == 2 &&
+			    !(M_LEN(msdu->m) >= 24 && qwz_mon_is_station_frame(sc, mtod(msdu->m, const uint8_t *), (size_t)M_LEN(msdu->m)))) {
+				/* F2d: one ring carries the monitor filter, so other networks' frames reach this path too; neither the station's nor the cell's: dropped, never delivered */
+				sc->mon_stats.coex_drop++;
+				m_freem(msdu->m);
+				msdu->m = NULL;
+				continue;
+			} else {
 				sc->mon_stats.coex_st_data++;
 				qwz_dp_rx_deliver_msdu(sc, msdu);
 				msdu->m = NULL;

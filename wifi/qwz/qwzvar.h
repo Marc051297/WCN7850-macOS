@@ -2330,6 +2330,13 @@ struct qwz_softc {
 		uint32_t vdev_id;
 		uint32_t mac_id;
 	} hwm_map[8];
+	/* F2d: WMI_PDEV_HW_MODE_TRANSITION_EVENTID, parsed by qwz_hwmode_transition_note (log and evidence only): the firmware's old and new hw mode index and its vdev-to-mac entries */
+	uint32_t hwm_trans_seen, hwm_trans_old, hwm_trans_new, hwm_trans_declared;
+	uint8_t hwm_trans_n;
+	struct {
+		uint32_t vdev_id;
+		uint32_t mac_id;
+	} hwm_trans[8];
 	uint32_t pdevs_active;
 	int pdevs_macaddr_valid;
 	struct ath12k_hal_reg_capabilities_ext hal_reg_cap[MAX_RADIOS];
@@ -2372,6 +2379,7 @@ struct qwz_softc {
 	 * mon_coex_sta_addr is the station's own address; mon_coex_stopped_ns is when the last coex cell stopped.
 	 */
 	int				 mon_coex, mon_coex_setup, mon_coex_base_vdevs, mon_coex_base_peers, mon_coex_halt, mon_coex_swapped, mon_coex_probe;
+	int				 mon_coex_swap_ring;	/* F2d: with debug.qwz.moncoexfilter 3 (mon_coex_swapped 2) the one rx_mac_buf_ring that carries the monitor filter, else -1 */
 	uint8_t				 mon_coex_sta_addr[IEEE80211_ADDR_LEN];
 	uint64_t			 mon_coex_stopped_ns;
 	struct task			 mon_coex_task;	/* K5 (L1-C13, C14): runs in the gate on systq (the 1 s watchdog tick runs on the workloop thread, which may not sleep); NOT reference-counted */
@@ -2403,7 +2411,8 @@ struct qwz_softc {
 		uint32_t wmi_mgmt_rx_events, ring_mgmt_frames;	/* K2c (C4): WMI management-RX events seen while the cell runs (before any filter); management frames that arrived through the RX ring path */
 		uint32_t ufr_fmt, ufr_fmtfail;	/* K4 (M1): user frames sent with a tx_params block (debug.qwz.monfmt); of those, frames whose tx_params send failed and went again without */
 		uint32_t badcookie, nolink, duplink, linkret_fail;
-		uint32_t coex_st_mgmt, coex_cell_mgmt, coex_st_data, coex_cell_data, coex_drop;	/* K5 (L1-C6, C7, C15): while a coex cell runs, frames the claim tests sent to the station (st_*), to the cell's capture (cell_*), or dropped (drop); reset with the rest of mon_stats at cell start */
+		uint32_t coex_st_mgmt, coex_cell_mgmt, coex_st_data, coex_cell_data, coex_drop;
+		uint32_t coex_awdl_otherfreq;	/* F2d: AWDL-BSS management frames the firmware reported on another frequency than the cell's (refused as before; evidence) */	/* K5 (L1-C6, C7, C15): while a coex cell runs, frames the claim tests sent to the station (st_*), to the cell's capture (cell_*), or dropped (drop); reset with the rest of mon_stats at cell start */
 		uint32_t coex_wbm_taken, coex_wbm_skipped, coex_wbm_badhdr;	/* K6 (K6-1): coex cell, WBM error ring: peer-less data frames copied to the capture (taken), multi-buffer or already-processed frames left alone (skipped), frames whose descriptor or length could not be used (badhdr); reset at cell start */
 		uint64_t last_log;
 	} mon_stats;
