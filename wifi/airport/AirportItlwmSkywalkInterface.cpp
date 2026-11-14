@@ -1409,8 +1409,12 @@ setVIRTUAL_IF_CREATE(apple80211_virt_if_create_data *data)
                 instance->fAWDLInterface->release();
                 instance->fAWDLInterface = nullptr;
             }
-            else
+            else {
+                // The firmware listener must acknowledge the address carried by
+                // native AWDL frames, as ForbiddenItlwm's listener MAC does.
+                static_cast<ItlQwz *>(instance->fHalService)->setAwdlAddress(address.octet);
                 instance->awdlNativeRadioStart();	/* F2-1: connect the cell to the peer manager */
+            }
         }
         qwz_log("airport: awdl0: native create: attached %d result 0x%x\n", attached, result);
         qwz_log_publish();

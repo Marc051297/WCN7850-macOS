@@ -2,6 +2,7 @@ firmware/dl/
 firmware/FwBinary.cpp
 build/
 build-debug/
+build-f2h/
 deps/
 .DS_Store
 build-fixes/

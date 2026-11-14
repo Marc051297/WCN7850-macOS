@@ -357,8 +357,12 @@ ItlQwz::awdlPeerAddGated(OSObject *, void *arg0, void *arg1, void *arg2, void *)
 void
 ItlQwz::setAwdlAddress(const uint8_t *mac)
 {
-	if (sc == NULL || mac == NULL)
+	if (sc == NULL)
 		return;
+	if (mac == NULL) {
+		__atomic_store_n(&sc->sc_awdl_addr_valid, 0, __ATOMIC_RELEASE);
+		return;
+	}
 	/* The bytes first, then the flag: qwz_awdltest_vdev_create reads the flag and then the bytes. */
 	memcpy(sc->sc_awdl_addr, mac, IEEE80211_ADDR_LEN);
 	__atomic_store_n(&sc->sc_awdl_addr_valid, 1, __ATOMIC_RELEASE);

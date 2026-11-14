@@ -102,7 +102,7 @@ extern int qwz_moncoex, qwz_moncoexmode, qwz_moncoexpassive, qwz_moncoexfilter, 
 /* K6 (K6-1): debug.qwz.moncoexwbm, default 1, acts only while a coex cell runs (moncoex defaults to 0): the WBM error path hands the cell's peer-less data frames to the capture; read live */
 extern int qwz_moncoexwbm;
 extern int qwz_moncoexdwell, qwz_moncoexrest, qwz_moncoexdwellflags;	/* F2e */
-#define QWZ_MON_DWELL_SCAN_ID	0xA0D1	/* F2e: scan id of a dwell visit (ATH12K_SCAN_ID is 0xA000) */
+/* F2h: each dwell uses 0xA001..0xAfff, request id 2. Ordinary scans use 0xA000, request id 1. */
 #define QWZ_MON_DWELL_REQ_ID	2	/* the station's scans use 1 */
 int	qwz_mon_dwell_start(struct qwz_softc *, uint32_t freq, int dwell_ms);	/* qwz.c: sends the scan; may sleep for a WMI credit */
 void	qwz_mon_dwell_event(struct qwz_softc *, uint32_t type, uint32_t freq, uint32_t reason);	/* qwz_mon.c: the visit's scan events */
@@ -167,6 +167,9 @@ typedef void (*qwz_mon_native_rx_fn)(void *arg, const uint8_t *frame, size_t len
 void	qwz_mon_set_native_rx(qwz_mon_native_rx_fn fn, void *arg);
 /* F2: free transmit slots on the cell for data frames right now (0 when no cell, the firmware is unavailable or TX is blocked). */
 int	qwz_mon_tx_room(void);
+/* Native frames wait for the matching listener address and, during ROC,
+ * the firmware's arrival on the requested channel. Does not consume packets. */
+int	qwz_mon_native_tx_ready(void);
 /* F2: send one 802.11 frame (no FCS) from the cell, the gate held by the caller; errno (ENOSPC: no slot, try later). */
 int	qwz_mon_tx_raw(const uint8_t *frame, size_t len);
 /* qwz_attach(): allocates the capture ring and remembers the softc. */

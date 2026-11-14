@@ -12506,9 +12506,11 @@ qwz_scan_event(struct qwz_softc *sc, struct mbuf *m)
 #ifdef notyet
 	rcu_read_lock();
 #endif
-	if (scan_ev.scan_id == QWZ_MON_DWELL_SCAN_ID || scan_ev.scan_req_id == QWZ_MON_DWELL_REQ_ID) {
+	if ((sc->mon_dwell_scan_id != 0 && scan_ev.scan_id == sc->mon_dwell_scan_id) || scan_ev.scan_req_id == QWZ_MON_DWELL_REQ_ID) {
 		/* F2e: a dwell visit's events never touch the station's scan state machine */
-		qwz_mon_dwell_event(sc, scan_ev.event_type, scan_ev.channel_freq, scan_ev.reason);
+		if (scan_ev.scan_id == sc->mon_dwell_scan_id && scan_ev.scan_req_id == QWZ_MON_DWELL_REQ_ID &&
+		    scan_ev.vdev_id == sc->sc_vif.vdev_id)
+			qwz_mon_dwell_event(sc, scan_ev.event_type, scan_ev.channel_freq, scan_ev.reason);
 		return;
 	}
 	if (arvif->vdev_id != scan_ev.vdev_id &&
@@ -19924,6 +19926,12 @@ qwz_wmi_mgmt_send(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	cmd->vdev_id = arvif->vdev_id;
 	cmd->desc_id = buf_id;
 	cmd->chanfreq = 0;
+	/* WCN7850 needs an explicit frequency for ROC management TX (ath12k's
+	 * ath12k_wmi_mgmt_get_freq). A vdev on 149 alone doesn't route a scan's
+	 * outgoing frames there. Station commands retain their original value. */
+	if (arvif == &sc->sc_monvif && sc->mon_coex &&
+	    sc->mon_dwell_inflight && sc->mon_dwell_onchannel)
+		cmd->chanfreq = sc->mon_freq;
 	cmd->paddr_lo = paddr & 0xffffffff;
 	cmd->paddr_hi = paddr >> 32;
 	cmd->frame_len = M_PKTLEN(frame);
@@ -26492,10 +26500,14 @@ qwz_mon_dwell_start(struct qwz_softc *sc, uint32_t freq, int dwell_ms)
 		return ENOMEM;
 	qwz_wmi_start_scan_init(sc, arg);
 	arg->vdev_id = sc->sc_vif.vdev_id;
-	arg->scan_id = QWZ_MON_DWELL_SCAN_ID;
+	// A late completion from an earlier visit must not release a new one.
+	sc->mon_dwell_scan_id = 0xA000 | ((sc->mon_dwell_scan_id + 1) & 0x0fff);
+	if (sc->mon_dwell_scan_id == 0xA000)
+		sc->mon_dwell_scan_id++;
+	arg->scan_id = sc->mon_dwell_scan_id;
 	arg->scan_req_id = QWZ_MON_DWELL_REQ_ID;
 	arg->scan_priority = WMI_SCAN_PRIORITY_HIGH;
-	arg->scan_flags |= WMI_SCAN_FLAG_PASSIVE;
+	arg->scan_f_passive = 1;
 	if (qwz_moncoexdwellflags & 1)	/* F2f: without this the firmware forwards only beacons and probe responses during a scan */
 		arg->scan_f_promisc_mode = 1;
 	if (qwz_moncoexdwellflags & 2)
@@ -26504,9 +26516,10 @@ qwz_mon_dwell_start(struct qwz_softc *sc, uint32_t freq, int dwell_ms)
 		arg->scan_f_offchan_data_tx = 1;
 	arg->dwell_time_passive = dwell_ms;
 	arg->dwell_time_active = dwell_ms;
+	arg->burst_duration = dwell_ms;	/* ath12k remain-on-channel: reserve a contiguous visit */
 	arg->max_scan_time = dwell_ms + 1000;
 	arg->notify_scan_events = WMI_SCAN_EVENT_STARTED | WMI_SCAN_EVENT_COMPLETED | WMI_SCAN_EVENT_BSS_CHANNEL | WMI_SCAN_EVENT_FOREIGN_CHAN |
-	    WMI_SCAN_EVENT_DEQUEUED | WMI_SCAN_EVENT_START_FAILED | WMI_SCAN_EVENT_PREEMPTED;
+	    WMI_SCAN_EVENT_DEQUEUED | WMI_SCAN_EVENT_START_FAILED | WMI_SCAN_EVENT_PREEMPTED | WMI_SCAN_EVENT_FOREIGN_CHAN_EXIT;
 	arg->num_chan = 1;
 	arg->chan_list = mallocarray(1, sizeof(*arg->chan_list), M_DEVBUF, M_NOWAIT | M_ZERO);
 	if (arg->chan_list == NULL) {

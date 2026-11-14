@@ -849,8 +849,12 @@ qwz_mon_tx_raw(const uint8_t *frame, size_t len)
 
 	if (sc == NULL)
 		return ENXIO;
-	if (len < 10)
+	if (frame == NULL || len < 10)
 		return EINVAL;
+	if (!qwz_mon_native_tx_ready())
+		return EAGAIN;
+	if (len >= 24 && !IEEE80211_ADDR_EQ(frame + 10, sc->sc_monvif.vdev_addr))
+		return EADDRNOTAVAIL;
 	type = (frame[0] >> 2) & 3;
 	kind = type == 0 ? 1 : type == 2 ? 2 : 3;
 	ret = qwz_mon_tx_bytes(sc, frame, len, kind);
@@ -1092,6 +1096,45 @@ qwz_mon_set_native_rx(qwz_mon_native_rx_fn fn, void *arg)
 {
 	__atomic_store_n(&qwz_mon_native_rx_arg, arg, __ATOMIC_RELEASE);
 	__atomic_store_n(&qwz_mon_native_rx, fn, __ATOMIC_RELEASE);
+}
+
+/* The Intel listener binds its MAC to awdl0 and filters on the AWDL BSSID.
+ * Native mode needs the same identity on the Qualcomm vdev. The daemon's
+ * independent cell retains its previous address-selection rules. */
+static int
+qwz_mon_native_identity(struct qwz_softc *sc)
+{
+	if (__atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE) == NULL)
+		return 0;
+	const uint8_t *address = sc->sc_awdl_addr;
+	const uint8_t zero[6] = {0};
+	if (!__atomic_load_n(&sc->sc_awdl_addr_valid, __ATOMIC_ACQUIRE) ||
+	    (address[0] & 1) || IEEE80211_ADDR_EQ(address, zero))
+		return EADDRNOTAVAIL;
+	if (IEEE80211_ADDR_EQ(address, sc->sc_ic.ic_myaddr) ||
+	    IEEE80211_ADDR_EQ(address, sc->sc_vif.vdev_addr))
+		return EADDRINUSE;
+	IEEE80211_ADDR_COPY(sc->sc_monvif.vdev_addr, address);
+	IEEE80211_ADDR_COPY(sc->mon_bssid, qwz_awdl_bssid);
+	sc->mon_bssid_set = 1;
+	return 0;
+}
+
+int
+qwz_mon_native_tx_ready(void)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	if (sc == NULL || !sc->mon_active || sc->mon_coex_halt ||
+	    !sc->sc_monvif.is_up || qwz_mon_fw_unavail(sc) ||
+	    __atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE) == NULL ||
+	    !__atomic_load_n(&sc->sc_awdl_addr_valid, __ATOMIC_ACQUIRE) ||
+	    !IEEE80211_ADDR_EQ(sc->sc_monvif.vdev_addr, sc->sc_awdl_addr))
+		return 0;
+	const struct ieee80211_node *bss = sc->sc_ic.ic_bss;
+	if (sc->mon_coex && qwz_moncoexdwell > 0 && bss != NULL && bss->ni_chan != NULL &&
+	    bss->ni_chan->ic_freq != sc->mon_freq)
+		return sc->mon_dwell_inflight && sc->mon_dwell_onchannel;
+	return 1;
 }
 
 static void
@@ -1544,10 +1587,12 @@ qwz_mon_reap(void *arg)
 		/* F2e: the next visit to the cell's channel is due; the scan command is sent by the task (it may wait for a WMI credit) */
 		if (sc->mon_dwell_inflight && now - sc->mon_dwell_sent_ns > 4000000000ULL) {
 			sc->mon_dwell_inflight = 0;	/* no completion in 4 s: count it and go on */
+			sc->mon_dwell_onchannel = 0;
 			sc->mon_stats.dwell_lost++;
 		}
 		if (!sc->mon_dwell_inflight && now >= sc->mon_dwell_next_ns) {
 			sc->mon_dwell_inflight = 1;
+			sc->mon_dwell_onchannel = 0;
 			sc->mon_dwell_sent_ns = now;
 			task_add(systq, &sc->mon_dwell_task);
 		}
@@ -1577,8 +1622,9 @@ qwz_mon_reap(void *arg)
 			    (int)sc->htc.endpoint[sc->wmi.wmi[sc->pdevs[0].pdev_id].eid].tx_credits : -1, qwz_moncoexfilter,
 			    sc->mon_coex_swap_ring, sc->mon_stats.coex_awdl_otherfreq);	/* F2d: the swapped ring (-1 none) and the other-frequency count */
 		if (sc->mon_coex && (qwz_moncoexdwell > 0 || sc->mon_stats.dwell_start))	/* F2e */
-			printf("qwz: mon: coex: dwell: asked %u onchan %u done %u fail %u lost %u; dwell %d ms rest %d ms\n", sc->mon_stats.dwell_start,
-			    sc->mon_stats.dwell_onchan, sc->mon_stats.dwell_done, sc->mon_stats.dwell_fail, sc->mon_stats.dwell_lost, qwz_moncoexdwell, qwz_moncoexrest);
+			printf("qwz: mon: coex: dwell: asked %u onchan %u done %u fail %u lost %u; dwell %d ms rest %d ms; freq %u wrongfreq %u lastvisit %u ms ready %d\n", sc->mon_stats.dwell_start,
+			    sc->mon_stats.dwell_onchan, sc->mon_stats.dwell_done, sc->mon_stats.dwell_fail, sc->mon_stats.dwell_lost, qwz_moncoexdwell, qwz_moncoexrest,
+			    sc->mon_stats.dwell_lastfreq, sc->mon_stats.dwell_wrongfreq, sc->mon_stats.dwell_lastms, sc->mon_dwell_onchannel);
 		if (sc->mon_coex)	/* K6 (K6-1): the WBM error ring tap, adjacent additive line */
 			printf("qwz: mon: coex: wbm counters taken %u skipped %u badhdr %u wbm_err %u; moncoexwbm %d\n",
 			    sc->mon_stats.coex_wbm_taken, sc->mon_stats.coex_wbm_skipped, sc->mon_stats.coex_wbm_badhdr, sc->mon_stats.wbm_err, qwz_moncoexwbm);
@@ -1674,6 +1720,13 @@ qwz_mon_vdev_create(struct qwz_softc *sc)
 				printf("qwz: mon: coex: cell MAC adjusted\n");
 		}
 	}
+	ret = qwz_mon_native_identity(sc);
+	if (ret) {
+		printf("qwz: mon: native listener identity refused: %d\n", ret);
+		return ret;
+	}
+	if (__atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE) != NULL)
+		printf("qwz: mon: native listener f2h: MAC matches awdl0, BSSID 00:25:00:ff:94:73\n");
 
 	memset(&params, 0, sizeof(params));
 	ret = qwz_mac_setup_vdev_create_params(sc, vif, pdev, &params);
@@ -2210,6 +2263,8 @@ k5_coex_guards_done:	/* K5 (L1-C2) */
 	if (coex) {
 		sc->mon_coex_swap_ring = -1;
 		sc->mon_dwell_inflight = 0;	/* F2e */
+		sc->mon_dwell_onchannel = 0;
+		sc->mon_dwell_arrived_ns = 0;
 		sc->mon_dwell_next_ns = 0;
 		if (qwz_moncoexfilter == 3) {
 			/*
@@ -2438,6 +2493,8 @@ qwz_mon_stop(struct qwz_softc *sc)
 		return;
 	}
 	sc->mon_active = 0;
+	sc->mon_dwell_onchannel = 0;
+	sc->mon_dwell_inflight = 0;
 	timeout_del(&sc->mon_cell_timer);
 	qwz_mon_coex_quota_clear(sc);	/* F2-3: the firmware's scheduler back to adaptive, while the firmware is up */
 	/*
@@ -2532,6 +2589,9 @@ qwz_mon_epoch_reset(struct qwz_softc *sc)
 		printf("qwz: mon: capture cell ended by a firmware teardown (epoch %u)\n", sc->sc_fw_epoch);
 	sc->mon_active = 0;
 	sc->mon_coex = 0;		/* K5 (L1-C2): a firmware teardown ends a coex cell too */
+	sc->mon_dwell_inflight = 0;
+	sc->mon_dwell_onchannel = 0;
+	sc->mon_dwell_arrived_ns = 0;
 	sc->mon_coex_swapped = 0;
 	sc->mon_coex_halt = 0;		/* K5 (L1-C13) */
 	sc->mon_coex_probe = 0;		/* K5 (L1-C14): no firmware left to watch */
@@ -2691,6 +2751,7 @@ qwz_mon_dwell_task_fn(void *arg)
 		return;
 	if (!sc->mon_active || !sc->mon_coex || sc->mon_coex_halt || qwz_moncoexdwell <= 0) {
 		sc->mon_dwell_inflight = 0;
+		sc->mon_dwell_onchannel = 0;
 		return;
 	}
 	ret = qwz_mon_dwell_start(sc, sc->mon_freq, qwz_mon_dwell_clamp(qwz_moncoexdwell, 20, 1000));
@@ -2699,6 +2760,7 @@ qwz_mon_dwell_task_fn(void *arg)
 			printf("qwz: mon: coex: dwell: first visit not sent: %d\n", ret);
 		sc->mon_dwell_next_ns = getnsecuptime() + 300000000ULL;
 		sc->mon_dwell_inflight = 0;
+		sc->mon_dwell_onchannel = 0;
 		return;
 	}
 	if (++sc->mon_stats.dwell_start == 1)
@@ -2709,8 +2771,27 @@ qwz_mon_dwell_task_fn(void *arg)
 void
 qwz_mon_dwell_event(struct qwz_softc *sc, uint32_t type, uint32_t freq, uint32_t reason)
 {
+	if (!sc->mon_active || !sc->mon_coex || !sc->mon_dwell_inflight)
+		return;
+	const uint64_t now = getnsecuptime();
+	if (sc->mon_dwell_onchannel && (type == WMI_SCAN_EVENT_BSS_CHANNEL ||
+	    type == WMI_SCAN_EVENT_FOREIGN_CHAN_EXIT || type == WMI_SCAN_EVENT_START_FAILED ||
+	    type == WMI_SCAN_EVENT_PREEMPTED || type == WMI_SCAN_EVENT_COMPLETED || type == WMI_SCAN_EVENT_DEQUEUED)) {
+		sc->mon_stats.dwell_lastms = (uint32_t)((now - sc->mon_dwell_arrived_ns) / 1000000ULL);
+		sc->mon_dwell_onchannel = 0;
+	}
 	switch (type) {
 	case WMI_SCAN_EVENT_FOREIGN_CHAN:
+		sc->mon_stats.dwell_lastfreq = freq;
+		if (freq != sc->mon_freq) {
+			sc->mon_stats.dwell_wrongfreq++;
+			sc->mon_dwell_onchannel = 0;
+			break;
+		}
+		if (sc->mon_dwell_onchannel)
+			break;
+		sc->mon_dwell_arrived_ns = now;
+		sc->mon_dwell_onchannel = 1;
 		if (++sc->mon_stats.dwell_onchan == 1)
 			printf("qwz: mon: coex: dwell: the radio is on %u MHz (first arrival)\n", freq);
 		break;
@@ -2723,7 +2804,7 @@ qwz_mon_dwell_event(struct qwz_softc *sc, uint32_t type, uint32_t freq, uint32_t
 	case WMI_SCAN_EVENT_DEQUEUED:
 		if (type == WMI_SCAN_EVENT_COMPLETED)
 			sc->mon_stats.dwell_done++;
-		sc->mon_dwell_next_ns = getnsecuptime() + (uint64_t)qwz_mon_dwell_clamp(qwz_moncoexrest, 20, 5000) * 1000000ULL;
+		sc->mon_dwell_next_ns = now + (uint64_t)qwz_mon_dwell_clamp(qwz_moncoexrest, 20, 5000) * 1000000ULL;
 		sc->mon_dwell_inflight = 0;
 		break;
 	default:

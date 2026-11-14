@@ -2381,7 +2381,9 @@ struct qwz_softc {
 	int				 mon_coex, mon_coex_setup, mon_coex_base_vdevs, mon_coex_base_peers, mon_coex_halt, mon_coex_swapped, mon_coex_probe;
 	/* F2e: host-paced visits to the cell's channel (debug.qwz.moncoexdwell): one single-channel passive scan at a time on the station vdev */
 	struct task			 mon_dwell_task;
-	int				 mon_dwell_inflight;
+	int				 mon_dwell_inflight, mon_dwell_onchannel;
+	uint32_t			 mon_dwell_scan_id;	/* changes each visit, survives cell stop/restart */
+	uint64_t			 mon_dwell_arrived_ns;
 	uint64_t			 mon_dwell_next_ns, mon_dwell_sent_ns;
 	int				 mon_coex_swap_ring;	/* F2d: with debug.qwz.moncoexfilter 3 (mon_coex_swapped 2) the one rx_mac_buf_ring that carries the monitor filter, else -1 */
 	uint8_t				 mon_coex_sta_addr[IEEE80211_ADDR_LEN];
@@ -2417,6 +2419,7 @@ struct qwz_softc {
 		uint32_t badcookie, nolink, duplink, linkret_fail;
 		uint32_t coex_st_mgmt, coex_cell_mgmt, coex_st_data, coex_cell_data, coex_drop;
 		uint32_t dwell_start, dwell_done, dwell_onchan, dwell_fail, dwell_lost;	/* F2e: visits asked, completed, arrivals on the cell's channel, refused or failed, never answered */
+		uint32_t dwell_wrongfreq, dwell_lastfreq, dwell_lastms;
 		uint32_t coex_awdl_otherfreq;	/* F2d: AWDL-BSS management frames the firmware reported on another frequency than the cell's (refused as before; evidence) */	/* K5 (L1-C6, C7, C15): while a coex cell runs, frames the claim tests sent to the station (st_*), to the cell's capture (cell_*), or dropped (drop); reset with the rest of mon_stats at cell start */
 		uint32_t coex_wbm_taken, coex_wbm_skipped, coex_wbm_badhdr;	/* K6 (K6-1): coex cell, WBM error ring: peer-less data frames copied to the capture (taken), multi-buffer or already-processed frames left alone (skipped), frames whose descriptor or length could not be used (badhdr); reset at cell start */
 		uint64_t last_log;

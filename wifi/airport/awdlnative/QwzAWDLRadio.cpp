@@ -78,6 +78,7 @@ void AirportItlwm::awdlNativeRadioStart()
 	qwz_mon_set_native_rx(awdlNativeRadioRx, this);
 	awdlNativeTimer->setTimeoutMS(50);
 	setProperty("QwzAWDLRadio", "started");
+	setProperty("QwzAWDLRadioBuild", "f2h-native-listener");
 	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
 	qwz_log_publish();
 }
@@ -85,6 +86,8 @@ void AirportItlwm::awdlNativeRadioStart()
 void AirportItlwm::awdlNativeRadioStop()
 {
 	qwz_mon_set_native_rx(nullptr, nullptr);
+	if (fHalService != nullptr)
+		static_cast<ItlQwz *>(fHalService)->setAwdlAddress(nullptr);
 	if (awdlNativeTimer != nullptr) {
 		awdlNativeTimer->cancelTimeout();
 		getWorkLoop()->removeEventSource(awdlNativeTimer);
@@ -186,8 +189,9 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 	const int cell = ready ? qwz_mon_status() : 0;
 	const uint64_t now = nowUS();
 	bool pending = false;
-	if (cell > 0) {
+	if (cell > 0)
 		st.cellTimerTicks++;
+	if (cell > 0 && qwz_mon_native_tx_ready()) {
 		const bool dataActive = self->awdlNativeLastDataUS != 0 && now - self->awdlNativeLastDataUS < kDataActiveUS;
 		const uint64_t sinceSync = now - self->awdlNativeLastSyncUS;
 		if (self->awdlNativeLastSyncUS == 0 || sinceSync >= (dataActive ? kSyncDataIntervalUS : ItlAWDL::kSyncIdleIntervalUS)) {
@@ -229,6 +233,9 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 					break;
 			}
 		}
+	}
+	// Return completed Skywalk packets even while waiting for a radio window.
+	if (cell > 0) {
 		pending = self->serviceAWDLTransmit();
 		st.queued = self->queuedAWDLTransmit();
 	}
@@ -240,6 +247,7 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 				if (OSNumber *n = OSNumber::withNumber(v, 64)) { d->setObject(k, n); n->release(); }
 			};
 			put("cell", uint64_t(cell)); put("ticks", st.timerTicks); put("cellTicks", st.cellTimerTicks);
+			put("txReady", qwz_mon_native_tx_ready());
 			put("rxAction", st.rxAction); put("rxActionHanded", st.rxActionHanded); put("rxActionRefused", st.rxActionRefused);
 			put("rxActionLastError", st.rxActionLastError); put("rxActionTrimmed", st.rxActionTrimmed); put("rxActionTooLong", st.rxActionTooLong);
 			put("rxData", st.rxData); put("rxDataHanded", st.rxDataHanded); put("rxDataTooLong", st.rxDataTooLong);
