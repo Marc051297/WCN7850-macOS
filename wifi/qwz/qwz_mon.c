@@ -2090,7 +2090,8 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 			return EBUSY;
 		}
 		stachan = ieee80211_chan2ieee(cic, cic->ic_bss->ni_chan);
-		if ((stachan != chan && !qwz_moncoexmcc) || !(chan == 6 || chan == 44 || chan == 149) || (chan >= 52 && chan <= 144)) {
+		/* F2g: on the station's OWN channel any non-DFS channel is allowed (36 to 48, 149 to 165, 1 to 13): the same-channel cell needs no second channel from the firmware. Another channel stays 6, 44 or 149. */
+		if ((stachan != chan && !qwz_moncoexmcc) || (stachan != chan && !(chan == 6 || chan == 44 || chan == 149)) || (chan >= 52 && chan <= 144) || chan < 1 || chan > 165) {
 			printf("qwz: mon: coex: refused: the station is on channel %d, the cell asked for %d (the cell runs only on the station's channel, 6, 44 or 149, never 52 to 144; debug.qwz.moncoexmcc=1 allows another channel)\n",
 			    stachan, chan);
 			return EBUSY;
