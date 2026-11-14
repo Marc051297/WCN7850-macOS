@@ -3056,8 +3056,10 @@ qwz_mon_native_auto_allowed(struct qwz_softc *sc)
 	    __atomic_load_n(&sc->sc_awdl_addr_valid, __ATOMIC_ACQUIRE) &&
 	    sc->attached && !qwz_mon_fw_unavail(sc) && !sc->mon_active && !sc->mon_coex_setup &&
 	    sc->sc_ic.ic_state == IEEE80211_S_RUN && sc->sc_vif.is_up && sc->sc_vif.is_started &&
+	    sc->ns_nstate == IEEE80211_S_RUN &&
 	    sc->sc_ic.ic_bss != NULL && sc->sc_ic.ic_bss->ni_chan != NULL &&
-	    !sc->sc_ic.ic_wcl_join_requested && !sc->sc_ic.ic_wcl_scan_requested &&
+	    (!sc->sc_ic.ic_bss->ni_rsnprotos || sc->sc_ic.ic_bss->ni_port_valid) &&
+	    !sc->sc_ic.ic_wcl_scan_requested && !(sc->sc_ic.ic_flags & IEEE80211_F_BGSCAN) &&
 	    sc->scan.state == ATH12K_SCAN_IDLE;
 }
 
@@ -3093,7 +3095,11 @@ qwz_mon_native_auto_tick(void)
 		return;
 	}
 	if (!qwz_mon_native_auto_allowed(sc)) {
-		qwz_mon_native_state = "waiting-for-wifi";
+		const struct ieee80211com *ic = &sc->sc_ic;
+		qwz_mon_native_state = ic->ic_state != IEEE80211_S_RUN ? "waiting-for-wifi" :
+		    !sc->sc_awdl_addr_valid ? "waiting-for-address" :
+		    sc->scan.state != ATH12K_SCAN_IDLE || ic->ic_wcl_scan_requested || (ic->ic_flags & IEEE80211_F_BGSCAN) ? "waiting-for-scan" :
+		    ic->ic_bss && ic->ic_bss->ni_rsnprotos && !ic->ic_bss->ni_port_valid ? "waiting-for-authorization" : "waiting-for-device";
 		return;
 	}
 	const uint64_t now = getnsecuptime();

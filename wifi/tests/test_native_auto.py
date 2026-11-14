@@ -32,13 +32,15 @@ prefix = r'''
 #define isset(a,n) ((a)[(n)/8] & (1U<<((n)%8)))
 constexpr unsigned IEEE80211_CHAN_PASSIVE=0x200,IEEE80211_CHAN_DFS=0x80000,IEEE80211_CHAN_NOADHOC=0x200000;
 constexpr int IEEE80211_S_RUN=4,ATH12K_SCAN_IDLE=0,RW_WRITE=1,RW_NOSLEEP=0x40;
+constexpr unsigned IEEE80211_F_BGSCAN=1U<<12;
 constexpr unsigned QWZ_MON_F_OFFSETS=1,QWZ_MON_F_RXMON=2,QWZ_MON_F_KEEP_FILTER=8,QWZ_MON_F_REO=256,QWZ_MON_F_AP=1024;
 struct task {int adds=0;};
 struct rwlock {int held=0;};
 struct ieee80211_channel {uint32_t ic_freq=0,ic_flags=0;};
-struct ieee80211_node {ieee80211_channel *ni_chan=nullptr;};
+struct ieee80211_node {ieee80211_channel *ni_chan=nullptr; int ni_rsnprotos=0,ni_port_valid=0;};
 struct ieee80211com {
     int ic_state=0; ieee80211_node *ic_bss=nullptr;
+    unsigned ic_flags=0;
     bool ic_wcl_join_requested=false,ic_wcl_scan_requested=false;
     ieee80211_channel ic_channels[256]; uint8_t ic_chan_active[32]{};
 };
@@ -51,6 +53,7 @@ struct qwz_softc {
     struct {int state=0;} scan;
     task mon_coex_task; rwlock ioctl_rwl;
     int unavailable=0;
+    int ns_nstate=IEEE80211_S_RUN;
 };
 using qwz_mon_native_rx_fn=void(*)();
 static qwz_softc *qwz_mon_sc;
@@ -121,13 +124,22 @@ int main() {
     qwz_mon_native_auto_tick(); assert(sc.mon_coex_task.adds==1);
     qwz_mon_native_auto_start(&sc); assert(starts==1); // queued old start cannot violate pause
     now+=13000000000ULL;
+    // WCL intentionally retains this flag after a successful connection.
     sc.sc_ic.ic_wcl_join_requested=true;
+    sc.ns_nstate=0;
     qwz_mon_native_auto_start(&sc); assert(starts==1);
-    sc.sc_ic.ic_wcl_join_requested=false;
+    sc.ns_nstate=IEEE80211_S_RUN;
+    bss.ni_rsnprotos=1;
+    qwz_mon_native_auto_start(&sc); assert(starts==1); // secured port still pending
+    bss.ni_port_valid=1;
+    sc.sc_ic.ic_flags=IEEE80211_F_BGSCAN;
+    qwz_mon_native_auto_start(&sc); assert(starts==1);
+    sc.sc_ic.ic_flags=0;
     sc.sc_ic.ic_wcl_scan_requested=true;
     qwz_mon_native_auto_start(&sc); assert(starts==1);
     sc.sc_ic.ic_wcl_scan_requested=false;
     qwz_mon_native_auto_start(&sc); assert(starts==2 && sc.mon_active);
+    assert(sc.sc_ic.ic_wcl_join_requested); // retained request must permit auto start
     // Explicit sysctl stop opts out. A later timer must not restart the cell.
     int result=-1;
     qwz_mon_gated(nullptr,nullptr,&result,(void*)1,nullptr);
