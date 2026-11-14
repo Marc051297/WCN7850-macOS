@@ -1,5 +1,5 @@
 diff --git a/BrcmPatchRAM/BlueToolFixup.cpp b/BrcmPatchRAM/BlueToolFixup.cpp
-index e592e66..8fd3d15 100644
+index e592e66..03c5909 100644
 --- a/BrcmPatchRAM/BlueToolFixup.cpp
 +++ b/BrcmPatchRAM/BlueToolFixup.cpp
 @@ -14,8 +14,18 @@
@@ -86,35 +86,89 @@ index e592e66..8fd3d15 100644
      "Mac-9F18E312C5C2BF0B",
      "Mac-937CB26E2E02BB01",
      "Mac-E43C1C25D4880AD6",
-@@ -236,6 +293,27 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
-                 searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
-             if (shouldPatchAddress)
-                 searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
-+            if (shouldPatchQcaContinuity && !QcaBluetooth::allowed(QcaBluetooth::buildGate(version, qcaOsBuild))) {
-+                shouldPatchQcaContinuity = false;
-+                IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityBuildAllowed", false);
-+                IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityPageGate", "unsupported-os-build");
+@@ -212,31 +269,59 @@ static inline void searchAndPatchWithMask(const void *haystack, size_t haystackS
+ 
+ #pragma mark - Patched functions
+ 
++#include "QcaPageGuard.inc"
++
++static void patchBluetoothdPage(const void *data, const char *path) {
++    searchAndPatch(data, PAGE_SIZE, path, kVendorCheckOriginal, kVendorCheckPatched);
++    searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal, kBadChipsetCheckPatched);
++    if (getKernelVersion() >= KernelVersion::Ventura && getKernelVersion() < KernelVersion::Sequoia)
++        searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal13_3, kBadChipsetCheckPatched13_3);
++    if (getKernelVersion() >= KernelVersion::Sequoia)
++        searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
++    if (shouldPatchNvramCheck)
++        searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3), kSkipInternalControllerNVRAMCheckMask13_3, sizeof(kSkipInternalControllerNVRAMCheckMask13_3), kSkipInternalControllerNVRAMCheckPatched13_3, sizeof(kSkipInternalControllerNVRAMCheckPatched13_3), nullptr, 0);
++    if (shouldPatchBoardId)
++        searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
++    if (shouldPatchAddress)
++        searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
++    if (shouldPatchQcaContinuity && !QcaBluetooth::allowed(QcaBluetooth::buildGate(version, qcaOsBuild))) {
++        shouldPatchQcaContinuity = false;
++        IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityBuildAllowed", false);
++        IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityPageGate", "unsupported-os-build");
++    }
++    auto *qcaHook = OSDynamicCast(OSNumber, IORegistryEntry::getRegistryRoot()->getProperty("QcaContinuityHciHookRouted"));
++    if (shouldPatchQcaContinuity && qcaHook && qcaHook->unsigned32BitValue() == 1) {
++        // Reuse this plugin's existing validation hook; no second cs_validate_page route.
++        for (size_t i = 0; i < arrsize(BTLEAdv::kPatches); ++i) {
++            const auto &p = BTLEAdv::kPatches[i];
++            if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, p.find, p.size, p.replace, p.size)) {
++                OSBitOrAtomic(UInt32(1) << i, &qcaPatchMask);
++                IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityPatchMask", UInt32(qcaPatchMask), 32);
 +            }
-+            auto *qcaHook = OSDynamicCast(OSNumber, IORegistryEntry::getRegistryRoot()->getProperty("QcaContinuityHciHookRouted"));
-+            if (shouldPatchQcaContinuity && qcaHook && qcaHook->unsigned32BitValue() == 1) {
-+                // Reuse this plugin's existing validation hook; no second cs_validate_page route.
-+                for (size_t i = 0; i < arrsize(BTLEAdv::kPatches); ++i) {
-+                    const auto &p = BTLEAdv::kPatches[i];
-+                    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, p.find, p.size, p.replace, p.size)) {
-+                        OSBitOrAtomic(UInt32(1) << i, &qcaPatchMask);
-+                        IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityPatchMask", UInt32(qcaPatchMask), 32);
-+                    }
-+                }
-+            }
-+            if (shouldPatchLEEventMask) {
-+                searchAndPatch(data, PAGE_SIZE, path, kDongleLEEventMaskCode26Original, kDongleLEEventMaskCode26Patched);
-+                searchAndPatch(data, PAGE_SIZE, path, kDongleLEEventMaskTable26Original, kDongleLEEventMaskTable26Patched);
-+                searchAndPatch(data, PAGE_SIZE, path, kDongleLEEventMaskOriginal, kDongleLEEventMaskPatched);
-+            }
-         }
++        }
++    }
++    if (shouldPatchLEEventMask) {
++        searchAndPatch(data, PAGE_SIZE, path, kDongleLEEventMaskCode26Original, kDongleLEEventMaskCode26Patched);
++        searchAndPatch(data, PAGE_SIZE, path, kDongleLEEventMaskTable26Original, kDongleLEEventMaskTable26Patched);
++        searchAndPatch(data, PAGE_SIZE, path, kDongleLEEventMaskOriginal, kDongleLEEventMaskPatched);
++    }
++}
++
+ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data, int *validated_p, int *tainted_p, int *nx_p) {
+     char path[PATH_MAX];
+     int pathlen = PATH_MAX;
+-    FunctionCast(patched_cs_validate_page, orig_cs_validate)(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
+-    static constexpr size_t dirLength = sizeof("/usr/sbin/")-1;
+-    if (vn_getpath(vp, path, &pathlen) == 0 && UNLIKELY(strncmp(path, "/usr/sbin/", dirLength) == 0)) {
+-        if (strcmp(path + dirLength, "BlueTool") == 0) {
+-            searchAndPatch(data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
+-            if (shouldPatchBoardId)
+-                searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+-        }
+-        else if (strcmp(path + dirLength, "bluetoothd") == 0) {
+-            searchAndPatch(data, PAGE_SIZE, path, kVendorCheckOriginal, kVendorCheckPatched);
+-            searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal, kBadChipsetCheckPatched);
+-            if (getKernelVersion() >= KernelVersion::Ventura && getKernelVersion() < KernelVersion::Sequoia)
+-                searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal13_3, kBadChipsetCheckPatched13_3);
+-            if (getKernelVersion() >= KernelVersion::Sequoia)
+-                searchAndPatch(data, PAGE_SIZE, path, kBadChipsetCheckOriginal15_4, kBadChipsetCheckPatched15_4);
+-            if (shouldPatchNvramCheck)
+-                searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipInternalControllerNVRAMCheck13_3, sizeof(kSkipInternalControllerNVRAMCheck13_3), kSkipInternalControllerNVRAMCheckMask13_3, sizeof(kSkipInternalControllerNVRAMCheckMask13_3), kSkipInternalControllerNVRAMCheckPatched13_3, sizeof(kSkipInternalControllerNVRAMCheckPatched13_3), nullptr, 0);
+-            if (shouldPatchBoardId)
+-                searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
+-            if (shouldPatchAddress)
+-                searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
+-        }
++    const bool named = vn_getpath(vp, path, &pathlen) == 0;
++    auto native = FunctionCast(patched_cs_validate_page, orig_cs_validate);
++    const bool bluetoothd = named && strcmp(path, "/usr/sbin/bluetoothd") == 0;
++    if (bluetoothd && qcaGuardValidate(vp, pager, page_offset, data, validated_p,
++        tainted_p, nx_p, native, patchBluetoothdPage, path)) return;
++    native(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
++    if (named && strcmp(path, "/usr/sbin/BlueTool") == 0) {
++        searchAndPatch(data, PAGE_SIZE, path, kSkipUpdateFilePathOriginal, kSkipUpdateFilePathPatched);
++        if (shouldPatchBoardId)
++            searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
++    } else if (bluetoothd) {
++        patchBluetoothdPage(data, path);
      }
  }
-@@ -267,6 +345,17 @@ static void pluginStart() {
+ 
+@@ -267,6 +352,18 @@ static void pluginStart() {
              shouldPatchAddress = checkKernelArgument("-btlfxallowanyaddr");
          if (getKernelVersion() <= KernelVersion::Sonoma)
              shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
@@ -129,6 +183,7 @@ index e592e66..8fd3d15 100644
 +            IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityBuildAllowed", shouldPatchQcaContinuity);
 +        }
 +        shouldPatchLEEventMask = checkKernelArgument("-btlfxlemask") || shouldPatchQcaContinuity;
++        qcaSetupPageGuard(patcher);
          KernelPatcher::RouteRequest csRoute = KernelPatcher::RouteRequest("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
          if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
              SYSLOG(MODULE_SHORT, "failed to route cs validation pages");

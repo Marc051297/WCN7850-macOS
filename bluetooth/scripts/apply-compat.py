@@ -21,7 +21,9 @@ def main():
     if name == 'BrcmPatchRAM':
         destination = tree / 'BrcmPatchRAM'
         apply(tree, 'bluetoolfixup-continuity.patch')
-        files = ['QcaContinuityPatches.hpp', 'QcaBluetoothHci.hpp']
+        files = ['QcaContinuityPatches.hpp', 'QcaBluetoothHci.hpp',
+                 'QcaValidatedPages.hpp', 'QcaVerifyLayout.hpp',
+                 'QcaPeerAddress25G342.hpp', 'QcaPageGuard.inc']
     elif name == 'IntelBluetoothFirmware':
         destination = tree / 'IntelBTPatcher'
         apply(tree, 'intelbtpatcher-continuity.patch')
