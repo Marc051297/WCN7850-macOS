@@ -1861,6 +1861,25 @@ struct qwz_txmgmt_queue {
 	int queued;
 };
 
+/* Completions may arrive out of order. A count below capacity does not make
+ * cur free: select an unowned slot within this vif's descriptor partition. */
+static inline int
+qwz_txmgmt_find_free(const struct qwz_txmgmt_queue *q, int first, int limit)
+{
+	int i, slot;
+	if (first < 0 || limit <= first ||
+	    limit > (int)(sizeof(q->data) / sizeof(q->data[0])))
+		return -1;
+	slot = q->cur >= first && q->cur < limit ? q->cur : first;
+	for (i = 0; i < limit - first; ++i) {
+		if (q->data[slot].m == NULL)
+			return slot;
+		if (++slot == limit)
+			slot = first;
+	}
+	return -1;
+}
+
 struct qwz_vif {
 	uint32_t vdev_id;
 #ifdef __APPLE__

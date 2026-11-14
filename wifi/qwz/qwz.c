@@ -26296,16 +26296,18 @@ qwz_mac_mgmt_tx_wmi(struct qwz_softc *sc, struct qwz_vif *arvif,
 	int buf_id;
 	int ret;
 
-	buf_id = txmgmt->cur;
-
-	DNPRINTF(QWZ_D_MAC, "%s: tx mgmt frame, buf id %d\n", __func__, buf_id);
-
 	if (txmgmt->queued >= nitems(txmgmt->data))
 		return ENOSPC;
 	if (txmgmt->queued >= qwz_txmgmt_nslots(sc, arvif))	/* the BSS ring is 8 slots (QWZ_BSS_TXMGMT_SLOTS), the capture vif's 64 */
 		return ENOSPC;
 	if (txmgmt->queued >= qwz_txmgmt_nslots(sc, arvif) - qwz_txmgmt_base(sc, arvif))	/* K5 (L1-C8): the coex cell's ring is ids 8 to 63 */
 		return ENOSPC;
+	buf_id = qwz_txmgmt_find_free(txmgmt, qwz_txmgmt_base(sc, arvif),
+	    qwz_txmgmt_nslots(sc, arvif));
+	if (buf_id < 0)
+		return ENOSPC;
+	txmgmt->cur = buf_id;
+	DNPRINTF(QWZ_D_MAC, "%s: tx mgmt frame, buf id %d\n", __func__, buf_id);
 
 	tx_data = &txmgmt->data[buf_id];
 #if 0

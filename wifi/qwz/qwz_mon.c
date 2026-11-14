@@ -489,6 +489,12 @@ qwz_mon_tx_copy(struct qwz_softc *sc, const uint8_t *dst)
 		return EAGAIN;
 	if (!sc->mon_active || !vif->is_up || mon_psf_len == 0 || !qwz_mon_have_maps(sc))
 		return ENXIO;
+	slot_lat = qwz_txmgmt_find_free(&vif->txmgmt,
+	    sc->mon_coex ? QWZ_MON_COEX_STA_SLOTS : 0,
+	    (int)nitems(vif->txmgmt.data));
+	if (slot_lat < 0)
+		return ENOSPC;
+	vif->txmgmt.cur = slot_lat;
 	m = m_gethdr(M_DONTWAIT, MT_DATA);
 	if (m == NULL)
 		return ENOBUFS;
@@ -729,6 +735,12 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 			return ENOSPC;
 		}
 	}
+	slot = qwz_txmgmt_find_free(&vif->txmgmt,
+	    sc->mon_coex ? QWZ_MON_COEX_STA_SLOTS : 0,
+	    (int)nitems(vif->txmgmt.data));
+	if (slot < 0)
+		return ENOSPC;
+	vif->txmgmt.cur = slot;
 	m = m_gethdr(M_DONTWAIT, MT_DATA);
 	if (m == NULL)
 		return ENOBUFS;
@@ -836,6 +848,10 @@ qwz_mon_tx_room(void)
 		return 0;
 	vif = &sc->sc_monvif;
 	if (!vif->is_up || !qwz_mon_have_maps(sc))
+		return 0;
+	if (qwz_txmgmt_find_free(&vif->txmgmt,
+	    sc->mon_coex ? QWZ_MON_COEX_STA_SLOTS : 0,
+	    (int)nitems(vif->txmgmt.data)) < 0)
 		return 0;
 	room = (int)nitems(vif->txmgmt.data) - 1 - (sc->mon_coex ? QWZ_MON_COEX_STA_SLOTS : 0) - vif->txmgmt.queued;
 	if (qwz_monqmax != 0) {
