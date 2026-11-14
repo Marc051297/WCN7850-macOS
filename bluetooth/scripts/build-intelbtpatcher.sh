@@ -10,9 +10,8 @@ ROOT=$PWD
 OUT=${1:-$ROOT/build}
 DEPS=$ROOT/deps
 mkdir -p "$DEPS" "$OUT"
-[ -d "$DEPS/IntelBluetoothFirmware/.git" ] || git clone -q --depth 1 https://github.com/OpenIntelWireless/IntelBluetoothFirmware "$DEPS/IntelBluetoothFirmware"
-[ -d "$DEPS/Lilu/.git" ] || git clone -q --depth 1 https://github.com/acidanthera/Lilu "$DEPS/Lilu"
-[ -d "$DEPS/MacKernelSDK/Headers" ] || git clone -q --depth 1 https://github.com/acidanthera/MacKernelSDK "$DEPS/MacKernelSDK"
+python3 -I "$ROOT/scripts/prepare-deps.py" IntelBluetoothFirmware Lilu MacKernelSDK
+python3 -I "$ROOT/scripts/apply-compat.py" IntelBluetoothFirmware
 cd "$DEPS/IntelBluetoothFirmware"
 mkdir -p Lilu.kext/Contents/Resources
 ln -sfn "$DEPS/Lilu/Lilu/Headers" Lilu.kext/Contents/Resources/Headers

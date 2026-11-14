@@ -1,6 +1,27 @@
+diff --git a/BrcmPatchRAM/BlueToolFixup.cpp b/BrcmPatchRAM/BlueToolFixup.cpp
+index e592e66..8fd3d15 100644
 --- a/BrcmPatchRAM/BlueToolFixup.cpp
 +++ b/BrcmPatchRAM/BlueToolFixup.cpp
-@@ -161,9 +161,56 @@
+@@ -14,8 +14,18 @@
+ #include <Headers/kern_devinfo.hpp>
+ 
+ 
++#include "QcaContinuityPatches.hpp"
++#include "QcaBluetoothHci.hpp"
++#include <libkern/OSAtomic.h>
++// Declare only this export: libkern/version.h conflicts with Lilu's version_major linkage.
++extern "C" const char version[];
++
+ #define MODULE_SHORT "btlfx"
+ 
++static bool shouldPatchQcaContinuity = false;
++static const char *qcaOsBuild = nullptr;
++static volatile UInt32 qcaPatchMask = 0;
++
+ 
+ class EXPORT BlueToolFixup : public IOService {
+     OSDeclareDefaultStructors(BlueToolFixup)
+@@ -161,15 +171,62 @@ static const uint8_t kBadChipsetCheckPatched15_4[] =
      0x90, 0x90
  };
  
@@ -55,12 +76,36 @@
  static bool shouldPatchNvramCheck = false;
 +static bool shouldPatchLEEventMask = false;
  
- static constexpr size_t kBoardIdSize = sizeof("Mac-9F18E312C5C2BF0B");
+-static constexpr size_t kBoardIdSize = sizeof("Mac-F60DEB81FF30ACF6");
++static constexpr size_t kBoardIdSize = sizeof("Mac-9F18E312C5C2BF0B");
  static constexpr size_t kBoardIdSizeLegacy = sizeof("Mac-F22586C8");
-@@ -236,6 +283,11 @@
+ 
+ static const char boardIdsWithUSBBluetooth[][kBoardIdSize] = {
+-    "Mac-F60DEB81FF30ACF6",
++    "Mac-9F18E312C5C2BF0B",  /* was MacPro6,1; gone in macOS 26, see QcaBluetooth docs */
+     "Mac-9F18E312C5C2BF0B",
+     "Mac-937CB26E2E02BB01",
+     "Mac-E43C1C25D4880AD6",
+@@ -236,6 +293,27 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                  searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
              if (shouldPatchAddress)
                  searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
++            if (shouldPatchQcaContinuity && !QcaBluetooth::allowed(QcaBluetooth::buildGate(version, qcaOsBuild))) {
++                shouldPatchQcaContinuity = false;
++                IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityBuildAllowed", false);
++                IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityPageGate", "unsupported-os-build");
++            }
++            auto *qcaHook = OSDynamicCast(OSNumber, IORegistryEntry::getRegistryRoot()->getProperty("QcaContinuityHciHookRouted"));
++            if (shouldPatchQcaContinuity && qcaHook && qcaHook->unsigned32BitValue() == 1) {
++                // Reuse this plugin's existing validation hook; no second cs_validate_page route.
++                for (size_t i = 0; i < arrsize(BTLEAdv::kPatches); ++i) {
++                    const auto &p = BTLEAdv::kPatches[i];
++                    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, p.find, p.size, p.replace, p.size)) {
++                        OSBitOrAtomic(UInt32(1) << i, &qcaPatchMask);
++                        IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityPatchMask", UInt32(qcaPatchMask), 32);
++                    }
++                }
++            }
 +            if (shouldPatchLEEventMask) {
 +                searchAndPatch(data, PAGE_SIZE, path, kDongleLEEventMaskCode26Original, kDongleLEEventMaskCode26Patched);
 +                searchAndPatch(data, PAGE_SIZE, path, kDongleLEEventMaskTable26Original, kDongleLEEventMaskTable26Patched);
@@ -69,11 +114,21 @@
          }
      }
  }
-@@ -267,6 +319,7 @@
+@@ -267,6 +345,17 @@ static void pluginStart() {
              shouldPatchAddress = checkKernelArgument("-btlfxallowanyaddr");
          if (getKernelVersion() <= KernelVersion::Sonoma)
              shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
-+        shouldPatchLEEventMask = checkKernelArgument("-btlfxlemask");
++        const bool requested = checkKernelArgument("-qcaadv") && !checkKernelArgument("-qcaadvoff");
++        if (requested) {
++            qcaOsBuild = reinterpret_cast<const char *>(patcher.solveSymbol(KernelPatcher::KernelID, "_osversion"));
++            patcher.clearError();
++            const auto gate = QcaBluetooth::buildGate(version, qcaOsBuild);
++            shouldPatchQcaContinuity = getKernelVersion() == KernelVersion::Tahoe && QcaBluetooth::allowed(gate);
++            IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityPageGate", QcaBluetooth::gateReason(gate));
++            IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityPageBuildAtInit", !qcaOsBuild ? "<unresolved>" : *qcaOsBuild ? qcaOsBuild : "<empty>");
++            IORegistryEntry::getRegistryRoot()->setProperty("QcaContinuityBuildAllowed", shouldPatchQcaContinuity);
++        }
++        shouldPatchLEEventMask = checkKernelArgument("-btlfxlemask") || shouldPatchQcaContinuity;
          KernelPatcher::RouteRequest csRoute = KernelPatcher::RouteRequest("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
          if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
              SYSLOG(MODULE_SHORT, "failed to route cs validation pages");

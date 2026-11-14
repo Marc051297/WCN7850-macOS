@@ -7,7 +7,7 @@ ROOT=$PWD
 OUT=${1:-$ROOT/build}
 MKSDK=$ROOT/deps/MacKernelSDK
 VERSION=$(cat VERSION)
-[ -d "$MKSDK/Headers" ] || git clone -q --depth 1 https://github.com/acidanthera/MacKernelSDK "$MKSDK"
+python3 -I "$ROOT/scripts/prepare-deps.py" MacKernelSDK
 [ -f kext/FwData.cpp ] || { echo "STOP: run scripts/fetch-firmware.sh first"; exit 1; }
 
 OBJ=$OUT/obj; KEXT=$OUT/BluetoothWCN7850.kext
@@ -23,9 +23,8 @@ COMMON=(-arch x86_64 -mmacosx-version-min=12.0 -fapple-kext -mkernel -nostdinc
 
 for s in kext/QcaBluetooth.cpp kext/FwData.cpp; do
   o=$OBJ/$(basename "$s").o
-  if [ ! -f "$o" ] || [ "$s" -nt "$o" ] || [ kext/QcaBluetooth.hpp -nt "$o" ] || [ kext/FwData.h -nt "$o" ]; then
-    xcrun clang++ "${COMMON[@]}" -c "$s" -o "$o"
-  fi
+  # Recompile so VERSION, compiler flags and dependency changes cannot leave stale objects.
+  xcrun clang++ "${COMMON[@]}" -c "$s" -o "$o"
 done
 # kmod_info (what Xcode generates for kext targets) must keep C symbol names.
 xcrun clang -arch x86_64 -mmacosx-version-min=12.0 -mkernel -nostdinc -isystem "$MKSDK/Headers" \

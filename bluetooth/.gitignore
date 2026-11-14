@@ -2,7 +2,9 @@ firmware/dl/
 kext/FwData.cpp
 build/
 build-debug/
+build-exp6/
 deps/
 tools/qcabt
 tools/usbdesc
 .DS_Store
+__pycache__/
