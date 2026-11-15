@@ -53,6 +53,7 @@
 
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
+#include "qwz_log.h"	/* JL (join lifecycle): key-handshake evidence, metadata only (never keys, nonces, counters or payload) */
 
 void	ieee80211_recv_4way_msg1(struct ieee80211com *,
                                  struct ieee80211_eapol_key *, struct ieee80211_node *);
@@ -94,8 +95,16 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
     struct _ifnet *ifp = &ic->ic_if;
     struct ether_header *eh;
     struct ieee80211_eapol_key *key;
-    u_int16_t info, desc;
+    u_int16_t info = 0, desc = 0;
     int totlen, bodylen, paylen;
+    /*
+     * JL (join lifecycle): evidence only, metadata only. Every frame this function used to discard silently now leaves
+     * one ring line with the reason, and every frame it hands on leaves one line with what changed.
+     * Nothing secret is printed: no key, nonce, replay counter, MIC or key data.
+     */
+    const char *drop = NULL, *kind = NULL;
+    u_int32_t replay0 = 0, badmic0 = 0;
+    int port0 = 0;
     
     ifp->if_ibytes += mbuf_pkthdr_len(m);
     
@@ -106,59 +115,85 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
     }
     mbuf_adj(m, sizeof(*eh));
     
-    if (mbuf_pkthdr_len(m) < sizeof(*key))
+    if (mbuf_pkthdr_len(m) < sizeof(*key)) {
+        drop = "shorter than a key frame";
         goto done;
+    }
     if (mbuf_len(m) < sizeof(*key) &&
         (mbuf_pullup(&m, sizeof(*key)))) {
         ic->ic_stats.is_rx_nombuf++;
+        drop = "no mbuf";
         goto done;
     }
     key = mtod(m, struct ieee80211_eapol_key *);
     
-    if (key->type != EAPOL_KEY)
+    if (key->type != EAPOL_KEY) {
+        drop = "not an EAPOL-Key frame";
         goto done;
+    }
     ic->ic_stats.is_rx_eapol_key++;
     
     if ((ni->ni_rsnprotos == IEEE80211_PROTO_RSN &&
          key->desc != EAPOL_KEY_DESC_IEEE80211) ||
         (ni->ni_rsnprotos == IEEE80211_PROTO_WPA &&
-         key->desc != EAPOL_KEY_DESC_WPA))
+         key->desc != EAPOL_KEY_DESC_WPA)) {
+        drop = "descriptor type does not match the negotiated protocol";
         goto done;
+    }
     
     /* check packet body length */
     bodylen = BE_READ_2(key->len);
     totlen = 4 + bodylen;
-    if (mbuf_pkthdr_len(m) < totlen || totlen > MCLBYTES)
+    if (mbuf_pkthdr_len(m) < totlen || totlen > MCLBYTES) {
+        drop = "bad body length";
         goto done;
+    }
     
     /* check key data length */
     paylen = BE_READ_2(key->paylen);
-    if (paylen > totlen - sizeof(*key))
+    if (paylen > totlen - sizeof(*key)) {
+        drop = "bad key data length";
         goto done;
+    }
     
     info = BE_READ_2(key->info);
     
     /* discard EAPOL-Key frames with an unknown descriptor version */
     desc = info & EAPOL_KEY_VERSION_MASK;
-    if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3)
+    if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3) {
+        drop = "unknown descriptor version";
         goto done;
+    }
     
     if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
-        if (desc != EAPOL_KEY_DESC_V3)
+        if (desc != EAPOL_KEY_DESC_V3) {
+            drop = "descriptor version is not 3 for a SHA-256 AKM";
             goto done;
+        }
     } else if (ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||
                ni->ni_rsngroupcipher == IEEE80211_CIPHER_CCMP) {
-        if (desc != EAPOL_KEY_DESC_V2)
+        if (desc != EAPOL_KEY_DESC_V2) {
+            drop = "descriptor version is not 2 for CCMP";
             goto done;
+        }
     }
     
     /* make sure the key data field is contiguous */
     if (mbuf_len(m) < totlen && mbuf_pullup(&m, totlen)) {
         ic->ic_stats.is_rx_nombuf++;
+        drop = "no mbuf";
         goto done;
     }
     key = mtod(m, struct ieee80211_eapol_key *);
     
+    kind = (info & EAPOL_KEY_REQUEST) ? "request" :
+        (info & EAPOL_KEY_PAIRWISE) ?
+        ((info & EAPOL_KEY_KEYMIC) ? ((info & EAPOL_KEY_KEYACK) ? "4-way msg3" : "4-way msg2/4") :
+         ((info & EAPOL_KEY_KEYACK) ? "4-way msg1" : "pairwise without ack")) :
+        ((info & EAPOL_KEY_KEYACK) ? "group msg1" : "group msg2");
+    replay0 = ic->ic_stats.is_rx_eapol_replay;
+    badmic0 = ic->ic_stats.is_rx_eapol_badmic;
+    port0 = ni->ni_port_valid;
     /* determine message type (see 8.5.3.7) */
     if (info & EAPOL_KEY_REQUEST) {
 #ifndef IEEE80211_STA_ONLY
@@ -178,8 +213,10 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
             ieee80211_recv_4way_msg1(ic, key, ni);
     } else {
         /* Group Key Handshake */
-        if (!(info & EAPOL_KEY_KEYMIC))
+        if (!(info & EAPOL_KEY_KEYMIC)) {
+            drop = "group message without a MIC";
             goto done;
+        }
         if (info & EAPOL_KEY_KEYACK) {
             if (key->desc == EAPOL_KEY_DESC_WPA)
                 ieee80211_recv_wpa_group_msg1(ic, key, ni);
@@ -192,6 +229,20 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
 #endif
     }
 done:
+    {
+        static unsigned int keyLines;
+
+        if (drop != NULL) {
+            if (qwz_log_ratelimit(&keyLines, 96, 8))
+                qwz_log("airport: rsn: eapol-key rx dropped: %s (info 0x%04x, ic state %d)\n", drop, info, (int)ic->ic_state);
+        } else if (kind != NULL) {
+            if (qwz_log_ratelimit(&keyLines, 96, 8))
+                qwz_log("airport: rsn: eapol-key rx %s (info 0x%04x ver %u): replay-dropped %d bad-mic %d, port %d -> %d, supplicant state %d, ic state %d\n",
+                        kind, info, (unsigned int)desc, ic->ic_stats.is_rx_eapol_replay != replay0,
+                        ic->ic_stats.is_rx_eapol_badmic != badmic0, port0, (int)ni->ni_port_valid,
+                        (int)ni->ni_rsn_supp_state, (int)ic->ic_state);
+        }
+    }
     mbuf_freem(m);
 }
 
@@ -219,6 +270,13 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
      */
     if (ni->ni_rsn_supp_state == RSNA_SUPP_INITIALIZE) {
         DPRINTF(("unexpected in state: %d\n", ni->ni_rsn_supp_state));
+        {
+            static unsigned int earlyLines;	/* JL: an AP repeats message 1; the ring is small */
+
+            if (qwz_log_ratelimit(&earlyLines, 32, 16))
+                qwz_log("airport: rsn: 4-way msg1 ignored: the supplicant is still in its initial state (the stack has not reached RUN for this association), ic state %d\n",
+                        (int)ic->ic_state);
+        }
         return;
     }
     /* enforce monotonicity of key request replay counter */
@@ -698,6 +756,12 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
     }
 deauth:
     if (reason != 0) {
+        {
+            static unsigned int rejectLines;	/* JL */
+
+            if (qwz_log_ratelimit(&rejectLines, 32, 16))
+                qwz_log("airport: rsn: key message rejected here: sending a deauthentication with reason %d\n", (int)reason);
+        }
         IEEE80211_SEND_MGMT(ic, ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
                             reason);
         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);

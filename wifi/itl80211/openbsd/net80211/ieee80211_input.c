@@ -68,6 +68,7 @@
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
 #include "qwz_life.h"	/* K3 (S1): qwz_rssisigned */
+#include "qwz_log.h"	/* JL (join lifecycle): the deauthentication evidence line */
 
 mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
                                  struct ieee80211_node *, mbuf_t,
@@ -2962,6 +2963,21 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
 
     XYLog("Deauth received, reason %d\n", reason);
     ic->ic_deauth_reason = reason;
+    {
+        /*
+         * JL (join lifecycle): evidence only. A phone hotspot's deauthentication was read as reason 311, which is not a
+         * reason code: frame control, length and the first body bytes show how the frame is laid out.
+         * A deauthentication frame carries no credentials.
+         */
+        static unsigned int deauthLines;
+        const u_int8_t *b = (const u_int8_t *)wh;
+        const size_t blen = mbuf_len(m);
+
+        if (qwz_log_ratelimit(&deauthLines, 32, 16))
+            qwz_log("airport: rsn: deauth rx fc %02x %02x len %u body %02x %02x %02x %02x -> reason %u, ic state %d\n",
+                    b[0], b[1], (unsigned int)blen, blen > 24 ? b[24] : 0, blen > 25 ? b[25] : 0,
+                    blen > 26 ? b[26] : 0, blen > 27 ? b[27] : 0, (unsigned int)reason, (int)ic->ic_state);
+    }
     if (ic->ic_event_handler) {
         (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
     }
@@ -2975,9 +2991,26 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
                         (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
             int stay_auth = ((ic->ic_userflags & IEEE80211_F_STAYAUTH) &&
                              ic->ic_state >= IEEE80211_S_AUTH);
+#ifdef AIRPORT_WCL
+            /*
+             * JL (join lifecycle): macOS owns every join here. A deauthentication ends the association: the event
+             * handler above has reported it (and forgotten the network), and the stack goes to the
+             * scan state, where it idles until macOS asks for a scan or a join. It must not
+             * re-authenticate by itself as OpenBSD does: nobody completes that key handshake (a failed
+             * join has already wiped the key), the AP deauthenticates again a few seconds later, and
+             * RUN without a valid port refuses every scan (ieee80211_begin_cache_bgscan), so the
+             * interface stayed unusable until Wi-Fi was switched off and on. A deauthentication in
+             * SCAN or INIT changes nothing.
+             */
+            (void)roamscan;
+            (void)stay_auth;
+            if (ic->ic_state >= IEEE80211_S_AUTH)
+                ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+#else
             if (!(roamscan || stay_auth))
                 ieee80211_new_state(ic, IEEE80211_S_AUTH,
                                     IEEE80211_FC0_SUBTYPE_DEAUTH);
+#endif
         }
             break;
 #ifndef IEEE80211_STA_ONLY

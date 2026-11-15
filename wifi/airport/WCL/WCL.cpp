@@ -481,6 +481,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
             ic->ic_wcl_scan_requested = false;
             scanSource->cancelTimeout();
             scanLog("Busy", "bgscan declined in RUN", logState, logIdle, logPrev);
+            leaveUnauthorisedRun();	// JL (join lifecycle): never stay in a RUN that refuses every scan
             return kIOReturnBusy;
         }
     } else if (ic->ic_state != IEEE80211_S_SCAN) {
@@ -1026,6 +1027,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     wclBssValid = false;
     joinPending = true;
     assocNotified = firstBeaconNotified = portAuthorized = false;
+    wclUnauthSinceMs = 0;	// JL (join lifecycle): a new join starts a new history
     wclAssociatedBeacons = 0;
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
@@ -1125,6 +1127,65 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
     ic->ic_des_esslen = 0;
     bzero(ic->ic_des_essid, sizeof(ic->ic_des_essid));
     return kIOReturnSuccess;
+}
+
+/*
+ * JL (join lifecycle): forget the network without changing the 802.11 state (safe inside an event handler that the stack
+ * called in the middle of its own processing). After a join that failed or an association the AP ended,
+ * nothing may reconnect by itself: finishWCLJoin wipes the key, so a reconnect could never complete its key
+ * handshake. The desired SSID and BSSID, the RSN and WEP configuration, the key and the PMK cache all go;
+ * the next join brings them again. leaveWCLNetwork does the same after its state change.
+ */
+void AirportItlwmSkywalkInterface::forgetWCLNetwork(const char *why)
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    {
+        static unsigned int forgets;
+        if (qwz_log_ratelimit(&forgets, 200, 20))
+            qwz_log("airport: wcl: network forgotten after %s (ic_state %s, join pending %d): no reconnect without a new join\n",
+                    why, ieee80211_state_name[ic->ic_state], joinPending);
+    }
+    ic->ic_wcl_join_requested = false;
+    ieee80211_disable_rsn(ic);
+    ieee80211_disable_wep(ic);
+    explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+    clearWCLPMKSA();
+    ic->ic_wcl_enterprise = false;
+    ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_DESBSSID);
+    ic->ic_des_esslen = 0;
+    bzero(ic->ic_des_essid, sizeof(ic->ic_des_essid));
+}
+
+/*
+ * JL (join lifecycle): called when a scan request was refused because the stack is in RUN and declined a background scan.
+ * One cause of that refusal is permanent: RUN with RSN on, the port not valid (the key handshake never
+ * completed) and no join pending. macOS does not own that association and cannot scan to replace it.
+ * When such refusals have lasted 8 s (a re-key or a re-association settles in well under a second), leave
+ * the BSS as LEAVE_NETWORK does; the refused request stays refused and macOS repeats it within seconds,
+ * then in the scan state. A gap of more than 15 s between refusals starts the count again, so an old
+ * transient is never added to a new one. With the other join-lifecycle changes this state should not arise; this is
+ * the guard for a path nobody has seen yet.
+ */
+void AirportItlwmSkywalkInterface::leaveUnauthorisedRun()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    const bool unauthorised = ic->ic_state == IEEE80211_S_RUN && !joinPending && (ic->ic_flags & IEEE80211_F_RSNON) &&
+        ic->ic_bss != NULL && !ic->ic_bss->ni_port_valid;
+    const uint64_t now = wclScanNowMs();
+
+    if (!unauthorised) {
+        wclUnauthSinceMs = 0;
+        return;
+    }
+    if (wclUnauthSinceMs == 0 || now - wclUnauthLastMs > 15000)
+        wclUnauthSinceMs = now;
+    wclUnauthLastMs = now;
+    if (now - wclUnauthSinceMs < 8000)
+        return;
+    qwz_log("airport: wcl: RUN without a completed key handshake and no join pending for %llu ms: leaving the BSS so scans and joins work again\n",
+            (unsigned long long)(now - wclUnauthSinceMs));
+    wclUnauthSinceMs = 0;
+    leaveWCLNetwork();
 }
 
 IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
@@ -1372,8 +1433,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                 event.driverStatus = event.status ? kIOReturnError : kIOReturnSuccess;
                 assocNotified = !event.status;
                 instance->postMessage(this, AirportWCL::AssocComplete, &event, sizeof(event), true);
-                if (event.status)
+                if (event.status) {
                     finishWCLJoin(event.status, 0, kIOReturnError);
+                    forgetWCLNetwork("association refused");	// JL
+                }
             }
             break;
         case IEEE80211_EVT_STA_DEAUTH: {
@@ -1389,6 +1452,10 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             instance->postMessage(this, AirportWCL::Deauth, &event, sizeof(event), true);
             finishWCLJoin(1, event.reason, kIOReturnOffline);
+            // JL (join lifecycle): the AP ended the association, during a join or after it. macOS has been told and decides
+            // whether to join again; ieee80211_recv_deauth (which called us) then moves the stack to the idle
+            // scan state. No state change from inside this handler.
+            forgetWCLNetwork("deauthentication");
             break;
         }
         default: break;

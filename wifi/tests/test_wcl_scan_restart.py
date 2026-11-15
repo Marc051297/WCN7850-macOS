@@ -90,6 +90,7 @@ struct AirportItlwmSkywalkInterface {
     AirportItlwmSkywalkInterface(){hal.ic.ic_newstate=newstate;}
     IOReturn beginWCLScan(apple80211ScanRequest *);
     void finishWCLScan(IOReturn);void completeWCLScan();
+    void leaveUnauthorisedRun(){} // JL (join lifecycle): covered by test_join_failure_leave.py
     void event(int code){switch(code){
 ''' + event + r'''
     default:break;}}

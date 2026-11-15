@@ -55,6 +55,7 @@
 
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
+#include "qwz_log.h"	/* JL (join lifecycle): key-handshake evidence, metadata only */
 
 int		ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
                                  struct ieee80211_node *ni, const struct ieee80211_ptk *ptk);
@@ -140,6 +141,13 @@ ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
 #endif
     
     error = ifq_enqueue(&ifp->if_snd, m);
+    {
+        /* JL (join lifecycle): evidence only: that a key message was built and queued (info field and length, nothing secret) */
+        static unsigned int keyTxLines;
+
+        if (qwz_log_ratelimit(&keyTxLines, 96, 8))
+            qwz_log("airport: rsn: eapol-key tx queued (info 0x%04x len %d): %d\n", info, len, error);
+    }
     if (error) {
         XYLog("%s enqueue fail!!\n", __FUNCTION__);
         return (error);

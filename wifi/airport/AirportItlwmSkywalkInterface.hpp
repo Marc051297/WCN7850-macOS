@@ -449,6 +449,8 @@ private:
     IOReturn leaveWCLNetwork();
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
+    void forgetWCLNetwork(const char *);	// JL
+    void leaveUnauthorisedRun();		// JL
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t, const uint8_t *frame = nullptr, size_t frameLength = 0);	/* K3 (S2): frame = the 802.11 frame, for the beacon/probe-response subtype */
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
@@ -469,6 +471,7 @@ private:
     bool assocNotified;
     bool firstBeaconNotified;
     bool portAuthorized;
+    uint64_t wclUnauthSinceMs = 0, wclUnauthLastMs = 0;	// JL (join lifecycle): scan refusals in a RUN without a valid port (leaveUnauthorisedRun)
     uint8_t wclPermanentMAC[6] = {};
     bool wclStopping;
 #endif
