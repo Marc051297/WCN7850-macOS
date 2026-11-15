@@ -2062,6 +2062,8 @@ struct ath12k_peer {
 };
 TAILQ_HEAD(qwz_peer_list, ath12k_peer);
 
+#define QWZ_MON_RS_MAX	64	/* RS (f2u): native data frames that may wait for another try */
+
 struct qwz_softc {
 	struct device			sc_dev;
 	struct ieee80211com		sc_ic;
@@ -2152,6 +2154,7 @@ struct qwz_softc {
 	int			attached;
 	int			fw_initialized;
 	char			reg_country[3], reg_country_requested[3];
+	char			reg_chan_cc[3];	/* CC (f2u): the country whose rules the host channel table holds */
 	int			reg_country_pending, reg_country_request_error;
 	int			reg_country_rules_valid;
 	uint32_t		reg_country_status, reg_country_updates;
@@ -2435,6 +2438,25 @@ struct qwz_softc {
 	int				 mon_sender_peer;	/* raw firmware peer for mon_sender_addr */
 	uint8_t				 mon_sender_addr[IEEE80211_ADDR_LEN];
 	uint8_t				 mon_tx_kind[64];	/* per transmit slot: 0 replay, 1 user mgmt, 2 user data, 3 user ctrl */
+	/*
+	 * RS (f2u), debug.qwz.nativeresend: a native data frame the receiver did not acknowledge is kept (qwz_mon_tx_compl) and waits here, ordered by its first
+	 * submission, for another try from the native pump. The per-slot arrays carry a frame's history across its submissions; the three ctx fields are set
+	 * around one qwz_mon_tx_bytes call by qwz_mon_native_resend_send. mon_tx_tries 0: not a native data frame, never kept.
+	 */
+	struct qwz_mon_resend {
+		struct mbuf	*m;
+		uint64_t	 first_ns, notbefore_ns;
+		uint32_t	 serial;
+		uint8_t		 tries;
+	}				 mon_rs[QWZ_MON_RS_MAX];
+	unsigned int			 mon_rs_count;
+	uint32_t			 mon_rs_serial, mon_rs_ctx_serial;
+	uint8_t				 mon_rs_ctx_tries;
+	uint64_t			 mon_rs_ctx_first_ns;
+	uint8_t				 mon_tx_tries[64];
+	uint32_t			 mon_tx_serial[64];
+	uint64_t			 mon_tx_first_ns[64];
+	int				 mon_rate_applied;	/* RT (f2u): the debug.qwz.monrate value the cell vdev was last given, -1 none since the cell started */
 	int				 mon_txp_valid, mon_txp_err;	/* K4 (M1), debug.qwz.monfmt: the next capture-vdev management send carries a tx_params TLV (set and cleared around one call by qwz_mon_tx_bytes); the error the firmware send returned for it */
 	uint32_t			 mon_txp_d0, mon_txp_d1;	/* K4 (M1): the two tx_params dwords of that send */
 	struct {
@@ -2447,6 +2469,7 @@ struct qwz_softc {
 		uint32_t ufr_mgmt_ok, ufr_mgmt_bad, ufr_data_ok, ufr_data_bad, ufr_ctrl_ok, ufr_ctrl_bad;
 		uint64_t ufr_data_acked_bytes;
 		uint32_t ufr_data_noack;
+		uint32_t ufr_data_resent, ufr_data_gaveup, ufr_data_rsfull;	/* RS (f2u): native data frames submitted again; dropped after the last allowed try or past the window; dropped because QWZ_MON_RS_MAX frames already waited */
 		uint32_t ufr_inflight;	/* K2b (W1b): user DATA and CONTROL frames (kind 2, 3) in flight in the capture TX ring, the number monqmax is compared with; management frames are never counted */
 		uint32_t ufr_nocred, ufr_qmax;	/* K1 (W1): refused early with ENOSPC by monnocred (no credit) and by monqmax; both are also counted in ufr_full */
 		uint32_t ufr_reaped, ufr_livefull;	/* K2c (C2): slots freed by the stale-slot reaper (debug.qwz.monreap); sends refused because the next slot was still occupied */

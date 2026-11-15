@@ -12073,6 +12073,7 @@ qwz_init_channels_world(struct qwz_softc *sc)
 		supported_bands = WMI_HOST_WLAN_2G_CAP | WMI_HOST_WLAN_5G_CAP;
 
 	memset(ic->ic_channels, 0, sizeof(ic->ic_channels));
+	memcpy(sc->reg_chan_cc, "00", 3);	/* CC (f2u) */
 
 	if (supported_bands & WMI_HOST_WLAN_2G_CAP) {
 		for (i = 0; i < nitems(channels_2ghz); i++) {
@@ -12104,8 +12105,9 @@ qwz_init_channels_world(struct qwz_softc *sc)
 	ieee80211_channel_init(&ic->ic_if);
 }
 
+/* `seen` (CC, f2u): one bit per channel number, set for every channel a rule of this event names, open or closed. */
 void
-qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info)
+qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info, uint8_t *seen)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_channel *chan;
@@ -12131,8 +12133,14 @@ qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info)
 			    "channel %u\n", __func__, freq, chnum);
 			continue;
 		}
-		while (freq <= rule->end_freq && chnum <= 14) {
+		/*
+		 * CC (f2u): a rule names the channels whose 20 MHz lie inside it, as Linux's regulatory code decides (cfg80211_does_bw_fit_range). The centre
+		 * frequency alone let a 2402-2472 rule, the United States' and others', open channels 12 and 13.
+		 */
+		while (freq + 10 <= rule->end_freq && chnum <= 14) {
 			chan = &ic->ic_channels[chnum];
+			if (seen != NULL)
+				seen[chnum / 8] |= (uint8_t)(1U << (chnum % 8));
 			if (rule->flags & REGULATORY_CHAN_DISABLED) {
 				chan->ic_freq = 0;
 				chan->ic_flags = 0;
@@ -12146,6 +12154,9 @@ qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info)
 				if ((rule->flags & REGULATORY_CHAN_NO_HT40) == 0)
 					chan->ic_flags |=
 					    IEEE80211_CHAN_40MHZ;
+				if (rule->flags & REGULATORY_CHAN_NO_IR)	/* CC (f2u): listen-only by rule, as the 5 GHz branch below */
+					chan->ic_flags |=
+					    IEEE80211_CHAN_PASSIVE;
 			}
 			chnum++;
 			freq = ieee80211_ieee2mhz(chnum, IEEE80211_CHAN_2GHZ);
@@ -12170,9 +12181,11 @@ qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info)
 			    "channel %u\n", __func__, freq, chnum);
 			continue;
 		}
-		while (freq <= rule->end_freq && freq <= 5885 &&
+		while (freq + 10 <= rule->end_freq && freq <= 5885 &&	/* CC (f2u): the channel's 20 MHz inside the rule, as above */
 		    chnum <= IEEE80211_CHAN_MAX) {
 			chan = &ic->ic_channels[chnum];
+			if (seen != NULL)
+				seen[chnum / 8] |= (uint8_t)(1U << (chnum % 8));
 			if (rule->flags & (REGULATORY_CHAN_DISABLED |
 			    REGULATORY_CHAN_NO_OFDM)) {
 				chan->ic_freq = 0;
@@ -12199,6 +12212,24 @@ qwz_init_channels(struct qwz_softc *sc, struct cur_regulatory_info *reg_info)
 			freq = ieee80211_ieee2mhz(chnum, IEEE80211_CHAN_5GHZ);
 		}
 	}
+}
+
+/* CC (f2u): closes every channel whose bit is clear in `seen`. Returns how many were open. */
+static int
+qwz_close_unnamed_channels(struct qwz_softc *sc, const uint8_t *seen)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int i, closed = 0;
+
+	for (i = 0; i <= IEEE80211_CHAN_MAX; i++) {
+		if (seen[i / 8] & (1U << (i % 8)))
+			continue;
+		if (ic->ic_channels[i].ic_flags != 0 || ic->ic_channels[i].ic_freq != 0)
+			closed++;
+		ic->ic_channels[i].ic_freq = 0;
+		ic->ic_channels[i].ic_flags = 0;
+	}
+	return closed;
 }
 
 static void
@@ -12279,7 +12310,25 @@ qwz_reg_chan_list_event(struct qwz_softc *sc, struct mbuf *m,
 		goto mem_free;
 	}
 
-	qwz_init_channels(sc, reg_info);
+	{
+		/*
+		 * CC (f2u): the table may hold another country's rules: the firmware starts in its world domain and the itlwm_cc request follows, at every
+		 * firmware start. A channel the new rules do not name is closed, it never stays open from the previous table.
+		 */
+		uint8_t seen[(IEEE80211_CHAN_MAX + 8) / 8];
+		const int other = sc->reg_chan_cc[0] != 0 && memcmp(sc->reg_chan_cc, reg_info->alpha2, 2) != 0;
+		int closed = 0;
+
+		memset(seen, 0, sizeof(seen));
+		qwz_init_channels(sc, reg_info, seen);
+		if (other) {
+			closed = qwz_close_unnamed_channels(sc, seen);
+			qwz_log("qwz: regulatory: the channel table follows %.2s now (it held %.2s); %d channels the new rules do not name were closed\n",
+			    (const char *)reg_info->alpha2, sc->reg_chan_cc, closed);
+		}
+		memcpy(sc->reg_chan_cc, reg_info->alpha2, 2);
+		sc->reg_chan_cc[2] = 0;
+	}
 	sc->reg_country_rules_valid = 1;
 	qwz_reg_country_event(sc, reg_info);
 	/* M0 (C29): what the firmware's regulatory event carried (6 GHz rule counts show whether it reports 6 GHz at all) */
@@ -18657,11 +18706,57 @@ qwz_wmi_set_init_country(struct qwz_softc *sc, const char country[3])
 	return ret;
 }
 
+/* CC (f2u): ath12k's WMI_SET_CURRENT_COUNTRY_CMDID (ath12k_wmi_send_set_current_country_cmd), the command Linux sends on
+ * WCN7850 (hw_params current_cc_support); this firmware answers the init form above with REG_SET_CC_CHANGE_NOT_ALLOWED.
+ * Like the init form it only asks: channel permissions change only with the firmware's reply. */
+static int
+qwz_wmi_set_current_country(struct qwz_softc *sc, const char country[3])
+{
+	const uint32_t pdev_id = sc->pdevs[0].pdev_id;
+	struct qwz_pdev_wmi *wmi = &sc->wmi.wmi[pdev_id];
+	struct wmi_set_current_country_cmd *cmd;
+	struct mbuf *m = qwz_wmi_alloc_mbuf(sizeof(*cmd));
+	int ret;
+	if (m == NULL)
+		return ENOMEM;
+	cmd = (struct wmi_set_current_country_cmd *)(mtod(m, uint8_t *) +
+	    sizeof(struct ath12k_htc_hdr) + sizeof(struct wmi_cmd_hdr));
+	memset(cmd, 0, sizeof(*cmd));
+	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_SET_CURRENT_COUNTRY_CMD) |
+	    FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
+	cmd->pdev_id = pdev_id;
+	memcpy(&cmd->new_alpha2, country, 2);
+	ret = qwz_wmi_cmd_send(wmi, m, WMI_SET_CURRENT_COUNTRY_CMDID);
+	if (ret)
+		m_freem(m);
+	return ret;
+}
+
+/* One country request and its bounded wait for the firmware's reply. 0: the firmware now reports `value`. */
+static int
+qwz_country_ask(struct qwz_softc *sc, const char value[3], int current_form)
+{
+	int ret;
+
+	sc->reg_country_pending = 1;
+	sc->reg_country_request_error = 0;
+	ret = current_form ? qwz_wmi_set_current_country(sc, value) : qwz_wmi_set_init_country(sc, value);
+	if (ret == 0 && sc->reg_country_pending)
+		ret = tsleep_nsec(&sc->reg_country_pending, 0, "qwzcountry", SEC_TO_NSEC(1));
+	if (ret == 0 && (sc->reg_country_pending || memcmp(sc->reg_country, value, 2) != 0))
+		ret = EIO;
+	if (ret && sc->reg_country_request_error == 0)
+		sc->reg_country_request_error = ret;
+	sc->reg_country_pending = 0;
+	return ret;
+}
+
 static void
 qwz_apply_boot_country(struct qwz_softc *sc)
 {
 #ifdef __APPLE__
 	char value[8] = {};
+	const char *form = "init form";
 	int ret;
 	if (!PE_parse_boot_argn("itlwm_cc", value, sizeof(value)))
 		return;
@@ -18678,21 +18773,24 @@ qwz_apply_boot_country(struct qwz_softc *sc)
 		    sc->sc_ic.ic_channels[149].ic_flags, sc->sc_ic.ic_channels[149].ic_freq);
 		return;
 	}
-	sc->reg_country_pending = 1;
-	sc->reg_country_request_error = 0;
-	ret = qwz_wmi_set_init_country(sc, value);
-	if (ret == 0 && sc->reg_country_pending)
-		ret = tsleep_nsec(&sc->reg_country_pending, 0, "qwzcountry", SEC_TO_NSEC(1));
-	if (ret == 0 && (sc->reg_country_pending || memcmp(sc->reg_country, value, 2) != 0))
-		ret = EIO;
-	if (ret && sc->reg_country_request_error == 0)
-		sc->reg_country_request_error = ret;
-	sc->reg_country_pending = 0;
+	/* CC (f2u), debug.qwz.regcc: the current-country command first, the init form when that is not taken (or alone with regcc 0, as up to f2t). */
+	ret = EOPNOTSUPP;
+	if (qwz_regcc != 0) {
+		form = "current-country command";
+		ret = qwz_country_ask(sc, value, 1);
+		if (ret) {
+			qwz_log("qwz: regulatory: the current-country request for %.2s was not taken (firmware %.2s status %u error %d); the init form follows\n",
+			    value, sc->reg_country, sc->reg_country_status, sc->reg_country_request_error);
+			form = "init form after the current-country command";
+		}
+	}
+	if (ret)
+		ret = qwz_country_ask(sc, value, 0);
 	qwz_compat_publish_country(sc->reg_country_requested, sc->reg_country, 0,
 	    sc->reg_country_request_error, sc->reg_country_status,
 	    sc->sc_ic.ic_channels[149].ic_flags, sc->sc_ic.ic_channels[149].ic_freq);
-	qwz_log("qwz: regulatory: requested %.2s firmware %.2s status %u error %d; ch149 freq %u flags 0x%x\n",
-	    value, sc->reg_country, sc->reg_country_status, sc->reg_country_request_error,
+	qwz_log("qwz: regulatory: requested %.2s firmware %.2s status %u error %d (%s); ch149 freq %u flags 0x%x\n",
+	    value, sc->reg_country, sc->reg_country_status, sc->reg_country_request_error, form,
 	    sc->sc_ic.ic_channels[149].ic_freq, sc->sc_ic.ic_channels[149].ic_flags);
 #endif
 }

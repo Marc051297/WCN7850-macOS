@@ -50,8 +50,9 @@ code += r'''
 struct mbuf {std::vector<uint8_t> bytes;};
 #define mtod(m,type) reinterpret_cast<type>((m)->bytes.data())
 #define M_PKTLEN(m) ((m)->bytes.size())
-struct qwz_softc {struct {const char *dv_xname="mock";} sc_dev; int reg_country_rules_valid=0;};
-static unsigned worlds,inits,replies,lastStatus;
+constexpr int IEEE80211_CHAN_MAX=255;
+struct qwz_softc {struct {const char *dv_xname="mock";} sc_dev; int reg_country_rules_valid=0; char reg_chan_cc[3]{};};
+static unsigned worlds,inits,replies,lastStatus,closes;
 static char lastCountry[3];
 static const void **qwz_wmi_tlv_parse_alloc(qwz_softc *,const void *data,size_t length) {
     auto *tb=static_cast<const void **>(calloc(WMI_TAG_MAX,sizeof(void *)));
@@ -81,7 +82,8 @@ static cur_reg_rule *qwz_create_ext_reg_rules_from_wmi(unsigned n,wmi_regulatory
 }
 static uint8_t qwz_wmi_ignore_num_extra_rules(wmi_regulatory_ext_rule *,unsigned) {return 0;}
 static void qwz_init_channels_world(qwz_softc *) {++worlds;}
-static void qwz_init_channels(qwz_softc *,cur_regulatory_info *) {++inits;}
+static void qwz_init_channels(qwz_softc *,cur_regulatory_info *,uint8_t *seen) {++inits;assert(seen && !seen[0] && !seen[31]);}
+static int qwz_close_unnamed_channels(qwz_softc *,const uint8_t *seen) {++closes;assert(seen);return 2;}   // CC (f2u)
 static void qwz_reg_country_event(qwz_softc *,const cur_regulatory_info *info) {
     ++replies;lastStatus=info->status_code;memcpy(lastCountry,info->alpha2,2);
 }
@@ -98,8 +100,9 @@ for name, signature in (
 code += r'''
 #undef free
 #undef malloc
-template<class Header,class Rule> static mbuf packet(unsigned tag,unsigned status,unsigned count,bool rules=true) {
-    mbuf m;Header h{};h.alpha2='U'|('S'<<8);h.status_code=status;
+template<class Header,class Rule> static mbuf packet(unsigned tag,unsigned status,unsigned count,bool rules=true,
+                                                     uint32_t country='U'|('S'<<8)) {
+    mbuf m;Header h{};h.alpha2=country;h.status_code=status;
     h.num_2ghz_reg_rules=count;
     uint32_t tlv=(tag<<16)|sizeof(h);
     m.bytes.resize(4+sizeof(h));memcpy(m.bytes.data(),&tlv,4);memcpy(m.bytes.data()+4,&h,sizeof(h));
@@ -117,7 +120,16 @@ template<class Header,class Rule> static mbuf packet(unsigned tag,unsigned statu
 template<class Header,class Rule> static void run(unsigned tag,wmi_reg_chan_list_cmd_type id) {
     qwz_softc sc;
     auto valid=packet<Header,Rule>(tag,0,1);
+    closes=0;
     assert(qwz_reg_chan_list_event(&sc,&valid,id)==0 && sc.reg_country_rules_valid);
+    // CC (f2u): the first table has nothing to close; the table remembers whose rules it holds.
+    assert(!closes && !strcmp(sc.reg_chan_cc,"US"));
+    // The same country again closes nothing; another country's rules close what they do not name, once per change.
+    assert(qwz_reg_chan_list_event(&sc,&valid,id)==0 && !closes);
+    auto world=packet<Header,Rule>(tag,0,1,true,'0'|('0'<<8));
+    assert(qwz_reg_chan_list_event(&sc,&world,id)==0 && closes==1 && !strcmp(sc.reg_chan_cc,"00"));
+    assert(qwz_reg_chan_list_event(&sc,&world,id)==0 && closes==1);
+    assert(qwz_reg_chan_list_event(&sc,&valid,id)==0 && closes==2 && !strcmp(sc.reg_chan_cc,"US"));
     unsigned before=inits,worldBefore=worlds,replyBefore=replies;
     // Firmware rejection and status-only success must not erase valid rules.
     auto rejected=packet<Header,Rule>(tag,1,0,false);
@@ -126,6 +138,7 @@ template<class Header,class Rule> static void run(unsigned tag,wmi_reg_chan_list
     auto empty=packet<Header,Rule>(tag,0,0,false);
     assert(qwz_reg_chan_list_event(&sc,&empty,id)==0 && lastStatus==0);
     assert(inits==before && worlds==worldBefore && replies==replyBefore+2);
+    assert(closes==2 && !strcmp(sc.reg_chan_cc,"US"));   // a refusal or a status-only reply never touches the table
     // Truncated arrays and lying counts fail safely, retaining the old table.
     auto shortArray=packet<Header,Rule>(tag,0,2);
     shortArray.bytes.resize(shortArray.bytes.size()-sizeof(Rule));
@@ -141,7 +154,7 @@ template<class Header,class Rule> static void run(unsigned tag,wmi_reg_chan_list
 int main() {
     run<wmi_reg_chan_list_cc_event,wmi_regulatory_rule_struct>(1,WMI_REG_CHAN_LIST_CC_ID);
     run<wmi_reg_chan_list_cc_ext_event,wmi_regulatory_ext_rule>(2,WMI_REG_CHAN_LIST_CC_EXT_ID);
-    puts("ok: both wire parsers retain country/rejection metadata, bound rule arrays, preserve valid permissions");
+    puts("ok: both wire parsers retain country/rejection metadata, bound rule arrays, preserve valid permissions; a change of country closes what the new rules do not name");
 }
 '''
 with tempfile.TemporaryDirectory(prefix="qwz-reg-reply-") as directory:

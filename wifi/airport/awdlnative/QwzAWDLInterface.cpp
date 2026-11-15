@@ -8,6 +8,7 @@
 #include "AirportItlwmV2.hpp"
 #if defined(ITL_AWDL_NATIVE)
 #include "QwzAWDLInterface.hpp"
+#include "qwz_mon.h"
 #include <Airport/IO80211ManagementBuffer.h>
 #include <AWDLObservation.hpp>
 #include <AWDLManagementFrame.hpp>
@@ -484,11 +485,19 @@ bool QwzAWDLInterface::popTransmit(uint8_t *output, size_t available, size_t *wr
     ++transmitDepthBins[ItlAWDL::depthBin(transmitQueued)];
     while (transmitQueued) {
         unsigned selected = 0;
+        if (!timing) {
+            // RS (f2u): without per-receiver timing the queue is strictly first in, first out, so a head whose
+            // receiver still has an unacknowledged frame waiting for another try waits behind it.
+            const auto &head = transmitFrames[transmitHead];
+            if (head.length >= 14 && qwz_mon_native_resend_blocks(head.bytes)) return false;
+        }
         if (timing) {
             bool found = false;
             for (unsigned offset = 0; offset < transmitQueued; ++offset) {
                 const auto &candidate = transmitFrames[(transmitHead + offset) % transmitFrameCount];
                 if (candidate.length < 14) { selected = offset; found = true; break; }
+                // RS (f2u): a receiver with an unacknowledged frame waiting for another try gets no newer frame first.
+                if (qwz_mon_native_resend_blocks(candidate.bytes)) continue;
                 bool earlier = false;
                 // Only the oldest frame for a destination may pass. A second
                 // call to a deadline-bearing hold predicate must not let a

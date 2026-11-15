@@ -108,6 +108,11 @@ void MockQueue::dequeue() {
         if(!n) break;
     }
 }
+// RS (f2u): the cell says which receiver still has an unacknowledged frame waiting for another try.
+static uint8_t resendBlocked[6]; static bool resendBlocking=false; static unsigned resendAsked=0;
+static int qwz_mon_native_resend_blocks(const uint8_t *dest) {
+    ++resendAsked; return resendBlocking && !memcmp(dest,resendBlocked,6);
+}
 static bool pop(QwzAWDLInterface &i,unsigned expected) {
     uint8_t out[1600]{}; size_t length=0;
     if(!i.popTransmit(out,sizeof(out),&length)) return false;
@@ -203,7 +208,37 @@ int main() {
         assert(k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000) && output[47]==1);
         assert(k.transmitSequence==4 && !k.transmitQueued && !k.transmitDropped);
     }
-    puts("ok: full FIFO keeps ownership in Skywalk, resumes without loss/reordering/double completion");
+    // RS (f2u): while a receiver has an unacknowledged frame waiting for another try, none of its newer frames
+    // leaves the queue, in either queue mode, and other receivers' frames still pass it when timing is on.
+    for(unsigned head=0;head<4;++head) {
+        QwzAWDLInterface k;MockQueue queue;queue.owner=&k;k.packetQueues[0]=k.packetQueues[1]=&queue;
+        k.transmitHead=head;
+        IOSkywalkPacket batch[4];
+        for(unsigned n=0;n<4;++n) {
+            auto *eth=batch[n].bytes+batch[n].offset;
+            eth[0]=n<2 ? 4 : 6;memcpy(eth+6,k.localFrameAddress,6);
+            eth[12]=0x86;eth[13]=0xdd;eth[14]=0x60;eth[21]=uint8_t(n);
+            queue.waiting.push_back(&batch[n]);
+        }
+        queue.dequeue();
+        ItlAWDL::NativePeerTiming timing{};   // no schedule known: nobody is held by timing
+        uint8_t output[1600];size_t length=0;
+        memset(resendBlocked,0,6);resendBlocked[0]=4;resendBlocking=true;
+        // First in, first out: the head is the blocked receiver's, so nothing moves and nothing is lost.
+        assert(!k.popTransmit(output,sizeof(output),&length) && k.transmitQueued==4 && !k.transmitSequence);
+        // With timing the other receiver's frames pass, in their order; the blocked receiver's two stay.
+        assert(k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000) && output[47]==2);
+        assert(k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000) && output[47]==3);
+        assert(!k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000));
+        assert(k.transmitQueued==2 && k.transmitSequence==2 && !k.transmitDropped);
+        // The waiting frame went out again: its receiver's frames follow, oldest first.
+        resendBlocking=false;
+        assert(k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000) && output[47]==0);
+        assert(k.popTransmit(output,sizeof(output),&length) && output[47]==1);
+        assert(!k.transmitQueued && k.transmitSequence==4 && !k.transmitDropped);
+    }
+    assert(resendAsked>0);
+    puts("ok: full FIFO keeps ownership in Skywalk, resumes without loss/reordering/double completion; a receiver with a frame waiting for another try gets no newer frame");
 }
 '''
 with tempfile.TemporaryDirectory(prefix="qwz-backpressure-") as directory:

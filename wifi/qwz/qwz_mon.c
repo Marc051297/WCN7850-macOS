@@ -404,6 +404,8 @@ qwz_mon_reap_slot(struct qwz_softc *sc, int slot, uint64_t now)
 	if ((kind == 2 || kind == 3) && sc->mon_stats.ufr_inflight > 0)
 		sc->mon_stats.ufr_inflight--;
 	sc->mon_tx_kind[slot] = 0;
+	if (slot >= 0 && slot < (int)nitems(sc->mon_tx_tries))
+		sc->mon_tx_tries[slot] = 0;	/* RS (f2u): a frame whose completion never came is not sent again */
 	sc->mon_lat.tx_ns[slot] = 0;
 	sc->mon_stats.ufr_reaped++;
 }
@@ -568,11 +570,110 @@ qwz_mon_rx_hook(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint16_t
 		qwz_mon_tx_copy(sc, mon_psf_src);	/* the peer is on our channel right now */
 }
 
+/*
+ * RS (f2u), debug.qwz.nativeresend. A native AirDrop data frame (qwz_mon_tx_raw) the receiver did not acknowledge is no longer dropped. The completion
+ * says the firmware has finished with it, so its mbuf leaves the transmit slot and waits in sc->mon_rs, ordered by the frame's first submission. The
+ * native pump sends the oldest waiting frame of a receiver again when that receiver is expected on the channel (the per-destination hold), with the Retry
+ * bit and the same bytes, before any newer frame for that receiver. Bounds: `nativeresend` submissions per frame (at most 16), QWZ_MON_RS_WINDOW_NS from
+ * the first submission, QWZ_MON_RS_MAX frames waiting; past a bound the frame is dropped as before and the transport above recovers it. Only unicast
+ * data of the native lane: management, control and group frames and the user-space lane never wait here. Every access runs in the gate, as the transmit
+ * slots' own accounting does.
+ */
+#define QWZ_MON_RS_WINDOW_NS	700000000ULL
+
+static uint64_t
+qwz_mon_rs_backoff_ns(unsigned int tries)	/* after the tries-th unacknowledged submission; the hold decides the rest */
+{
+	return tries <= 1 ? 0 : tries == 2 ? 5000000ULL : 25000000ULL;
+}
+
+static unsigned int
+qwz_mon_rs_limit(void)
+{
+	return qwz_nativeresend <= 0 ? 0 : qwz_nativeresend > 16 ? 16U : (unsigned int)qwz_nativeresend;
+}
+
+static void
+qwz_mon_rs_remove(struct qwz_softc *sc, unsigned int index, int free_frame)
+{
+	unsigned int i;
+
+	if (index >= sc->mon_rs_count)
+		return;
+	if (free_frame && sc->mon_rs[index].m != NULL)
+		m_freem(sc->mon_rs[index].m);
+	for (i = index; i + 1 < sc->mon_rs_count; i++)
+		sc->mon_rs[i] = sc->mon_rs[i + 1];
+	sc->mon_rs_count--;
+	memset(&sc->mon_rs[sc->mon_rs_count], 0, sizeof(sc->mon_rs[0]));
+}
+
+/* Every waiting frame is freed and no slot remembers a native frame: with the transmit ring's purge and at a cell's start. */
+static void
+qwz_mon_rs_flush(struct qwz_softc *sc)
+{
+	while (sc->mon_rs_count > 0)
+		qwz_mon_rs_remove(sc, sc->mon_rs_count - 1, 1);
+	memset(sc->mon_tx_tries, 0, sizeof(sc->mon_tx_tries));
+	memset(sc->mon_tx_serial, 0, sizeof(sc->mon_tx_serial));
+	memset(sc->mon_tx_first_ns, 0, sizeof(sc->mon_tx_first_ns));
+	sc->mon_rs_ctx_tries = 0;
+	sc->mon_rs_ctx_serial = 0;
+	sc->mon_rs_ctx_first_ns = 0;
+}
+
+/*
+ * The completion of slot `id` reported no acknowledgement for frame `m`. 1: the frame now waits for another try and the caller must not free it; 0: the
+ * caller frees it as before. A frame that failed again goes back to its place by first submission, so it stays ahead of the newer frames behind it.
+ */
+static int
+qwz_mon_rs_keep(struct qwz_softc *sc, unsigned int id, struct mbuf *m, uint64_t now)
+{
+	const unsigned int limit = qwz_mon_rs_limit();
+	const uint8_t *f;
+	uint8_t tries;
+	uint32_t serial;
+	uint64_t first;
+	unsigned int at, i;
+
+	if (id >= nitems(sc->mon_tx_tries))
+		return 0;
+	tries = sc->mon_tx_tries[id];
+	serial = sc->mon_tx_serial[id];
+	first = sc->mon_tx_first_ns[id];
+	if (limit == 0 || tries == 0 || m == NULL || !sc->mon_active || sc->mon_coex_halt)
+		return 0;
+	f = mtod(m, const uint8_t *);
+	if (M_PKTLEN(m) < 24 || (f[0] & 0x0c) != 0x08 || (f[4] & 0x01))	/* unicast data only */
+		return 0;
+	if (tries >= limit || first == 0 || now < first || now - first >= QWZ_MON_RS_WINDOW_NS) {
+		sc->mon_stats.ufr_data_gaveup++;
+		return 0;
+	}
+	if (sc->mon_rs_count >= nitems(sc->mon_rs)) {
+		sc->mon_stats.ufr_data_rsfull++;
+		return 0;
+	}
+	for (at = sc->mon_rs_count; at > 0 && (int32_t)(sc->mon_rs[at - 1].serial - serial) > 0; at--)
+		;
+	for (i = sc->mon_rs_count; i > at; i--)
+		sc->mon_rs[i] = sc->mon_rs[i - 1];
+	sc->mon_rs_count++;
+	sc->mon_rs[at].m = m;
+	sc->mon_rs[at].first_ns = first;
+	sc->mon_rs[at].notbefore_ns = now + qwz_mon_rs_backoff_ns(tries);
+	sc->mon_rs[at].serial = serial;
+	sc->mon_rs[at].tries = tries;
+	return 1;
+}
+
+
 int
 qwz_mon_tx_compl(struct qwz_softc *sc, struct wmi_mgmt_tx_compl_event *ev)
 {
 	struct qwz_txmgmt_queue *q = &sc->sc_monvif.txmgmt;
 	struct qwz_tx_data *td;
+	int kept = 0;	/* RS (f2u): the frame waits for another try, its mbuf is not freed here */
 
 	/*
 	 * K5 (L1-C8): beside the station the ids are partitioned: 0 to QWZ_MON_COEX_STA_SLOTS-1 are the station's ring, the cell's are the rest (the lane M
@@ -608,11 +709,16 @@ qwz_mon_tx_compl(struct qwz_softc *sc, struct wmi_mgmt_tx_compl_event *ev)
 	if (sc->mon_tx_kind[ev->desc_id] == 2) {
 		if (ev->status == 0)
 			sc->mon_stats.ufr_data_acked_bytes += M_PKTLEN(td->m);
-		else if (ev->status == 3)
+		else if (ev->status == 3) {
 			sc->mon_stats.ufr_data_noack++;
+			kept = qwz_mon_rs_keep(sc, ev->desc_id, td->m, getnsecuptime());	/* RS (f2u) */
+		}
 	}
+	if (ev->desc_id < nitems(sc->mon_tx_tries))
+		sc->mon_tx_tries[ev->desc_id] = 0;	/* RS: the slot's frame is leaving it either way */
 	bus_dmamap_unload(sc->sc_dmat, td->map);
-	m_freem(td->m);
+	if (!kept)
+		m_freem(td->m);
 	td->m = NULL;
 	td->ni = NULL;
 	if (q->queued > 0)
@@ -819,6 +925,14 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 		return ret;
 	}
 	sc->mon_tx_kind[slot] = kind;
+	if (slot >= 0 && slot < (int)nitems(sc->mon_tx_tries)) {	/* RS (f2u): only a native data frame has a history; every other frame clears the slot's */
+		if (nativeMode >= 0 && kind == 2) {
+			sc->mon_tx_tries[slot] = sc->mon_rs_ctx_tries != 0 ? sc->mon_rs_ctx_tries : 1;
+			sc->mon_tx_serial[slot] = sc->mon_rs_ctx_tries != 0 ? sc->mon_rs_ctx_serial : ++sc->mon_rs_serial;
+			sc->mon_tx_first_ns[slot] = sc->mon_rs_ctx_tries != 0 ? sc->mon_rs_ctx_first_ns : getnsecuptime();
+		} else
+			sc->mon_tx_tries[slot] = 0;
+	}
 	if (kind == 2 || kind == 3)
 		sc->mon_stats.ufr_inflight++;	/* K2b (W1b): counted only after the firmware accepted the frame */
 	qwz_mon_lat_stamp(sc, slot);	/* K1 W2b */
@@ -929,6 +1043,100 @@ qwz_mon_native_get_tx_stats(struct qwz_mon_native_tx_stats *out)
 	out->failed = sc->mon_stats.ufr_data_bad;
 	out->noack = sc->mon_stats.ufr_data_noack;
 	out->inflight = sc->mon_stats.ufr_inflight;
+	out->resent = sc->mon_stats.ufr_data_resent;
+	out->gaveup = sc->mon_stats.ufr_data_gaveup + sc->mon_stats.ufr_data_rsfull;
+	out->waiting = sc->mon_rs_count;
+}
+
+/*
+ * RS (f2u): the native pump's view of the frames waiting for another try (see qwz_mon_rs_keep), the gate held by the caller.
+ * _first: the index, at or after `from`, of the first waiting frame that is the oldest one for its receiver, with that receiver's address; -1 none.
+ * _blocks: 1 while a frame for this receiver waits, so that no newer frame for it is taken from the queue.
+ * _send: 0 the frame went to the firmware again and left the list; EAGAIN not due yet; ETIMEDOUT past its bounds, dropped; else the send's errno, the
+ * frame keeps waiting (ENOSPC: no slot or credit now).
+ */
+int
+qwz_mon_native_resend_first(unsigned int from, uint8_t *dest)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	unsigned int i, k;
+
+	if (sc == NULL || !sc->mon_active || dest == NULL)
+		return -1;
+	for (i = from; i < sc->mon_rs_count; i++) {
+		const uint8_t *a = mtod(sc->mon_rs[i].m, const uint8_t *) + 4;
+
+		for (k = 0; k < i; k++)
+			if (IEEE80211_ADDR_EQ(mtod(sc->mon_rs[k].m, const uint8_t *) + 4, a))
+				break;
+		if (k < i)
+			continue;
+		IEEE80211_ADDR_COPY(dest, a);
+		return (int)i;
+	}
+	return -1;
+}
+
+int
+qwz_mon_native_resend_blocks(const uint8_t *dest)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	unsigned int i;
+
+	if (sc == NULL || !sc->mon_active || dest == NULL)
+		return 0;
+	for (i = 0; i < sc->mon_rs_count; i++)
+		if (IEEE80211_ADDR_EQ(mtod(sc->mon_rs[i].m, const uint8_t *) + 4, dest))
+			return 1;
+	return 0;
+}
+
+int
+qwz_mon_native_resend_send(unsigned int index)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+	struct mbuf *m;
+	uint64_t now;
+	uint8_t *f;
+	unsigned int i;
+	int ret;
+
+	if (sc == NULL || !sc->mon_active || index >= sc->mon_rs_count)
+		return ENXIO;
+	auto *e = &sc->mon_rs[index];
+	m = e->m;
+	now = getnsecuptime();
+	if (e->tries >= qwz_mon_rs_limit() || now < e->first_ns || now - e->first_ns >= QWZ_MON_RS_WINDOW_NS) {
+		sc->mon_stats.ufr_data_gaveup++;
+		qwz_mon_rs_remove(sc, index, 1);
+		return ETIMEDOUT;
+	}
+	if (now < e->notbefore_ns)
+		return EAGAIN;
+	if (!qwz_mon_native_tx_ready())
+		return ENOSPC;
+	f = mtod(e->m, uint8_t *);
+	f[1] |= 0x08;	/* IEEE80211_FC1_RETRY: the same frame and sequence number, so a receiver that did hear the first copy discards this one */
+	sc->mon_rs_ctx_tries = (uint8_t)(e->tries + 1);
+	sc->mon_rs_ctx_serial = e->serial;
+	sc->mon_rs_ctx_first_ns = e->first_ns;
+	ret = qwz_mon_tx_bytes(sc, f, (size_t)M_PKTLEN(m), 2, 0);
+	sc->mon_rs_ctx_tries = 0;
+	if (ret == 0) {
+		sc->mon_stats.ufr_sent++;
+		sc->mon_stats.ufr_data_resent++;
+		/* qwz_mon_tx_bytes sent its own copy. The entry is found again by its frame, not by `index`: should the send ever sleep, the list may have moved or been emptied meanwhile */
+		for (i = 0; i < sc->mon_rs_count; i++) {
+			if (sc->mon_rs[i].m == m) {
+				qwz_mon_rs_remove(sc, i, 1);
+				break;
+			}
+		}
+	} else if (ret == ENOSPC)
+		sc->mon_stats.ufr_full++;
+	else
+		sc->mon_stats.ufr_fail++;
+	return ret;
 }
 
 int
@@ -1002,6 +1210,7 @@ qwz_mon_txq_purge(struct qwz_softc *sc)
 		q->cur = QWZ_MON_COEX_STA_SLOTS;
 	memset(sc->mon_lat.tx_ns, 0, sizeof(sc->mon_lat.tx_ns));	/* K2c (C3): no per-slot stamp or kind outlives the slots */
 	memset(sc->mon_tx_kind, 0, sizeof(sc->mon_tx_kind));
+	qwz_mon_rs_flush(sc);	/* RS (f2u): nor does a frame waiting for another try */
 }
 
 /*
@@ -1763,6 +1972,10 @@ qwz_mon_reap(void *arg)
 		if (sc->mon_coex)	/* K6 (K6-1): the WBM error ring tap, adjacent additive line */
 			printf("qwz: mon: coex: wbm counters taken %u skipped %u badhdr %u wbm_err %u; moncoexwbm %d\n",
 			    sc->mon_stats.coex_wbm_taken, sc->mon_stats.coex_wbm_skipped, sc->mon_stats.coex_wbm_badhdr, sc->mon_stats.wbm_err, qwz_moncoexwbm);
+		if (sc->mon_stats.ufr_data_noack || sc->mon_stats.ufr_data_resent)	/* RS, RT (f2u): adjacent additive line */
+			printf("qwz: mon: resend: data unacknowledged %u, sent again %u, given up %u, list full %u, waiting %u; nativeresend %d; rate %d Mbit/s (monrate %d)\n",
+			    sc->mon_stats.ufr_data_noack, sc->mon_stats.ufr_data_resent, sc->mon_stats.ufr_data_gaveup, sc->mon_stats.ufr_data_rsfull,
+			    sc->mon_rs_count, qwz_nativeresend, sc->mon_rate_applied, qwz_monrate);
 		if (sc->mon_stats.ufr_sent || sc->mon_stats.ufr_full || sc->mon_stats.ufr_fail)
 			printf("qwz: mon: utx: sent %u full %u fail %u; mgmt ok %u bad %u, data ok %u bad %u, ctrl ok %u bad %u; nocred %u qmax %u inflight %u; pending %d reaped %u livefull %u compl range %u nom %u sta %u; held_ms %u gate %u fmt %u fmtfail %u\n",
 			    sc->mon_stats.ufr_sent, sc->mon_stats.ufr_full, sc->mon_stats.ufr_fail,
@@ -2008,6 +2221,61 @@ qwz_mon_sender_peer(struct qwz_softc *sc, const uint8_t *addr, int add)
  * 2: also WMI_PDEV_PARAM_MGMT_RETRY_LIMIT 3 and WMI_VDEV_PARAM_NON_AGG_SW_RETRY_TH 4. Each set logs one "qwz: mon: params:" line; a failure logs and
  * continues, the cell start is never aborted. The firmware restarts after every cell (mon_fw_dirty), so nothing leaks into the station.
  */
+/*
+ * RT (f2u), debug.qwz.monrate: the cell vdev's WMI_VDEV_PARAM_MGMT_RATE in Mbit/s. Every frame of the cell leaves through the management path, so this is
+ * the rate of the AirDrop data frames too; the firmware's own is 6 Mbit/s on 5 GHz. The same vdev parameter Linux ath12k sets from the basic rates
+ * (ath12k_recalculate_mgmt_rate), an OFDM rate code as qwz_mon_cell_params below; not the per-frame tx_params block (monfmt, nativefmt). Returns the
+ * hardware rate index, -1 for a value that is no OFDM rate.
+ */
+static int
+qwz_mon_rate_index(int mbit)
+{
+	switch (mbit) {
+	case 6: return ATH12K_HW_RATE_OFDM_6M;
+	case 9: return ATH12K_HW_RATE_OFDM_9M;
+	case 12: return ATH12K_HW_RATE_OFDM_12M;
+	case 18: return ATH12K_HW_RATE_OFDM_18M;
+	case 24: return ATH12K_HW_RATE_OFDM_24M;
+	case 36: return ATH12K_HW_RATE_OFDM_36M;
+	case 48: return ATH12K_HW_RATE_OFDM_48M;
+	case 54: return ATH12K_HW_RATE_OFDM_54M;
+	default: return -1;
+	}
+}
+
+/*
+ * Gives the cell vdev the rate debug.qwz.monrate asks for, once per value: after the vdev is up and, for a value changed while the cell runs, from the
+ * visit task (both may sleep in the gate). 0 leaves a fresh cell alone and takes a cell that was given a rate back to 6 Mbit/s, on 5 GHz only. One
+ * "qwz: mon: rate:" line per attempt; a failure logs and is not repeated until the value changes.
+ */
+static void
+qwz_mon_cell_rate(struct qwz_softc *sc)
+{
+	struct qwz_vif *vif = &sc->sc_monvif;
+	const int want = qwz_monrate, had = sc->mon_rate_applied;
+	int mbit = want, idx, ret;
+
+	sc->mon_rate_applied = want;
+	if (want == 0) {
+		if (had <= 0 || sc->mon_chan <= 14)
+			return;
+		mbit = 6;
+	}
+	idx = qwz_mon_rate_index(mbit);
+	if (idx < 0) {
+		printf("qwz: mon: rate: debug.qwz.monrate %d is no OFDM rate (6, 9, 12, 18, 24, 36, 48, 54); the cell keeps its rate\n", want);
+		return;
+	}
+	if (!vif->is_up || qwz_mon_fw_unavail(sc)) {	/* not mon_active: the cell's start calls this before it sets that */
+		printf("qwz: mon: rate: skipped, the cell vdev or the firmware is unavailable (monrate %d)\n", want);
+		return;
+	}
+	ret = qwz_wmi_vdev_set_param_cmd(sc, vif->vdev_id, sc->pdevs[0].pdev_id, WMI_VDEV_PARAM_MGMT_RATE,
+	    ATH12K_HW_RATE_CODE(idx, 0, WMI_RATE_PREAMBLE_OFDM));
+	printf("qwz: mon: rate: vdev %u MGMT_RATE 0x%08x (OFDM %d Mbit/s, debug.qwz.monrate %d): %d\n", vif->vdev_id,
+	    (unsigned)ATH12K_HW_RATE_CODE(idx, 0, WMI_RATE_PREAMBLE_OFDM), mbit, want, ret);
+}
+
 static void
 qwz_mon_cell_params(struct qwz_softc *sc)
 {
@@ -2016,8 +2284,11 @@ qwz_mon_cell_params(struct qwz_softc *sc)
 	uint32_t rate = ATH12K_HW_RATE_CODE(ATH12K_HW_RATE_OFDM_12M, 0, WMI_RATE_PREAMBLE_OFDM);
 	int mode = qwz_monparams, ret;
 
-	if (mode <= 0)
+	if (mode <= 0) {
+		qwz_mon_cell_rate(sc);	/* RT (f2u): debug.qwz.monrate; monparams above 0 keeps its own fixed 12 Mbit/s below */
 		return;
+	}
+	sc->mon_rate_applied = qwz_monrate;	/* RT: monparams owns the rate until monrate changes */
 	if (qwz_mon_fw_unavail(sc)) {
 		printf("qwz: mon: params: skipped, firmware unavailable (monparams %d)\n", mode);
 		return;
@@ -2367,6 +2638,8 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 	}
 k5_coex_guards_done:	/* K5 (L1-C2) */
 	memset(&sc->mon_stats, 0, sizeof(sc->mon_stats));
+	qwz_mon_rs_flush(sc);	/* RS (f2u): nothing waits from an earlier cell */
+	sc->mon_rate_applied = -1;	/* RT (f2u) */
 	sc->mon_stats.ufr_inflight = 0;	/* K2b (W1b): no user frame is in flight in a new cell */
 	memset(sc->mon_tx_kind, 0, sizeof(sc->mon_tx_kind));	/* K2b (W1b): no stale per-slot kind from the previous cell may count against the cap */
 	memset(&sc->mon_lat, 0, sizeof(sc->mon_lat));	/* K1 W2b */
@@ -2901,7 +3174,10 @@ qwz_mon_dwell_task_fn(void *arg)
 	}
 	const uint32_t epoch = sc->sc_fw_epoch;
 	sc->mon_dwell_submitting = 1;
-	ret = qwz_mon_dwell_start(sc, sc->mon_freq, sc->mon_dwell_plan_ms > 0 ? sc->mon_dwell_plan_ms :	/* AL: a visit timed to a receiver */
+	if (sc->mon_rate_applied != qwz_monrate)	/* RT (f2u): a debug.qwz.monrate changed while the cell runs reaches the vdev here (may sleep, like the visit) */
+		qwz_mon_cell_rate(sc);
+	ret = epoch != sc->sc_fw_epoch ? ESHUTDOWN :
+	    qwz_mon_dwell_start(sc, sc->mon_freq, sc->mon_dwell_plan_ms > 0 ? sc->mon_dwell_plan_ms :	/* AL: a visit timed to a receiver */
 	    qwz_mon_dwell_clamp(qwz_moncoexdwell, 20, 1000));
 	sc->mon_dwell_submitting = 0;
 	/* The WMI send may sleep with the gate released across a reset. */

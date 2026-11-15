@@ -222,7 +222,12 @@ int AirportItlwm::awdlNativePlanVisit(uint32_t *delayUS, uint32_t *runUS)
 	uint8_t destinations[ItlAWDL::kVisitPlanLook][6];
 	unsigned count = 0;
 	interface->retain();	/* as buildAWDLTransmit holds it across its queue access */
-	while (count < ItlAWDL::kVisitPlanLook && interface->copyQueuedDestination(count, destinations[count]))
+	/* RS (f2u): receivers whose unacknowledged frames wait for another try come first; their newer frames are still in the queue behind them */
+	for (int index = qwz_mon_native_resend_first(0, destinations[count]); index >= 0 && count + 1 < ItlAWDL::kVisitPlanLook;
+	    index = qwz_mon_native_resend_first(unsigned(index) + 1, destinations[count]))
+		++count;
+	const unsigned waiting = count;
+	while (count < ItlAWDL::kVisitPlanLook && interface->copyQueuedDestination(count - waiting, destinations[count]))
 		++count;
 	interface->release();
 	uint64_t delay = 0, run = 0;
@@ -275,6 +280,32 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 				mbuf_freem(m);
 		}
 		unsigned budget = kPumpBudget;
+		// RS (f2u): frames the receiver didn't acknowledge go again first. For each receiver only its oldest waiting frame
+		// may go, and only while that receiver is expected on the channel: the same hold that gates its new frames.
+		{
+			uint8_t destination[6];
+			const bool timed = self->awdlNativePeerTimingEnabled && qwz_nativepeerpause;
+			int index = qwz_mon_native_resend_first(0, destination);
+			while (index >= 0 && budget > 0 && qwz_mon_native_tx_ready() && qwz_mon_tx_room() > 0) {
+				if (timed && self->awdlNativePeerTiming.hold(destination, uint8_t(cell), nowUS())) {
+					index = qwz_mon_native_resend_first(unsigned(index) + 1, destination);
+					continue;
+				}
+				const int err = qwz_mon_native_resend_send(unsigned(index));
+				if (err == 0) {
+					--budget;
+					++st.dataResent;
+					self->awdlNativeLastDataUS = now;
+					index = qwz_mon_native_resend_first(unsigned(index), destination);	// the list closed up
+				} else if (err == ETIMEDOUT) {
+					index = qwz_mon_native_resend_first(unsigned(index), destination);	// dropped, the list closed up
+				} else if (err == EAGAIN) {
+					index = qwz_mon_native_resend_first(unsigned(index) + 1, destination);	// not due yet; its receiver stays blocked
+				} else {
+					break;	// no slot or credit now, or the cell is going away
+				}
+			}
+		}
 		// A send spends a WMI credit. Recheck before dequeuing each packet;
 		// the slot count alone can outlive the available transport credit.
 		while (budget > 0 && qwz_mon_native_tx_ready() && qwz_mon_tx_room() > 0) {
@@ -332,6 +363,7 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 			put("txSubmittedBytes", st.txSubmittedBytes); put("rxDataBytes", st.rxDataBytes);
 			put("txDataAckedBytes", tx.acked_bytes); put("txDataAcked", tx.acked); put("txDataFailed", tx.failed);
 			put("txDataNoAck", tx.noack); put("txInflight", tx.inflight);
+			put("txDataResent", tx.resent); put("txDataGaveUp", tx.gaveup); put("txResendWaiting", tx.waiting);	/* RS (f2u) */
 			put("txAckedBytesPerSecond", txRate); put("rxBytesPerSecond", rxRate);
 			put("timedPeers", self->awdlNativePeerTiming.known(now));
 			put("peerHoldChecks", self->awdlNativePeerTiming.holdChecks);

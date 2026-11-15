@@ -448,7 +448,7 @@ public:
         uint64_t timerTicks, cellTimerTicks;
         uint64_t rxAction, rxActionHanded, rxActionRefused, rxActionTrimmed, rxActionTooLong;
         uint64_t rxData, rxDataHanded, rxDataTooLong, rxNotInGate, rxNoMbuf, rssiFallbacks;
-        uint64_t syncSent, syncBuildFailures, syncTxErrors, dataSent, dataTxErrors, queued;
+        uint64_t syncSent, syncBuildFailures, syncTxErrors, dataSent, dataTxErrors, queued, dataResent;
         uint64_t rxDataBytes, txSubmittedBytes;
         uint32_t rxActionLastError, syncLastBuild, syncLastTxError, dataLastTxError;
     } awdlNativeStats;

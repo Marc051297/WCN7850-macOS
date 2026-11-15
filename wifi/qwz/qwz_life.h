@@ -49,6 +49,10 @@ extern int qwz_scanraw;
 extern int qwz_monreap, qwz_hintfix;
 /* JL (join lifecycle): debug.qwz.joinhint (1 = a join scans the channel it names alone first, qwz_scan), debug.qwz.authfast (1 = an unacknowledged authentication frame is retried within a second). Defined in qwz_sysctl.cpp. */
 extern int qwz_joinhint, qwz_authfast;
+/* f2u. debug.qwz.nativeresend (RS): the most submissions one native AirDrop data frame gets when the receiver does not acknowledge it (default 6, at most 16; 0 = a frame is sent once, as up to f2t), qwz_mon.c.
+ * debug.qwz.monrate (RT): the cell vdev's management-path rate in Mbit/s, which is the rate of every frame the cell sends (6, 9, 12, 18, 24, 36, 48, 54; default 12; 0 = the firmware's own, 6 on 5 GHz); set when the cell starts and, when changed, at the next visit; debug.qwz.monparams above 0 keeps its own fixed 12.
+ * debug.qwz.regcc (CC): 1 = the country of the itlwm_cc boot argument is asked of the firmware with WMI_SET_CURRENT_COUNTRY_CMDID first, the command Linux ath12k uses on WCN7850, and the init form only when that is not taken (default); 0 = the init form only, as up to f2t; read at each firmware start. Defined in qwz_sysctl.cpp. */
+extern int qwz_nativeresend, qwz_monrate, qwz_regcc;
 /* K4 (M1): debug.qwz.monfmt, default 0 = tx_params_valid 0 for every cell frame: 1 = user frames under 150 bytes carry a tx_params block (retry limit 2, OFDM 12 Mbit/s); 2 = also user DATA frames (retry limit 1 with the header's NO_ACK flag, else 4; rate from the header's rate byte); 3 (offchan data command) is not implemented and acts as 2 */
 extern int qwz_monfmt;
 /* K3 (docs/research-scan-rssi-2026-11-06.md F1/F2/F3, K3 diagnosis), all default 0 = the build before K3; plain globals read at call time, defined in qwz_sysctl.cpp.

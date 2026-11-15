@@ -39,6 +39,7 @@ struct qwz_softc {
     int mon_chan=149,dead=0,hold=0;
     uint64_t mon_dwell_next_ns=0;
     int mon_dwell_plan_ms=0; // AL: 0 = the fixed visit
+    int mon_rate_applied=12; // RT: the rate the cell was last given
     struct {int state=ATH12K_SCAN_STARTING;} scan;
     struct {unsigned dwell_fail=0,dwell_start=0,coex_st_mgmt=0,coex_cell_mgmt=0,coex_drop=0,coex_scan_mgmt=0;
             int coex_scan_rssi_min=0,coex_scan_rssi_max=0;} mon_stats;
@@ -56,6 +57,11 @@ static int tsleep_nsec(void *,int,const char *,uint64_t ns) {
     now+=ns; ++sleeps;
     if(on_sleep) on_sleep();
     return sleep_error ? sleep_error : EWOULDBLOCK;
+}
+static int qwz_monrate=12,rate_sets,rate_mode;
+static void qwz_mon_cell_rate(qwz_softc *sc) { // RT: may sleep, like the visit; mode 1 = the firmware restarted meanwhile
+    ++rate_sets; assert(sc->mon_dwell_submitting); sc->mon_rate_applied=qwz_monrate;
+    if(rate_mode==1) ++sc->sc_fw_epoch;
 }
 static int qwz_mon_dwell_start(qwz_softc *sc,uint32_t,int) {
     ++submits; assert(sc->mon_dwell_submitting);
@@ -182,6 +188,16 @@ int main() {
     submit_mode=1; sc.mon_dwell_inflight=1; qwz_mon_dwell_task_fn(&sc);
     assert(submits==3 && sc.mon_dwell_inflight && sc.mon_stats.dwell_start==1);
     assert(!sc.mon_dwell_submitting && sc.mon_active && sc.mon_native_owned);
+    // RT: a changed debug.qwz.monrate reaches the cell from the visit task, once, before the visit goes out.
+    submit_mode=0; sc.mon_dwell_inflight=1; qwz_monrate=24;
+    qwz_mon_dwell_task_fn(&sc);
+    assert(rate_sets==1 && sc.mon_rate_applied==24 && submits==4);
+    sc.mon_dwell_inflight=1; qwz_mon_dwell_task_fn(&sc);
+    assert(rate_sets==1 && submits==5);
+    // The firmware restarted while the rate command slept: no visit goes into the new epoch, its state is left alone.
+    rate_mode=1; qwz_monrate=36; sc.mon_dwell_inflight=1; qwz_mon_dwell_task_fn(&sc);
+    assert(rate_sets==2 && submits==5 && sc.mon_dwell_inflight && !sc.mon_dwell_submitting);
+    rate_mode=0;
     // Allocation/drain failure frees only this scan's reservation. A busy
     // scan or newer firmware epoch retains its own state.
     submit_mode=0; sc.mon_dwell_inflight=0; sc.scan.state=ATH12K_SCAN_IDLE;

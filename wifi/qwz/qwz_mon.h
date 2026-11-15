@@ -203,8 +203,14 @@ int	qwz_mon_tx_raw(const uint8_t *frame, size_t len);
 struct qwz_mon_native_tx_stats {
 	uint64_t acked_bytes;
 	uint32_t acked, failed, noack, inflight;
+	uint32_t resent, gaveup, waiting;	/* RS (f2u): submissions of a frame after its first; frames dropped after their last allowed try; frames waiting for another try now */
 };
 void	qwz_mon_native_get_tx_stats(struct qwz_mon_native_tx_stats *);
+/* RS (f2u), debug.qwz.nativeresend: native data frames the receiver did not acknowledge wait in the cell for another try; the native pump drives them
+ * with these three, the gate held by the caller (qwz_mon.c has the contract of each). */
+int	qwz_mon_native_resend_first(unsigned int from, uint8_t *dest);
+int	qwz_mon_native_resend_blocks(const uint8_t *dest);
+int	qwz_mon_native_resend_send(unsigned int index);
 /* qwz_attach(): allocates the capture ring and remembers the softc. */
 void	qwz_mon_attach(struct qwz_softc *);
 /* ItlQwz::detachGated (merge glue F): ends a cell host-only, frees the capture buffers, the lock and the 64 maps, forgets the softc. */

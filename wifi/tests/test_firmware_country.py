@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Compile real boot-country/WMI/event code with delayed firmware responses."""
+"""Compile real boot-country/WMI/event code with delayed firmware responses.
+
+Both forms of the request: the init form (debug.qwz.regcc 0, as up to f2t) and the current-country command first with the
+init form behind it (regcc 1, f2u), against a firmware that takes, refuses or ignores each."""
 from pathlib import Path
 import re
 import subprocess
@@ -30,6 +33,7 @@ code = r'''
 #define FIELD_PREP(mask,value) ((uint32_t(value)<<__builtin_ctz(mask))&(mask))
 constexpr uint32_t WMI_TLV_TAG=0xffff0000U,WMI_TLV_LEN=0xffffU;
 constexpr unsigned WMI_TAG_SET_INIT_COUNTRY_CMD=123,WMI_SET_INIT_COUNTRY_CMDID=456;
+constexpr unsigned WMI_TAG_SET_CURRENT_COUNTRY_CMD=124,WMI_SET_CURRENT_COUNTRY_CMDID=457;
 constexpr unsigned WMI_COUNTRY_INFO_TYPE_ALPHA=0,TLV_HDR_SIZE=4;
 constexpr int REG_SET_CC_STATUS_PASS=0;
 #define SEC_TO_NSEC(n) (uint64_t(n)*1000000000ULL)
@@ -39,6 +43,7 @@ struct wmi_init_country_cmd {
     uint32_t tlv_header,pdev_id,init_cc_type;
     union {uint32_t alpha2,country_code,regdom_id;} cc_info;
 };
+struct wmi_set_current_country_cmd {uint32_t tlv_header,pdev_id,new_alpha2;};
 struct cur_regulatory_info {int status_code=0;char alpha2[3]{};};
 struct qwz_pdev_wmi {int id=0;};
 struct qwz_softc {
@@ -53,16 +58,21 @@ struct mbuf {uint8_t bytes[sizeof(ath12k_htc_hdr)+sizeof(wmi_cmd_hdr)+sizeof(wmi
 #define mtod(m,type) reinterpret_cast<type>((m)->bytes)
 static std::string argument;
 static int sends,frees,sleeps,wakes,publishes,sendResult,publishedError;
+static int qwz_regcc=0,currentSends,initSends,currentSendResult;   // regcc 0: the init form alone, as up to f2t
+static unsigned lastId;
 static bool allocFail;
 enum Reply {Inline,OnWait,Rejected,Unrelated,Absent};
-static Reply reply=OnWait;
+static Reply reply=OnWait,currentReply=OnWait;   // the firmware's answer to the init form, and to the current-country command
 static qwz_softc *active;
 static wmi_init_country_cmd lastCommand;
+static wmi_set_current_country_cmd lastCurrent;
 static void qwz_reg_country_event(qwz_softc *,const cur_regulatory_info *);
+static Reply answering() {return lastId==WMI_SET_CURRENT_COUNTRY_CMDID ? currentReply : reply;}
 static void emit() {
+    const Reply reply=answering();
     cur_regulatory_info event;
     memcpy(event.alpha2,reply==Unrelated?"00":"US",3);
-    if(reply==Rejected) event.status_code=1;
+    if(reply==Rejected) event.status_code=lastId==WMI_SET_CURRENT_COUNTRY_CMDID ? 3 : 1;   // 3: change not allowed, as this firmware says
     if(reply==Inline || reply==OnWait) active->sc_ic.ic_channels[149].ic_flags=0;
     qwz_reg_country_event(active,&event);
 }
@@ -72,14 +82,28 @@ static bool PE_parse_boot_argn(const char *name,void *out,int length) {
     std::strncpy(static_cast<char *>(out),argument.c_str(),length-1); return true;
 }
 static mbuf *qwz_wmi_alloc_mbuf(size_t n) {
-    assert(n==sizeof(wmi_init_country_cmd));
+    assert(n==sizeof(wmi_init_country_cmd) || n==sizeof(wmi_set_current_country_cmd));
     if(allocFail) return nullptr;
     auto *m=new mbuf; memset(m->bytes,0xa5,sizeof(m->bytes)); return m;
 }
 static void m_freem(mbuf *m) {++frees;delete m;}
 static int qwz_wmi_cmd_send(qwz_pdev_wmi *wmi,mbuf *m,uint32_t id) {
-    assert(id==WMI_SET_INIT_COUNTRY_CMDID && wmi==&active->wmi.wmi[3]);
-    ++sends;
+    assert(wmi==&active->wmi.wmi[3]);
+    ++sends;lastId=id;
+    if(id==WMI_SET_CURRENT_COUNTRY_CMDID) {
+        assert(qwz_regcc!=0);   // with regcc 0 this command is never sent
+        ++currentSends;
+        memcpy(&lastCurrent,m->bytes+sizeof(ath12k_htc_hdr)+sizeof(wmi_cmd_hdr),sizeof(lastCurrent));
+        assert(lastCurrent.pdev_id==3);
+        assert(lastCurrent.tlv_header==(WMI_TAG_SET_CURRENT_COUNTRY_CMD<<16 | (sizeof(lastCurrent)-4)));
+        assert(lastCurrent.new_alpha2==uint32_t('U'|('S'<<8))); // two letters, no stale padding bytes
+        if(currentSendResult) return currentSendResult;
+        m_freem(m);
+        if(currentReply==Inline) emit();
+        return 0;
+    }
+    assert(id==WMI_SET_INIT_COUNTRY_CMDID);
+    ++initSends;
     memcpy(&lastCommand,m->bytes+sizeof(ath12k_htc_hdr)+sizeof(wmi_cmd_hdr),sizeof(lastCommand));
     assert(lastCommand.pdev_id==3 && lastCommand.init_cc_type==WMI_COUNTRY_INFO_TYPE_ALPHA);
     assert(lastCommand.tlv_header==(WMI_TAG_SET_INIT_COUNTRY_CMD<<16 | (sizeof(lastCommand)-4)));
@@ -93,7 +117,7 @@ static void wakeup(void *p) {assert(p==&active->reg_country_pending);++wakes;}
 static int tsleep_nsec(void *p,int flags,const char *label,uint64_t ns) {
     assert(p==&active->reg_country_pending && !flags && ns==1000000000ULL);
     assert(strcmp(label,"qwzcountry")==0); ++sleeps;
-    if(reply==Absent) return ETIMEDOUT;
+    if(answering()==Absent) return ETIMEDOUT;
     emit();
     return active->reg_country_pending?ETIMEDOUT:0;
 }
@@ -103,11 +127,13 @@ static void qwz_compat_publish_country(const char *,const char *,int,int error,u
 }
 '''
 code += "\n" + "\n".join(function(n) for n in (
-    "qwz_reg_country_event", "qwz_wmi_set_init_country", "qwz_apply_boot_country"))
+    "qwz_reg_country_event", "qwz_wmi_set_init_country", "qwz_wmi_set_current_country", "qwz_country_ask",
+    "qwz_apply_boot_country"))
 code += r'''
 static void reset(qwz_softc &sc) {
     sc=qwz_softc{}; active=&sc; sends=frees=sleeps=wakes=publishes=sendResult=publishedError=0;
-    allocFail=false;argument="US";reply=OnWait;
+    currentSends=initSends=currentSendResult=0;lastId=0;
+    allocFail=false;argument="US";reply=OnWait;currentReply=OnWait;
 }
 int main() {
     qwz_softc sc;
@@ -138,7 +164,32 @@ int main() {
     assert(sends==1 && frees==1 && !sleeps && publishedError==EIO && !sc.reg_country_pending);
     reset(sc);allocFail=true;qwz_apply_boot_country(&sc);
     assert(!sends && !frees && !sleeps && publishedError==ENOMEM && !sc.reg_country_pending);
-    puts("ok: country command encoding/ownership, actual firmware replies, rejection, unrelated/late events and bounded timeout");
+    // f2u, regcc 1: the current-country command goes first; the firmware that takes it is asked nothing more.
+    qwz_regcc=1;
+    reset(sc);qwz_apply_boot_country(&sc);
+    assert(currentSends==1 && !initSends && frees==1 && sleeps==1 && wakes==1 && !publishedError);
+    assert(!strcmp(sc.reg_country,"US") && !sc.reg_country_pending && !sc.sc_ic.ic_channels[149].ic_flags);
+    qwz_apply_boot_country(&sc);assert(sends==1);   // already that country: no command at all
+    reset(sc);currentReply=Inline;qwz_apply_boot_country(&sc);
+    assert(currentSends==1 && !initSends && !sleeps && !publishedError && !strcmp(sc.reg_country,"US"));
+    // What f2t's firmware would do if it refused this command too: status 3, then the init form, refused as before.
+    // The channel table is untouched and the error is the init form's.
+    reset(sc);currentReply=Rejected;reply=Rejected;memcpy(sc.reg_country,"00",3);qwz_apply_boot_country(&sc);
+    assert(currentSends==1 && initSends==1 && publishedError==EIO && sc.reg_country_status==1);
+    assert(!strcmp(sc.reg_country,"00") && sc.sc_ic.ic_channels[149].ic_flags==0x200 && !sc.reg_country_pending);
+    // Refused, ignored or unsendable current-country command: the init form still gets its chance.
+    for(int how=0;how<4;++how) {
+        reset(sc);
+        if(how==0) currentReply=Rejected; else if(how==1) currentReply=Absent; else if(how==2) currentReply=Unrelated;
+        else currentSendResult=EIO;
+        qwz_apply_boot_country(&sc);
+        assert(currentSends==1 && initSends==1 && !publishedError && !strcmp(sc.reg_country,"US"));
+        assert(!sc.reg_country_pending && frees==2);
+    }
+    reset(sc);allocFail=true;qwz_apply_boot_country(&sc);
+    assert(!sends && !frees && !sleeps && publishedError==ENOMEM && !sc.reg_country_pending);
+    reset(sc);argument="ZZ";qwz_apply_boot_country(&sc);assert(!sends);   // no country asked: neither command
+    puts("ok: country command encoding/ownership, actual firmware replies, rejection, unrelated/late events and bounded timeout; current-country command first with the init form behind it");
 }
 '''
 with tempfile.TemporaryDirectory(prefix="qwz-country-") as directory:
