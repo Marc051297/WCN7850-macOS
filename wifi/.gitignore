@@ -9,6 +9,7 @@ build-f2k/
 build-f2l/
 build-f2m/
 build-f2n/
+build-f2o/
 deps/
 .DS_Store
 build-fixes/
@@ -16,3 +17,4 @@ deps/
 firmware/dl/
 firmware/FwBinary.cpp
 *.pcap
+__pycache__/

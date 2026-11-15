@@ -267,7 +267,7 @@ qwz_bgscan(struct ieee80211com *ic)
 	static int traced;
 	int ret;
 
-	if (sc->mon_coex && sc->mon_active && qwz_moncoexscan)	/* K5 (L1-C11): no firmware scan may pull the radio off the coex cell's channel */
+	if (qwz_mon_scan_hold(ic))
 		return EBUSY;
 	if (sc->scan.state != ATH12K_SCAN_IDLE)
 		return EBUSY;
@@ -12941,8 +12941,8 @@ qwz_mgmt_rx_event(struct qwz_softc *sc, struct mbuf *m)
 
 	/*
 	 * K5 (L1-C6): beside the station (mon_coex) the capture below is selective. The station's claim is tested FIRST: its frames take the normal path
-	 * (the jump over the capture block below); the cell's go to the capture; anything else (foreign beacons, other networks' probe responses) is counted
-	 * and dropped, so it never creates a node in RUN. Frames shorter than a header cannot be told apart and are dropped. mon_coex is 0 for every K4 cell.
+	 * (the jump over the capture block below); the cell's go to the capture. A native scan also admits foreign beacons and probe responses through the
+	 * normal scanner. Outside a scan, other management frames remain filtered. Frames shorter than a header are dropped. mon_coex is 0 for every K4 cell.
 	 */
 	if (sc->mon_active && sc->mon_coex) {
 		if (M_LEN(m) >= 24 && qwz_mon_is_station_frame(sc, mtod(m, const uint8_t *), (size_t)M_LEN(m))) {
@@ -12954,6 +12954,15 @@ qwz_mgmt_rx_event(struct qwz_softc *sc, struct mbuf *m)
 			qwz_mon_capture_mgmt_mbuf(sc, m, rxi.rxi_rssi, rx_ev.rate);
 			m_freem(m);
 			goto exit;
+		}
+		if (qwz_mon_is_scan_frame(sc, mtod(m, const uint8_t *), (size_t)M_LEN(m))) {
+			if (sc->mon_stats.coex_scan_mgmt++ == 0)
+				sc->mon_stats.coex_scan_rssi_min = sc->mon_stats.coex_scan_rssi_max = rxi.rxi_rssi;
+			else {
+				sc->mon_stats.coex_scan_rssi_min = MIN(sc->mon_stats.coex_scan_rssi_min, rxi.rxi_rssi);
+				sc->mon_stats.coex_scan_rssi_max = MAX(sc->mon_stats.coex_scan_rssi_max, rxi.rxi_rssi);
+			}
+			goto k5_coex_station_mgmt;
 		}
 		sc->mon_stats.coex_drop++;
 		m_freem(m);
@@ -26740,8 +26749,10 @@ qwz_scan(struct qwz_softc *sc)
 	int ret = 0, num_channels, i;
 	uint32_t scan_timeout;
 	int scan_2ghz = 1, scan_5ghz = 1;
+	bool owns_scan = false;
+	const uint32_t scan_epoch = sc->sc_fw_epoch;
 
-	if (sc->mon_coex && sc->mon_active && qwz_moncoexscan)	/* K5 (L1-C11): see qwz_bgscan; moncoexscan 0 lets the scan through */
+	if (qwz_mon_scan_hold(ic))
 		return EBUSY;
 
 	/*
@@ -26778,6 +26789,7 @@ qwz_scan(struct qwz_softc *sc)
 		sc->scan.state = ATH12K_SCAN_STARTING;
 		sc->scan.is_roc = 0;
 		sc->scan.vdev_id = arvif->vdev_id;
+		owns_scan = true;
 		ret = 0;
 		break;
 	case ATH12K_SCAN_STARTING:
@@ -26789,6 +26801,11 @@ qwz_scan(struct qwz_softc *sc)
 #ifdef notyet
 	spin_unlock_bh(&ar->data_lock);
 #endif
+	if (ret)
+		goto exit;
+
+	/* No new AWDL visit can begin once SCAN_STARTING is reserved. */
+	ret = qwz_mon_scan_drain(sc);
 	if (ret)
 		goto exit;
 
@@ -26934,13 +26951,8 @@ qwz_scan(struct qwz_softc *sc)
 			tsleep_delay_nsec(&sc->scan.state, 0, "qwzscanbk", SEC_TO_NSEC(1));
 #endif
 		}
-#ifdef notyet
-		spin_lock_bh(&ar->data_lock);
-#endif
-		sc->scan.state = ATH12K_SCAN_IDLE;
-#ifdef notyet
-		spin_unlock_bh(&ar->data_lock);
-#endif
+		/* Reservation cleanup below checks the firmware epoch; a WMI
+		 * wait can have returned after a restart began a different scan. */
 	} else {
 		/*
 		 * The current mode might have been fixed during association.
@@ -26953,6 +26965,11 @@ qwz_scan(struct qwz_softc *sc)
 	timeout_add_msec(&sc->scan.timeout, scan_timeout);
 #endif
 exit:
+	/* Admission/allocation failures must not strand SCAN_STARTING. Do not
+	 * clear a concurrent scan, or state belonging to a newer firmware epoch. */
+	if (ret && owns_scan && scan_epoch == sc->sc_fw_epoch &&
+	    sc->scan.state == ATH12K_SCAN_STARTING)
+		sc->scan.state = ATH12K_SCAN_IDLE;
 	if (arg) {
 		free(arg->chan_list, M_DEVBUF,
 		    arg->num_chan * sizeof(*arg->chan_list));

@@ -164,13 +164,16 @@ qwz_mon_coex_running(struct qwz_softc *sc)
 	return sc != NULL && sc->mon_active && sc->mon_coex && sc->fw_initialized && !QWZ_CRASHED(sc);
 }
 
-/* K5 (L1-C5): scans must not reach the firmware: the classic hold, or a coex cell with debug.qwz.moncoexscan (live) */
+/* Legacy diagnostic holds remain cache-only; native AWDL shares real scans. */
 int
 qwz_mon_scan_hold(struct ieee80211com *ic)
 {
 	struct qwz_softc *sc = ic ? (struct qwz_softc *)ic->ic_if.if_softc : NULL;
 
-	return qwz_mon_holding(ic) || (qwz_moncoexscan != 0 && qwz_mon_coex_running(sc));
+	/* Native AWDL yields its visits to a real scan in qwz_scan(). The old
+	 * diagnostic listener keeps its explicit cache-only policy. */
+	return qwz_mon_holding(ic) || (qwz_moncoexscan != 0 &&
+	    qwz_mon_coex_running(sc) && !sc->mon_native_owned);
 }
 
 /* K5 (L1-C12): qwz_mon_coex_running for a caller that only has the ieee80211com */
@@ -223,6 +226,20 @@ qwz_mon_is_station_frame(struct qwz_softc *sc, const uint8_t *f, size_t len)
 	if ((f[4] & 0x01) && bss != NULL && IEEE80211_ADDR_EQ(f + 10, bss->ni_macaddr))
 		return 1;
 	return 0;
+}
+
+/* Scan beacons/probe responses retain their own RSSI and normal net80211
+ * validation. Outside a native scan, foreign management frames stay filtered.
+ * Call after the station and AWDL claims, so their ownership is unchanged. */
+int
+qwz_mon_is_scan_frame(struct qwz_softc *sc, const uint8_t *f, size_t len)
+{
+	if (!sc->mon_native_owned ||
+	    (sc->scan.state != ATH12K_SCAN_STARTING && sc->scan.state != ATH12K_SCAN_RUNNING) ||
+	    len < 36 || (f[0] & (IEEE80211_FC0_VERSION_MASK | IEEE80211_FC0_TYPE_MASK)) != IEEE80211_FC0_TYPE_MGT)
+		return 0;
+	const uint8_t subtype = f[0] & IEEE80211_FC0_SUBTYPE_MASK;
+	return subtype == IEEE80211_FC0_SUBTYPE_BEACON || subtype == IEEE80211_FC0_SUBTYPE_PROBE_RESP;
 }
 
 /* K5 (L1-C6): the cell's management frames: on the cell's frequency and in the AWDL BSS (or the debug.qwz.monbssid one), or sent to the cell vdev's address */
@@ -324,6 +341,8 @@ qwz_mon_tx_blocked(struct qwz_softc *sc)
 	if (QWZ_CRASHED(sc) || !sc->fw_initialized || __atomic_load_n(&qwz_pm_pending, __ATOMIC_ACQUIRE) != 0)
 		return 1;
 	if (sc->mon_coex_halt)	/* K5 (L1-C13) */
+		return 1;
+	if (sc->mon_native_owned && (sc->scan.state != ATH12K_SCAN_IDLE || sc->sc_ic.ic_wcl_scan_requested))
 		return 1;
 	if (qwz_mon_cred_reserved(sc))	/* K5 (L1-C9) */
 		return 1;
@@ -1171,6 +1190,7 @@ qwz_mon_native_tx_ready(void)
 {
 	struct qwz_softc *sc = qwz_mon_sc;
 	if (sc == NULL || !sc->mon_active || sc->mon_coex_halt ||
+	    sc->scan.state != ATH12K_SCAN_IDLE || sc->sc_ic.ic_wcl_scan_requested ||
 	    !sc->sc_monvif.is_up || qwz_mon_fw_unavail(sc) ||
 	    __atomic_load_n(&qwz_mon_native_rx, __ATOMIC_ACQUIRE) == NULL ||
 	    !__atomic_load_n(&sc->sc_awdl_addr_valid, __ATOMIC_ACQUIRE) ||
@@ -1628,7 +1648,9 @@ qwz_mon_reap(void *arg)
 		return;
 	n = qwz_mon_reap_ring(sc);
 	now = getnsecuptime();
-	if (sc->mon_coex && qwz_moncoexdwell > 0 && sc->sc_ic.ic_bss != NULL && sc->sc_ic.ic_bss->ni_chan != NULL &&
+	if (sc->mon_coex && qwz_moncoexdwell > 0 &&
+	    sc->scan.state == ATH12K_SCAN_IDLE && !sc->sc_ic.ic_wcl_scan_requested &&
+	    !sc->mon_dwell_submitting && sc->sc_ic.ic_bss != NULL && sc->sc_ic.ic_bss->ni_chan != NULL &&
 	    sc->sc_ic.ic_bss->ni_chan->ic_freq != sc->mon_freq) {
 		/* F2e: the next visit to the cell's channel is due; the scan command is sent by the task (it may wait for a WMI credit) */
 		if (sc->mon_dwell_inflight && now - sc->mon_dwell_sent_ns > 4000000000ULL) {
@@ -1667,6 +1689,9 @@ qwz_mon_reap(void *arg)
 			    sc->mon_stats.coex_drop, qwz_moncoexcred, (unsigned int)sc->wmi.wmi[sc->pdevs[0].pdev_id].eid < (unsigned int)ATH12K_HTC_EP_COUNT ?
 			    (int)sc->htc.endpoint[sc->wmi.wmi[sc->pdevs[0].pdev_id].eid].tx_credits : -1, qwz_moncoexfilter,
 			    sc->mon_coex_swap_ring, sc->mon_stats.coex_awdl_otherfreq);	/* F2d: the swapped ring (-1 none) and the other-frequency count */
+		if (sc->mon_coex && sc->mon_stats.coex_scan_mgmt)
+			printf("qwz: mon: native scan: beacons/probe responses handed %u rssi %d..%d dBm\n",
+			    sc->mon_stats.coex_scan_mgmt, sc->mon_stats.coex_scan_rssi_min, sc->mon_stats.coex_scan_rssi_max);
 		if (sc->mon_coex && (qwz_moncoexdwell > 0 || sc->mon_stats.dwell_start))	/* F2e */
 			printf("qwz: mon: coex: dwell: asked %u onchan %u done %u fail %u lost %u; dwell %d ms rest %d ms; freq %u wrongfreq %u lastvisit %u ms ready %d\n", sc->mon_stats.dwell_start,
 			    sc->mon_stats.dwell_onchan, sc->mon_stats.dwell_done, sc->mon_stats.dwell_fail, sc->mon_stats.dwell_lost, qwz_moncoexdwell, qwz_moncoexrest,
@@ -2800,14 +2825,21 @@ qwz_mon_dwell_task_fn(void *arg)
 	struct qwz_softc *sc = (struct qwz_softc *)arg;
 	int ret;
 
-	if (sc == NULL || sc != qwz_mon_sc || !sc->mon_dwell_inflight)
+	if (sc == NULL || sc != qwz_mon_sc || !sc->mon_dwell_inflight || sc->mon_dwell_submitting)
 		return;
-	if (!sc->mon_active || !sc->mon_coex || sc->mon_coex_halt || qwz_moncoexdwell <= 0) {
+	if (!sc->mon_active || !sc->mon_coex || sc->mon_coex_halt || qwz_moncoexdwell <= 0 ||
+	    sc->scan.state != ATH12K_SCAN_IDLE || sc->sc_ic.ic_wcl_scan_requested) {
 		sc->mon_dwell_inflight = 0;
 		sc->mon_dwell_onchannel = 0;
 		return;
 	}
+	const uint32_t epoch = sc->sc_fw_epoch;
+	sc->mon_dwell_submitting = 1;
 	ret = qwz_mon_dwell_start(sc, sc->mon_freq, qwz_mon_dwell_clamp(qwz_moncoexdwell, 20, 1000));
+	sc->mon_dwell_submitting = 0;
+	/* The WMI send may sleep with the gate released across a reset. */
+	if (epoch != sc->sc_fw_epoch)
+		return;
 	if (ret) {
 		if (++sc->mon_stats.dwell_fail == 1)
 			printf("qwz: mon: coex: dwell: first visit not sent: %d\n", ret);
@@ -2818,6 +2850,40 @@ qwz_mon_dwell_task_fn(void *arg)
 	}
 	if (++sc->mon_stats.dwell_start == 1)
 		printf("qwz: mon: coex: dwell: first visit to %u MHz sent (%d ms there, %d ms rest)\n", sc->mon_freq, qwz_moncoexdwell, qwz_moncoexrest);
+}
+
+/* Called with the gate held after the station reserved SCAN_STARTING. Do not
+ * tear down the AWDL vdev, discard a firmware-owned DMA buffer, or declare a
+ * submitted visit complete. Wait for its real end (normally <=100 ms). An
+ * already queued, unsent task will see SCAN_STARTING and withdraw itself.
+ * A sender asleep on credits must return too before a station scan can start.
+ */
+int
+qwz_mon_scan_drain(struct qwz_softc *sc)
+{
+	if (!sc->mon_active || !sc->mon_coex || !sc->mon_native_owned)
+		return 0;
+	const uint32_t epoch = sc->sc_fw_epoch;
+	const uint64_t deadline = getnsecuptime() + 1500000000ULL;
+	while (sc->mon_dwell_inflight || sc->mon_dwell_submitting) {
+		if (qwz_mon_fw_unavail(sc) || epoch != sc->sc_fw_epoch)
+			return ESHUTDOWN;
+		if (sc->scan.state != ATH12K_SCAN_STARTING)
+			return EBUSY;
+		if (getnsecuptime() >= deadline) {
+			printf("qwz: mon: native scan: visit still owned by firmware/sender; scan refused\n");
+			return EBUSY;
+		}
+		int ret = tsleep_nsec(&sc->mon_dwell_inflight, 0, "qwzscyield", MSEC_TO_NSEC(10));
+		if (ret && ret != EWOULDBLOCK && ret != ETIMEDOUT)
+			return ret;
+	}
+	if (qwz_mon_fw_unavail(sc) || epoch != sc->sc_fw_epoch)
+		return ESHUTDOWN;
+	if (sc->scan.state != ATH12K_SCAN_STARTING)
+		return EBUSY;
+	printf("qwz: mon: native scan: visits yielded; listener retained on %d\n", sc->mon_chan);
+	return 0;
 }
 
 /* F2e: a visit's scan events (qwz_scan_event). The arrival on the cell's channel is counted; any end of the scan schedules the next visit. */

@@ -2408,6 +2408,7 @@ struct qwz_softc {
 	/* F2e: host-paced visits to the cell's channel (debug.qwz.moncoexdwell): one single-channel passive scan at a time on the station vdev */
 	struct task			 mon_dwell_task;
 	int				 mon_dwell_inflight, mon_dwell_onchannel;
+	int				 mon_dwell_submitting;	/* a WMI sender may sleep while a scan waits */
 	uint32_t			 mon_dwell_scan_id;	/* changes each visit, survives cell stop/restart */
 	uint64_t			 mon_dwell_arrived_ns;
 	uint64_t			 mon_dwell_next_ns, mon_dwell_sent_ns;
@@ -2446,6 +2447,8 @@ struct qwz_softc {
 		uint32_t ufr_fmt, ufr_fmtfail;	/* K4 (M1): user frames sent with a tx_params block (debug.qwz.monfmt); of those, frames whose tx_params send failed and went again without */
 		uint32_t badcookie, nolink, duplink, linkret_fail;
 		uint32_t coex_st_mgmt, coex_cell_mgmt, coex_st_data, coex_cell_data, coex_drop;
+		uint32_t coex_scan_mgmt;
+		int coex_scan_rssi_min, coex_scan_rssi_max;
 		uint32_t dwell_start, dwell_done, dwell_onchan, dwell_fail, dwell_lost;	/* F2e: visits asked, completed, arrivals on the cell's channel, refused or failed, never answered */
 		uint32_t dwell_wrongfreq, dwell_lastfreq, dwell_lastms;
 		uint32_t coex_awdl_otherfreq;	/* F2d: AWDL-BSS management frames the firmware reported on another frequency than the cell's (refused as before; evidence) */	/* K5 (L1-C6, C7, C15): while a coex cell runs, frames the claim tests sent to the station (st_*), to the cell's capture (cell_*), or dropped (drop); reset with the rest of mon_stats at cell start */

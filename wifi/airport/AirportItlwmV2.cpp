@@ -2750,7 +2750,7 @@ void AirportItlwm::engineRun()
     engineBusy = true;
     engBeginMs = now;
     engEpisodes++;
-    qwz_log("qwz: engine: ==== firmware restart: attempt %u of %u, reason %s ====\n", attempt, QWZ_FAIL_FINAL,
+    qwz_logc("qwz: engine: ==== firmware restart: attempt %u of %u, reason %s ====\n", attempt, QWZ_FAIL_FINAL,
             qwz_dead_names[reason < QWZ_DEAD_MAX ? reason : 0]);	/* not deadName(): for a user request the softc still holds the previous episode's reason */
     fHalService->setEngineState("RESTARTING", engFailCont, false);
     qwz_log_publish();
@@ -2796,7 +2796,7 @@ void AirportItlwm::engineRun()
     engFailCont = 0;
     engLastOkMs = done;
     fHalService->setEngineState("UP", 0, false);
-    qwz_log("qwz: engine: recovered in %llu ms (attempt %u)\n", done - engBeginMs, attempt);
+    qwz_logc("qwz: engine: recovered in %llu ms (attempt %u)\n", done - engBeginMs, attempt);
     qwz_log_publish();
 }
 
@@ -2810,7 +2810,7 @@ void AirportItlwm::engineNoteFailure(const char *why)
     }
     ms = n >= QWZ_FAIL_FIRST ? QWZ_COOLDOWN_MS : 2000 * n;			/* 2 s, 4 s, then 20 s, 20 s */
     engCooldownMs = pmNowMs() + ms;
-    qwz_log("qwz: engine: recovery failed (%s): %u of %u, next attempt in %u ms\n", why, n, QWZ_FAIL_FINAL, ms);
+    qwz_logc("qwz: engine: recovery failed (%s): %u of %u, next attempt in %u ms\n", why, n, QWZ_FAIL_FINAL, ms);
     fHalService->setEngineState("RETRY", n, false);
     qwz_log_publish();
     scheduleEngine(ms);
@@ -2822,7 +2822,7 @@ void AirportItlwm::engineGiveUp(const char *why)
 
     engGivenUp = true;
     fHalService->setEngineState("GIVEN_UP", engFailCont, true);
-    qwz_log("qwz: engine: ==== GIVEN UP: %s; %s. Re-arm: toggle Wi-Fi, sleep and wake, or sysctl debug.qwz.recover=2 ====\n", why,
+    qwz_logc("qwz: engine: ==== GIVEN UP: %s; %s. Re-arm: toggle Wi-Fi, sleep and wake, or sysctl debug.qwz.recover=2 ====\n", why,
             down ? "the chip stays down" : "the chip is up, but a further crash will not be restarted by itself");
     qwz_log_publish();
 }

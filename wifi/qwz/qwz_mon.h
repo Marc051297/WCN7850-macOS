@@ -126,8 +126,10 @@ struct ieee80211com;
 int	qwz_mon_holding(struct ieee80211com *);	/* hold set and cell active */
 /* K5 (L1-C5): 1 while a coex cell runs beside the station (cell active, mon_coex set, firmware up); qwz_mon_holding is 0 then */
 int	qwz_mon_coex_running(struct qwz_softc *);
-/* K5 (L1-C5): the scan policy: 1 when a scan must not reach the firmware, either the classic hold or (moncoexscan) a coex cell */
+/* Legacy diagnostic holds only; native AWDL yields visits to real scans. */
 int	qwz_mon_scan_hold(struct ieee80211com *);
+int	qwz_mon_scan_drain(struct qwz_softc *);
+int	qwz_mon_is_scan_frame(struct qwz_softc *, const uint8_t *, size_t);
 /* K5 (L1-C12): qwz_mon_coex_running for callers that only hold the ieee80211com (WCL.cpp) */
 int	qwz_mon_coex_running_ic(struct ieee80211com *);
 /*

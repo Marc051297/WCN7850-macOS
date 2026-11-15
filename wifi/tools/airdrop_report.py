@@ -20,6 +20,8 @@ process == "sharingd" OR
  (eventMessage CONTAINS[c] "BLE" OR eventMessage CONTAINS[c] "hotspot")) OR
 (process == "bluetoothd" AND
  (eventMessage CONTAINS[c] "Outgoing LE Connection complete" OR
+  eventMessage CONTAINS[c] "Received connection complete event after successful cancellation" OR
+  eventMessage CONTAINS[c] "LE Connection Cancelled with status" OR
   eventMessage CONTAINS[c] "Device connecting" OR
   eventMessage CONTAINS[c] "Bluetooth error - restarting" OR
   eventMessage CONTAINS[c] "Started advertising successfully")) OR

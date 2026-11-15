@@ -59,7 +59,7 @@ struct qwz_vif { uint8_t vdev_addr[6]; int is_up, is_started; uint32_t vdev_id; 
 struct qwz_softc {
     uint8_t sc_awdl_addr[6], mon_bssid[6];
     int sc_awdl_addr_valid, mon_bssid_set;
-    struct { uint8_t ic_myaddr[6]; ieee80211_node *ic_bss; } sc_ic;
+    struct { uint8_t ic_myaddr[6]; ieee80211_node *ic_bss; bool ic_wcl_scan_requested; } sc_ic;
     qwz_vif sc_vif, sc_monvif;
     int mon_active, mon_coex, mon_coex_halt, mon_dwell_inflight, mon_dwell_onchannel;
     uint32_t mon_freq, mon_dwell_scan_id;
@@ -160,6 +160,13 @@ int main() {
     assert(!qwz_mon_native_tx_ready() && sc.mon_stats.dwell_wrongfreq==1);
     qwz_mon_dwell_event(&sc,WMI_SCAN_EVENT_FOREIGN_CHAN,5745,0);
     assert(qwz_mon_native_tx_ready() && sc.mon_stats.dwell_onchan==1);
+    sc.scan.state=1;
+    assert(!qwz_mon_native_tx_ready());
+    assert(qwz_mon_tx_raw(frame,sizeof(frame))==EAGAIN && sent==0);
+    sc.scan.state=0; sc.sc_ic.ic_wcl_scan_requested=true;
+    assert(!qwz_mon_native_tx_ready());
+    sc.sc_ic.ic_wcl_scan_requested=false;
+    assert(qwz_mon_native_tx_ready());
     qwz_mon_dwell_event(&sc,WMI_SCAN_EVENT_FOREIGN_CHAN,5745,0);
     assert(sc.mon_stats.dwell_onchan==1); // duplicate event
     assert(qwz_mon_tx_raw(frame,sizeof(frame))==0 && sent==1);
