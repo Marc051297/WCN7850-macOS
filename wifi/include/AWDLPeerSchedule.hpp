@@ -199,7 +199,8 @@ struct PeerSchedule {
     }
     // Picks the offset where the fewest of the peer's frames fall in entries that say it's away.
     // Only when there is an away entry to tell offsets apart, and the best one is nearly clean.
-    void calibrate() {
+    void calibrate(uint32_t minimumFrames = kPeerCalibrateFrames, uint32_t minimumSeparationPercent = 0) {
+        if (binFrames < minimumFrames) return;
         unsigned away = 0;
         for (unsigned k = 0; k < kPeerSeqEntries; ++k) away += channels[k] != ourChannel;
         if (!away || away == kPeerSeqEntries) return;
@@ -212,7 +213,8 @@ struct PeerSchedule {
             if (inAway < best) { second = best; best = inAway; bestOffset = uint8_t(r); }
             else if (inAway < second) second = inAway;
         }
-        if (best * 100 > binFrames * kPeerCalibrateMaxAwayPercent || second <= best) return;
+        if (best * 100 > binFrames * kPeerCalibrateMaxAwayPercent || second <= best ||
+            uint64_t(second - best) * 100 < uint64_t(binFrames) * minimumSeparationPercent) return;
         offset = bestOffset;
         calibrated = true;
         refuted = false;

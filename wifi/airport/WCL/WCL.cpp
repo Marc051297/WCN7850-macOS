@@ -330,11 +330,11 @@ static void logWCLScanRequest(const void *request, const AirportWCL::ScanRequest
     if (p && !(launched && !list && !(scan && scan->ssidLength)))
         snprintf(famWords, sizeof(famWords), " family flags 0x%x active %u passive %u rest %u", AirportWCL::read32(p + 0x44), AirportWCL::read32(p + 0x48),
                  AirportWCL::read32(p + 0x4c), AirportWCL::read32(p + 0x50));
-    qwz_log("airport: WCL scan req%s #%u: id %u type %u ssid_len %u ssid_hash %08x bssid %s ch %u first%s list %u | "
+    qwz_log("airport: WCL scan req%s #%u: id %u type %u ssid_len %u ssid_hash %08x bssid %s ch %u first%s list %u probes %u | "
             "state %s idle %d scanPending %d joinPending %d bgscan %d skip %d%s | %s (%s)%s\n",
             launched && !list && !(scan && scan->ssidLength) ? "" : "!", seq, p ? AirportWCL::read32(p) : 0, p ? AirportWCL::read32(p + 0x40) : 0,
             p ? AirportWCL::read32(p + 0x1c) : 0, scan ? wclScanHash(scan->ssid, scan->ssidLength) : 0,
-            zero ? "zero" : "set", scan ? scan->channelCount : (p ? AirportWCL::read32(p + 0x54) : 0), chans, list,
+            zero ? "zero" : "set", scan ? scan->channelCount : (p ? AirportWCL::read32(p + 0x54) : 0), chans, list, scan ? scan->probeSSIDCount : 0,
             st.state >= 0 && st.state < IEEE80211_S_MAX ? ieee80211_state_name[st.state] : "?", st.idle,
             st.scanPending, st.joinPending, st.bgscan, st.skip, prev, outcome, detail, famWords);
 #ifdef QWZ_DEBUG
@@ -384,8 +384,10 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         if (wclScanDecodeFault(request, fault, sizeof(fault)))
             scanLog("decode-failure", fault);
     }
-    if (!AirportWCL::decodeScan(request, 0x1550, scan))
+    if (!AirportWCL::decodeScan(request, 0x1550, scan)) {
+        scanLog("BadArgument", "scan or SSID list validation failed");
         return kIOReturnBadArgument;
+    }
     scanDecoded = true;
     ieee80211com *ic = fHalService->get80211Controller();
     // S2: the same gates as the statements below, in the same order; each logs its outcome and only the first one that holds is reached.
@@ -459,6 +461,13 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     ic->ic_wcl_scan_active = scan.type != 2;
     ic->ic_wcl_scan_ssid_length = scan.type == 2 ? 0 : scan.ssidLength;
     memcpy(ic->ic_wcl_scan_ssid, scan.ssid, sizeof(scan.ssid));
+    static_assert(sizeof(ic->ic_wcl_scan_ssids) / sizeof(ic->ic_wcl_scan_ssids[0]) == AirportWCL::kScanSSIDCapacity,
+                  "WCL and firmware scan SSID capacities must agree");
+    ic->ic_wcl_scan_ssid_count = scan.type == 2 ? 0 : scan.probeSSIDCount;
+    for (unsigned i = 0; i < ic->ic_wcl_scan_ssid_count; ++i) {
+        ic->ic_wcl_scan_ssid_lengths[i] = scan.probeSSIDs[i].length;
+        memcpy(ic->ic_wcl_scan_ssids[i], scan.probeSSIDs[i].bytes, 32);
+    }
     ic->ic_wcl_scan_restricted = scan.channelCount != 0;
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
     scanSource->setTimeoutMS(20000);

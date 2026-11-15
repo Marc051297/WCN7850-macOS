@@ -37,6 +37,7 @@ public:
     // Frames macOS has queued that the driver hasn't taken yet.
     unsigned queuedTransmit() const { return transmitQueued; }
     unsigned heldShortTransmit() const { return transmitHeldShort; }
+    bool copyTransmitDestination(uint8_t *) const;
     IOReturn initializeNetwork(IO80211Controller*, IOWorkLoop*, const ether_addr&);
     IOReturn receiveManagementFrame(IO80211Controller*, const uint8_t*, size_t, uint32_t, int32_t);
     void stop(IOService*) override;

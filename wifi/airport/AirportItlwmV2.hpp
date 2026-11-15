@@ -40,6 +40,9 @@
 #include "AirportWCN7850AWDLBridge.h"
 /* F1 (native AWDL): defines ITL_AWDL_NATIVE for Tahoe WCL builds (from ForbiddenItlwm). */
 #include <ItlAWDLTargets.hpp>
+#if defined(ITL_AWDL_NATIVE)
+#include <AWDLNativePeerTiming.hpp>
+#endif
 
 enum
 {
@@ -410,6 +413,7 @@ public:
     bool serviceAWDLTransmit();
     unsigned queuedAWDLTransmit();
     unsigned heldShortAWDLTransmit();
+    bool copyAWDLTransmitDestination(uint8_t *);
     void teardownAWDLInterface();
     IO80211VirtualInterface *fAWDLInterface;
     bool awdlInterfaceTest;		/* -qwzawdlnative and the build guard agreed: the native path is on */
@@ -430,6 +434,11 @@ public:
     uint64_t awdlNativeLastSyncUS, awdlNativeLastDataUS, awdlNativeLastPublishUS;
     uint64_t awdlNativeLastRxBytes, awdlNativeLastAckedBytes;
     int awdlNativeRssiFallback;		/* itlawdlrssi=N (dBm) stands in when the capture path has no RSSI; default -60 */
+#if defined(ITL_AWDL_NATIVE)
+    ItlAWDL::NativePeerTiming awdlNativePeerTiming;
+    bool awdlNativePeerTimingEnabled;
+    int awdlNativeTimingCell;
+#endif
     struct {
         uint64_t timerTicks, cellTimerTicks;
         uint64_t rxAction, rxActionHanded, rxActionRefused, rxActionTrimmed, rxActionTooLong;

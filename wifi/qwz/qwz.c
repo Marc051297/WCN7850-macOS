@@ -806,6 +806,7 @@ stopped:
 	ic->ic_wcl_scan_requested = false;
 	ic->ic_wcl_scan_active = false;
 	ic->ic_wcl_scan_ssid_length = 0;
+	ic->ic_wcl_scan_ssid_count = 0;
 	ic->ic_wcl_scan_idle = false;
 	if (ic->ic_event_handler)
 		ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_STOPPED, NULL);
@@ -26829,7 +26830,21 @@ qwz_scan(struct qwz_softc *sc)
 	 */
 	if (ic->ic_wcl_scan_requested &&
 	    AirportWCL::scanUsesProbes(true, ic->ic_wcl_scan_active)) {
-		if (ic->ic_wcl_scan_ssid_length > 0 &&
+		if (ic->ic_wcl_scan_ssid_count > 0 &&
+		    ic->ic_wcl_scan_ssid_count <= nitems(ic->ic_wcl_scan_ssids) &&
+		    ic->ic_wcl_scan_ssid_count <= nitems(arg->ssid)) {
+			arg->num_ssids = ic->ic_wcl_scan_ssid_count;
+			for (unsigned i = 0; i < arg->num_ssids; ++i) {
+				arg->ssid[i].length = ic->ic_wcl_scan_ssid_lengths[i];
+				if (arg->ssid[i].length > sizeof(arg->ssid[i].ssid)) {
+					ret = EINVAL;
+					goto exit;
+				}
+				memcpy(arg->ssid[i].ssid, ic->ic_wcl_scan_ssids[i], arg->ssid[i].length);
+				if (arg->ssid[i].length == 0)
+					arg->scan_f_bcast_probe = 1;
+			}
+		} else if (ic->ic_wcl_scan_ssid_length > 0 &&
 		    ic->ic_wcl_scan_ssid_length <= IEEE80211_NWID_LEN) {
 			arg->num_ssids = 1;
 			arg->ssid[0].length = ic->ic_wcl_scan_ssid_length;

@@ -67,6 +67,10 @@ void AirportItlwm::awdlNativeRadioStart()
 	memset(&awdlNativeStats, 0, sizeof(awdlNativeStats));
 	awdlNativeLastSyncUS = awdlNativeLastDataUS = awdlNativeLastPublishUS = 0;
 	awdlNativeLastRxBytes = awdlNativeLastAckedBytes = 0;
+	awdlNativePeerTiming.reset();
+	awdlNativeTimingCell = 0;
+	int timingOff = 0;
+	awdlNativePeerTimingEnabled = !PE_parse_boot_argn("-qwzawdlpeerpauseoff", &timingOff, sizeof(timingOff));
 	if (awdlNativeScratch == nullptr)
 		awdlNativeScratch = static_cast<uint8_t *>(IOMalloc(kScratchBytes));
 	awdlNativeTimer = IOTimerEventSource::timerEventSource(this, awdlNativeTimerFired);
@@ -86,13 +90,15 @@ void AirportItlwm::awdlNativeRadioStart()
 	qwz_mon_native_auto_enable(!PE_parse_boot_argn("-qwzawdlmanual", &manual, sizeof(manual)));
 	awdlNativeTimer->setTimeoutMS(50);
 	setProperty("QwzAWDLRadio", "started");
-	setProperty("QwzAWDLRadioBuild", "f2o-live-scan-yield");
+	setProperty("QwzAWDLRadioBuild", "f2p-peer-window-pacing");
+	setProperty("QwzAWDLPeerTimingEnabled", awdlNativePeerTimingEnabled);
 	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
 	qwz_log_publish();
 }
 
 void AirportItlwm::awdlNativeRadioStop()
 {
+	awdlNativePeerTiming.clearPeers();
 	qwz_mon_set_native_rx(nullptr, nullptr);
 	if (fHalService != nullptr)
 		static_cast<ItlQwz *>(fHalService)->setAwdlAddress(nullptr);
@@ -134,6 +140,8 @@ void AirportItlwm::awdlNativeRadioInput(const uint8_t *frame, size_t len, uint16
 		size_t frameLength = fcs ? body : ItlAWDL::trimZeroPadding(frame, body);
 		if (frameLength != body)
 			++st.rxActionTrimmed;
+		if (awdlNativePeerTimingEnabled)
+			awdlNativePeerTiming.noteAction(frame, frameLength, chan, nowUS());
 		if (rssi == 0) {
 			rssi = int8_t(awdlNativeRssiFallback);
 			++st.rssiFallbacks;
@@ -167,6 +175,8 @@ void AirportItlwm::awdlNativeRadioInput(const uint8_t *frame, size_t len, uint16
 		return;
 	}
 	if (type == 2) {
+		if (awdlNativePeerTimingEnabled)
+			awdlNativePeerTiming.noteData(frame, len, fcs, chan, nowUS());
 		++st.rxData;
 		const uint8_t *buf = frame;
 		size_t n = len;
@@ -198,6 +208,10 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 	if (ready)
 		qwz_mon_native_auto_tick();
 	const int cell = ready ? qwz_mon_status() : 0;
+	if (cell != self->awdlNativeTimingCell) {
+		self->awdlNativePeerTiming.clearPeers();
+		self->awdlNativeTimingCell = cell;
+	}
 	const uint64_t now = nowUS();
 	bool pending = false;
 	if (cell > 0)
@@ -228,6 +242,10 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 		// A send spends a WMI credit. Recheck before dequeuing each packet;
 		// the slot count alone can outlive the available transport credit.
 		while (budget > 0 && qwz_mon_native_tx_ready() && qwz_mon_tx_room() > 0) {
+			uint8_t destination[6];
+			if (self->awdlNativePeerTimingEnabled && self->copyAWDLTransmitDestination(destination) &&
+			    self->awdlNativePeerTiming.hold(destination, uint8_t(cell), nowUS()))
+				break;	/* keep FIFO ownership/order/sequence; completions below still run */
 			mbuf_t m = nullptr;
 			if (self->buildAWDLTransmit(&m) != kIOReturnSuccess || m == nullptr)
 				break;
@@ -283,6 +301,10 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 			put("txDataAckedBytes", tx.acked_bytes); put("txDataAcked", tx.acked); put("txDataFailed", tx.failed);
 			put("txDataNoAck", tx.noack); put("txInflight", tx.inflight);
 			put("txAckedBytesPerSecond", txRate); put("rxBytesPerSecond", rxRate);
+			put("timedPeers", self->awdlNativePeerTiming.known(now));
+			put("peerHoldChecks", self->awdlNativePeerTiming.holdChecks);
+			put("peerForcedReleases", self->awdlNativePeerTiming.forcedReleases);
+			put("peerTimingResets", self->awdlNativePeerTiming.resets);
 			self->setProperty("QwzAWDLRadioStats", d);
 			self->setProperty("QwzAWDLRadioAuto", qwz_mon_native_auto_state());
 			d->release();

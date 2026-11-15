@@ -32,6 +32,7 @@ struct Packet { uint8_t byte; };
 using mbuf_t=Packet *;
 static int credits=2, reserve=1, ready=1, sent, freed, dequeued, roomChecks;
 static int closeAfterSend, syncResult, syncCalls;
+static bool peerHeld=false;
 static int cell=149,autoTicks,services;
 static uint64_t mockNow=1000000;
 static uint64_t nowUS() {return mockNow;}
@@ -60,6 +61,13 @@ struct MockSelf {
     int queued=40;
     bool awdlInterfaceTest=true,awdlManagementInputEnabled=true;
     void *fAWDLInterface=this;
+    bool awdlNativePeerTimingEnabled=true;
+    int awdlNativeTimingCell=0;
+    struct Timing {
+        bool hold(const uint8_t *,uint8_t,uint64_t) {return peerHeld;}
+        void clearPeers() {}
+    } awdlNativePeerTiming;
+    bool copyAWDLTransmitDestination(uint8_t *a) {a[0]=2;return queued>0;}
     bool serviceAWDLTransmit() {++services;return queued>0;}
     unsigned queuedAWDLTransmit() {return queued;}
     IOReturn buildAWDLTransmit(mbuf_t *p) {
@@ -131,6 +139,16 @@ int main() {
     assert(self.awdlNativeStats.syncBuildFailures==1); // historical counter
     assert(!self.awdlNativeStats.dataTxErrors);
     assert(roomChecks>0);
+    // Holding a calibrated peer leaves FIFO ownership intact. Completion
+    // service runs even when no packet may be removed for that peer.
+    credits=100;peerHeld=true;
+    const int queued=self.queued,wasDequeued=dequeued,wasServiced=services;
+    self.awdlNativeLastSyncUS=mockNow;
+    assert(tick(&self) && dequeued==wasDequeued && self.queued==queued);
+    assert(services==wasServiced+1);
+    self.awdlNativePeerTimingEnabled=false;
+    pump(&self,mockNow);
+    assert(dequeued>wasDequeued); // boot-argument opt-out keeps original path
     puts("ok: radio pump preserves queued packets when credits/window close; sync diagnostics recover");
 }
 '''

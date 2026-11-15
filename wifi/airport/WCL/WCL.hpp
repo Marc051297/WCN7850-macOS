@@ -448,6 +448,11 @@ inline bool probeChannel(bool active, bool passiveOnly, bool dfs) {
     return active && !passiveOnly && !dfs;
 }
 
+constexpr unsigned kScanSSIDCapacity = 11; // primary plus at most ten native list entries
+struct ScanSSID {
+    uint8_t length;
+    uint8_t bytes[32];
+};
 struct ScanRequest {
     uint32_t identifier;
     uint32_t type;
@@ -456,14 +461,28 @@ struct ScanRequest {
     uint8_t bssid[6];
     uint32_t channelCount;
     uint8_t channels[32];
+    uint8_t probeSSIDCount;
+    ScanSSID probeSSIDs[kScanSSIDCapacity];
 };
+
+inline bool addScanSSID(ScanRequest &scan, const uint8_t *bytes, uint32_t length) {
+    if (length > 32 || (!bytes && length)) return false;
+    for (unsigned i = 0; i < scan.probeSSIDCount; ++i)
+        if (scan.probeSSIDs[i].length == length &&
+            (!length || !memcmp(scan.probeSSIDs[i].bytes, bytes, length))) return true;
+    if (scan.probeSSIDCount >= kScanSSIDCapacity) return false;
+    auto &entry = scan.probeSSIDs[scan.probeSSIDCount++];
+    entry.length = uint8_t(length);
+    if (length) memcpy(entry.bytes, bytes, length);
+    return true;
+}
 
 inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsigned channel) {
     return !restricted || (channel < 256 && (channels[channel / 8] & (1U << (channel % 8))));
 }
 
 // List-bearing tether scans have an empty primary SSID. The list's count is
-// independently known at +0x1318; its payload layout is handled separately.
+// at +0x1318. This includes an explicit wildcard entry, when supplied.
 inline bool scanNeedsRadio(const ScanRequest &scan, const void *buffer, size_t length) {
     if (scan.ssidLength)
         return true;
@@ -482,13 +501,30 @@ inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
     if (count > 400 || ssidLength > 32 || type < 1 || type > 4 ||
         length < 0x58 + size_t(count) * 12)
         return false;
-    out = {};
-    out.identifier = read32(p);
-    out.type = type;
-    out.ssidLength = ssidLength;
-    out.channelCount = count;
-    memcpy(out.ssid, p + 0x20, ssidLength);
-    memcpy(out.bssid, p + 0x14, 6);
+    ScanRequest decoded = {};
+    decoded.identifier = read32(p);
+    decoded.type = type;
+    decoded.ssidLength = ssidLength;
+    decoded.channelCount = count;
+    memcpy(decoded.ssid, p + 0x20, ssidLength);
+    memcpy(decoded.bssid, p + 0x14, 6);
+    if (ssidLength && !addScanSSID(decoded, p + 0x20, ssidLength)) return false;
+    if (length >= 0x131c) {
+        const uint32_t listCount = read32(p + 0x1318);
+        if (listCount > 10 || listCount > (length - 0x131c) / 56) return false;
+        for (unsigned i = 0; i < listCount; ++i) {
+            // Native 25G342 capture: 56-byte entries, version at +0,
+            // length at +4, SSID at +8; an all-zero entry is a wildcard.
+            const uint8_t *entry = p + 0x131c + i * 56;
+            const uint32_t version = read32(entry), size = read32(entry + 4);
+            if (version != 1) {
+                bool empty = true;
+                for (unsigned k = 0; k < 56; ++k) empty &= entry[k] == 0;
+                if (!empty) return false;
+            }
+            if (!addScanSSID(decoded, entry + 8, size)) return false;
+        }
+    }
     // Native entries are apple80211_channel: version, channel, flags (12 bytes).
     for (uint32_t i = 0; i < count; ++i) {
         const uint8_t *entry = p + 0x58 + size_t(i) * 12;
@@ -498,8 +534,9 @@ inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
             continue;
         if (((flags & 0x8) && channel > 14) || ((flags & 0x10) && channel <= 14))
             continue;
-        out.channels[channel / 8] |= 1U << (channel % 8);
+        decoded.channels[channel / 8] |= 1U << (channel % 8);
     }
+    out = decoded;
     return true;
 }
 

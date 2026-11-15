@@ -446,6 +446,9 @@ struct ieee80211com {
     bool ic_wcl_scan_active;
     uint8_t ic_wcl_scan_ssid_length;
     uint8_t ic_wcl_scan_ssid[32];
+    uint8_t ic_wcl_scan_ssid_count;
+    uint8_t ic_wcl_scan_ssid_lengths[11];
+    uint8_t ic_wcl_scan_ssids[11][32];
     bool ic_wcl_scan_restricted;
     uint8_t ic_wcl_scan_channels[32];
     uint32_t ic_wcl_scan_away_time_ms;

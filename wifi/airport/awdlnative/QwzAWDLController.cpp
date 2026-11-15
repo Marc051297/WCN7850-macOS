@@ -313,6 +313,13 @@ IOReturn AirportItlwm::buildAWDLTransmit(mbuf_t *packet, const uint8_t *holdPayl
     return kIOReturnSuccess;
 }
 
+bool AirportItlwm::copyAWDLTransmitDestination(uint8_t *destination)
+{
+    if (!_fWorkloop || !_fWorkloop->inGate() || !awdlManagementInputEnabled || !fAWDLInterface)
+        return false;
+    return static_cast<QwzAWDLInterface *>(fAWDLInterface)->copyTransmitDestination(destination);
+}
+
 // How many frames macOS has queued on awdl0 that the driver hasn't taken yet, for diagnostics only.
 unsigned AirportItlwm::queuedAWDLTransmit()
 {

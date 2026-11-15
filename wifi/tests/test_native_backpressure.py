@@ -93,6 +93,7 @@ struct QwzAWDLInterface {
     template<class... T> void setProperty(T...) {}
     UInt32 acceptTransmit(IOSkywalkPacket *const *,UInt32);
     bool serviceTransmit();
+    bool copyTransmitDestination(uint8_t *) const;
     bool popTransmit(uint8_t *,size_t,size_t *,const uint8_t * = nullptr,bool = false);
 };
 void MockQueue::dequeue() {
@@ -112,7 +113,7 @@ static bool pop(QwzAWDLInterface &i,unsigned expected) {
     return true;
 }
 '''
-code += "\n" + "\n".join(function(n) for n in ("acceptTransmit", "popTransmit", "serviceTransmit"))
+code += "\n" + "\n".join(function(n) for n in ("acceptTransmit", "copyTransmitDestination", "popTransmit", "serviceTransmit"))
 code += r'''
 int main() {
     QwzAWDLInterface i;
@@ -127,6 +128,10 @@ int main() {
     q.dequeue();
     assert(i.transmitQueued==4 && i.transmitAccepted==4 && q.waiting.size()==8);
     assert(i.transmitBackpressured && !i.transmitDropped);
+    uint8_t destination[6]{};
+    assert(i.copyTransmitDestination(destination) && destination[0]==4);
+    assert(i.transmitQueued==4 && i.transmitSequence==0 && !i.transmitPopped);
+    assert(!i.copyTransmitDestination(nullptr));
     const unsigned callbacks=q.callbacks;
     i.serviceTransmit(); // completion space alone cannot resume a full FIFO
     assert(q.completed.size()==4 && q.requests==0 && q.callbacks==callbacks);
@@ -144,6 +149,7 @@ int main() {
         assert(pop(i,n)); i.serviceTransmit();
     }
     assert(!pop(i,12) && !i.serviceTransmit());
+    assert(!i.copyTransmitDestination(destination));
     assert(q.waiting.empty() && q.completed.size()==12 && i.transmitAccepted==12);
     assert(i.transmitCompleted==12 && !i.transmitDropped && !i.transmitBackpressured);
     for(unsigned n=0;n<12;++n) assert(q.completed[n]==&packets[n]);

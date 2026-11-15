@@ -455,6 +455,14 @@ UInt32 QwzAWDLInterface::acceptTransmit(IOSkywalkPacket *const *packets, UInt32 
     return accepted;
 }
 
+bool QwzAWDLInterface::copyTransmitDestination(uint8_t *destination) const
+{
+    if (!destination || !transmitFrames || !transmitQueued || transmitFrames[transmitHead].length < 14)
+        return false;
+    memcpy(destination, transmitFrames[transmitHead].bytes, 6);
+    return true;
+}
+
 bool QwzAWDLInterface::popTransmit(uint8_t *output, size_t available, size_t *written,
                                    const uint8_t *holdPayloadFor, bool holdEverySize)
 {
