@@ -11,6 +11,7 @@
 #include "qwzvar.h"
 #include "qwz_sysctl.h"
 #include "qwz_mon.h"
+#include "qwz_signal.h"
 #undef malloc
 #undef free
 #undef wakeup
@@ -1484,7 +1485,23 @@ ItlQwz::getFirmwareVersion()
 int16_t
 ItlQwz::getBSSNoise()
 {
-	return -95;	/* dBm; getNOISE() and scan results must not negate */
+	struct ieee80211com *ic = sc ? &sc->sc_ic : NULL;
+	if (!ic || ic->ic_state != IEEE80211_S_RUN || !ic->ic_bss ||
+	    !ic->ic_bss->ni_chan || ic->ic_bss->ni_chan == IEEE80211_CHAN_ANYC)
+		return 0;
+	return getChannelNoise(ic->ic_bss->ni_chan->ic_freq);
+}
+
+int16_t
+ItlQwz::getChannelNoise(uint32_t frequency)
+{
+	return qwz_signal_noise(sc, frequency);
+}
+
+int
+ItlQwz::getChannelBusy(uint32_t frequency)
+{
+	return qwz_signal_busy(sc, frequency);
 }
 
 bool

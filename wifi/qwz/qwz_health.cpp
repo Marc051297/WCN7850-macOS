@@ -15,6 +15,7 @@
 #include "qwzvar.h"
 #include "qwz_awdlx.h"
 #include "qwz_mon.h"	/* merge glue (I): qwz_mon_hold */
+#include "qwz_signal.h"
 
 /*
  * Statistics (C26): sc->sc_stat[] is indexed by QWZ_STAT_* (qwzvar.h); these
@@ -142,6 +143,7 @@ qwz_health_log(struct qwz_softc *sc, unsigned int wdskip)
 
 	if (sc == NULL)
 		return;
+	qwz_signal_log(sc);
 	life = __atomic_load_n(&sc->sc_life, __ATOMIC_ACQUIRE);
 	qwz_pci_cached_ee_state(sc, &ee, &mhi);
 	if ((unsigned int)sc->wmi.wmi[0].eid < (unsigned int)ATH12K_HTC_EP_COUNT)

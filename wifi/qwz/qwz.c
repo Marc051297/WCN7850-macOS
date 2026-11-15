@@ -97,6 +97,7 @@ hweight8(uint8_t x)
 
 #include "qwzreg.h"
 #include "qwzvar.h"
+#include "qwz_signal.h"
 #include "qwz_awdlx.h"	/* M2a (WP3): the AWDL evidence layer, log only */
 
 /*
@@ -12703,18 +12704,18 @@ qwz_pull_chan_info_ev(struct qwz_softc *sc, uint8_t *evt_buf, uint32_t len,
 		return EPROTO;
 	}
 
-	ch_info_ev->err_code = ev->err_code;
-	ch_info_ev->freq = ev->freq;
-	ch_info_ev->cmd_flags = ev->cmd_flags;
-	ch_info_ev->noise_floor = ev->noise_floor;
-	ch_info_ev->rx_clear_count = ev->rx_clear_count;
-	ch_info_ev->cycle_count = ev->cycle_count;
-	ch_info_ev->chan_tx_pwr_range = ev->chan_tx_pwr_range;
-	ch_info_ev->chan_tx_pwr_tp = ev->chan_tx_pwr_tp;
-	ch_info_ev->rx_frame_count = ev->rx_frame_count;
-	ch_info_ev->tx_frame_cnt = ev->tx_frame_cnt;
-	ch_info_ev->mac_clk_mhz = ev->mac_clk_mhz;
-	ch_info_ev->vdev_id = ev->vdev_id;
+	ch_info_ev->err_code = le32toh(ev->err_code);
+	ch_info_ev->freq = le32toh(ev->freq);
+	ch_info_ev->cmd_flags = le32toh(ev->cmd_flags);
+	ch_info_ev->noise_floor = le32toh(ev->noise_floor);
+	ch_info_ev->rx_clear_count = le32toh(ev->rx_clear_count);
+	ch_info_ev->cycle_count = le32toh(ev->cycle_count);
+	ch_info_ev->chan_tx_pwr_range = le32toh(ev->chan_tx_pwr_range);
+	ch_info_ev->chan_tx_pwr_tp = le32toh(ev->chan_tx_pwr_tp);
+	ch_info_ev->rx_frame_count = le32toh(ev->rx_frame_count);
+	ch_info_ev->tx_frame_cnt = le32toh(ev->tx_frame_cnt);
+	ch_info_ev->mac_clk_mhz = le32toh(ev->mac_clk_mhz);
+	ch_info_ev->vdev_id = le32toh(ev->vdev_id);
 
 	free(tb, M_DEVBUF, WMI_TAG_MAX * sizeof(*tb));
 	return 0;
@@ -12736,6 +12737,9 @@ qwz_chan_info_event(struct qwz_softc *sc, struct mbuf *m)
 		    sc->sc_dev.dv_xname);
 		return;
 	}
+	++sc->sc_signal_wmi_events;
+	sc->sc_signal_last_flags = ch_info_ev.cmd_flags;
+	sc->sc_signal_last_error = ch_info_ev.err_code;
 
 	DNPRINTF(QWZ_D_WMI, "%s: event chan info vdev_id %d err_code %d "
 	    "freq %d cmd_flags %d noise_floor %d rx_clear_count %d "
@@ -12760,6 +12764,12 @@ qwz_chan_info_event(struct qwz_softc *sc, struct mbuf *m)
 #endif
 		return;
 	}
+	// Passive observation of actual channel measurements, including the
+	// home-channel report on return from ROC while scan state is IDLE.
+	// No unsupported BSS-survey command is sent to obtain these records.
+	if (ch_info_ev.err_code == 0 && ch_info_ev.cmd_flags == WMI_CHAN_INFO_START_RESP)
+		qwz_signal_record(sc, ch_info_ev.freq, ch_info_ev.noise_floor,
+		    ch_info_ev.cycle_count, ch_info_ev.rx_clear_count);
 #ifdef notyet
 	spin_lock_bh(&ar->data_lock);
 #endif
@@ -12793,8 +12803,10 @@ qwz_chan_info_event(struct qwz_softc *sc, struct mbuf *m)
 		survey = &sc->survey[idx];
 		memset(survey, 0, sizeof(*survey));
 		survey->noise = ch_info_ev.noise_floor;
-		survey->time = ch_info_ev.cycle_count / cc_freq_hz;
-		survey->time_busy = ch_info_ev.rx_clear_count / cc_freq_hz;
+		if (cc_freq_hz) {
+			survey->time = ch_info_ev.cycle_count / cc_freq_hz;
+			survey->time_busy = ch_info_ev.rx_clear_count / cc_freq_hz;
+		}
 	}
 exit:
 #ifdef notyet

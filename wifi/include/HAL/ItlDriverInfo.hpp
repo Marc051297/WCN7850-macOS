@@ -22,6 +22,9 @@ public:
     virtual const char *getFirmwareVersion() = 0;
     
     virtual int16_t getBSSNoise() = 0;
+    /* 0 noise / -1 busy means unavailable, never an invented measurement. */
+    virtual int16_t getChannelNoise(uint32_t frequency) { return 0; }
+    virtual int getChannelBusy(uint32_t frequency) { return -1; }
     
     virtual bool is5GBandSupport() = 0;
     

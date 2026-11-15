@@ -33,6 +33,8 @@
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "QwzSignal.hpp"
+
 #ifdef QWZ_DEBUG
 #define DPRINTF(x...)		do { if (qwz_debug) printf(x); } while(0)
 #define DNPRINTF(n,x...)	do { if (qwz_debug & n) printf(x); } while(0)
@@ -2142,6 +2144,10 @@ struct qwz_softc {
 	} scan;
 	u_int			scan_channel;
 	struct qwz_survey_info	survey[IEEE80211_CHAN_MAX];
+	QwzSignal::Reading	sc_signal[IEEE80211_CHAN_MAX];
+	uint32_t		sc_signal_events, sc_signal_noise_samples, sc_signal_busy_samples;
+	uint32_t		sc_signal_rejected, sc_signal_last_freq, sc_signal_last_raw_noise;
+	uint32_t		sc_signal_wmi_events, sc_signal_last_flags, sc_signal_last_error;
 
 	int			attached;
 	int			fw_initialized;

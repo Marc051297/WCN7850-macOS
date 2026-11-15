@@ -36,6 +36,8 @@ public:
 	/* ItlDriverInfo */
 	const char *getFirmwareVersion() override;
 	int16_t getBSSNoise() override;
+	int16_t getChannelNoise(uint32_t frequency) override;
+	int getChannelBusy(uint32_t frequency) override;
 	bool is5GBandSupport() override;
 	int getTxNSS() override;
 	const char *getFirmwareName() override;

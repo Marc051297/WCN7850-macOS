@@ -92,8 +92,8 @@ struct LqmBeaconUpdate {
     uint8_t reserved0[3];
     int32_t rssi;                 // dBm
     uint8_t reserved1[3];
-    uint8_t unknown0bValid;
-    uint16_t unknown0c;
+    uint8_t snrValid;
+    int16_t snr;                  // dB, derived only from measured RSSI/noise
     uint8_t noiseValid;
     uint8_t reserved2;
     int16_t noise;                // dBm
@@ -110,41 +110,41 @@ struct LqmBeaconUpdate {
 };
 static_assert(sizeof(LqmBeaconUpdate) == 0x1dc, "WCL LQM update size");
 static_assert(offsetof(LqmBeaconUpdate, rssi) == 0x4, "WCL LQM RSSI offset");
+static_assert(offsetof(LqmBeaconUpdate, snrValid) == 0xb, "WCL LQM SNR valid offset");
+static_assert(offsetof(LqmBeaconUpdate, snr) == 0xc, "WCL LQM SNR offset");
 static_assert(offsetof(LqmBeaconUpdate, noiseValid) == 0xe, "WCL LQM noise valid offset");
 static_assert(offsetof(LqmBeaconUpdate, noise) == 0x10, "WCL LQM noise offset");
 static_assert(offsetof(LqmBeaconUpdate, cca) == 0x13, "WCL LQM CCA offset");
 static_assert(offsetof(LqmBeaconUpdate, receivedDelta) == 0x28, "WCL beacon delta offset");
 static_assert(offsetof(LqmBeaconUpdate, beaconValid) == 0x30, "WCL beacon valid offset");
 static_assert(offsetof(LqmBeaconUpdate, snapshotValid) == 0x1d8, "WCL snapshot valid offset");
-inline bool makeBeaconUpdate(uint32_t receivedDelta, int rssi, int noise, LqmBeaconUpdate &out)
+inline bool makeBeaconUpdate(uint32_t receivedDelta, int rssi, int noise, LqmBeaconUpdate &out,
+                             int measuredBusy = -1)
 {
     out = {};
     if (!receivedDelta)
         return false;
     out.receivedDelta = receivedDelta;
-    out.scheduledDelta = receivedDelta;  /* assume all expected beacons arrived */
-    out.beaconValid = out.snapshotValid = out.countersValid = 1;
-    if (rssi < 0) {
+    // We counted received beacons, not scheduled ones. Do not report zero
+    // loss by inventing an equal scheduled count. Radio fields stand alone.
+    out.snapshotValid = 1;
+    if (rssi >= -127 && rssi < 0) {
         out.rssiValid = 1;
         out.rssi = rssi;
     }
-    if (noise < 0) {
+    if (noise >= -127 && noise < -1) {
         out.noiseValid = 1;
         out.noise = (int16_t)noise;
     }
-    /* CCA: estimate channel busy percentage from SNR.
-     * Strong signal (SNR>30) → low CCA (~10%). Weak signal → higher CCA.
-     * This gives WCL a non-zero congestion metric to factor into LQM. */
-    if (rssi < 0 && noise < 0) {
-        int snr = rssi - noise;
-        uint8_t estimated_cca;
-        if (snr >= 40) estimated_cca = 5;
-        else if (snr >= 30) estimated_cca = 15;
-        else if (snr >= 20) estimated_cca = 30;
-        else if (snr >= 10) estimated_cca = 50;
-        else estimated_cca = 70;
+    if (out.rssiValid && out.noiseValid && rssi >= noise) {
+        out.snrValid = 1;
+        out.snr = int16_t(rssi - noise);
+    }
+    // Signal strength cannot establish channel occupancy. Only a valid
+    // firmware busy/cycle counter ratio is accepted here, including 0%.
+    if (measuredBusy >= 0 && measuredBusy <= 100) {
         out.ccaValid = 1;
-        out.cca = estimated_cca;
+        out.cca = uint8_t(measuredBusy);
     }
     return true;
 }

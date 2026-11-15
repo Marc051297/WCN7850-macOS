@@ -905,14 +905,18 @@ IOReturn AirportItlwmSkywalkInterface::
 getRSSI(struct apple80211_rssi_data *rd)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
-    if (ic->ic_state == IEEE80211_S_RUN) {
+    if (rd && ic->ic_state == IEEE80211_S_RUN && ic->ic_bss) {
+        const int rssi = rssiForNode(ic->ic_bss);
+        if (rssi >= 0 || rssi < -127)
+            return 6; // No RSSI sample; do not publish 0 dBm as full signal.
         memset(rd, 0, sizeof(*rd));
+        rd->version = APPLE80211_VERSION;
         rd->num_radios = 1;
         rd->rssi_unit = APPLE80211_UNIT_DBM;
         rd->rssi[0] = rd->aggregate_rssi
         = rd->rssi_ext[0]
         = rd->aggregate_rssi_ext
-        = rssiForNode(ic->ic_bss);	/* dBm (qwz stores dBm, not iwm's offset from -100), smoothed */
+        = rssi;	/* dBm, smoothed; no Intel-style offset */
         return kIOReturnSuccess;
     }
     return 6;
@@ -981,11 +985,14 @@ getNOISE(struct apple80211_noise_data *nd)
 {
     struct ieee80211com *ic = fHalService->get80211Controller();
     if (ic->ic_state == IEEE80211_S_RUN) {
+        const int16_t noise = fHalService->getDriverInfo()->getBSSNoise();
+        if (noise >= -1 || noise < -127)
+            return 6; // No valid current-channel noise measurement.
         memset(nd, 0, sizeof(*nd));
         nd->version = APPLE80211_VERSION;
         nd->num_radios = 1;
         nd->noise[0]
-        = nd->aggregate_noise = fHalService->getDriverInfo()->getBSSNoise();  /* already dBm */
+        = nd->aggregate_noise = noise;
         nd->noise_unit = APPLE80211_UNIT_DBM;
         return kIOReturnSuccess;
     }
@@ -1288,7 +1295,7 @@ static int convertNodeToScanResult(ItlHalService *fHalService, struct ieee80211_
     result->asr_channel.version = APPLE80211_VERSION;
     result->asr_channel.channel = ieee80211_chan2ieee(fHalService->get80211Controller(), fNextNodeToSend->ni_chan);
     result->asr_channel.flags = ieeeChanFlag2appleScanFlagVentura(fNextNodeToSend->ni_chan->ic_flags);
-    result->asr_noise = fHalService->getDriverInfo()->getBSSNoise();  /* already dBm */
+    result->asr_noise = fHalService->getDriverInfo()->getChannelNoise(fNextNodeToSend->ni_chan->ic_freq);
     result->asr_rssi = smoothedNodeRssi(fHalService, fNextNodeToSend);	/* dBm; smoothed only for the connected BSS */
     memcpy(result->asr_bssid, fNextNodeToSend->ni_bssid, IEEE80211_ADDR_LEN);
     result->asr_ssid_len = fNextNodeToSend->ni_esslen;

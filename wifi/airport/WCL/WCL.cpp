@@ -592,13 +592,20 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
     memcpy(metadata->ssid, node->ni_essid, node->ni_esslen);
     memcpy(metadata->bssid, node->ni_bssid, 6);
     metadata->rssi = rssiForNode(node);  /* dBm (qwz stores it as uint8, read as signed); smoothed only for the connected BSS */
-    metadata->noise = fHalService->getDriverInfo()->getBSSNoise();  /* -95 dBm */
-    metadata->snr = metadata->rssi - metadata->noise;  /* e.g. -48 - (-95) = 47 dB */
+    metadata->noise = fHalService->getDriverInfo()->getChannelNoise(node->ni_chan->ic_freq);
+    const bool noiseKnown = metadata->noise >= -127 && metadata->noise < -1;
+    const bool rssiKnown = metadata->rssi >= -127 && metadata->rssi < 0;
+    metadata->snr = noiseKnown && rssiKnown && metadata->rssi >= metadata->noise ?
+        metadata->rssi - metadata->noise : 0;
     metadata->interval = node->ni_intval;
     metadata->capability = node->ni_capinfo;
-    metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
-    if (qwz_beaconmeta) {	/* K3 (S2): noise is -95 and snr = rssi - noise, both already set above */
-        metadata->flags |= AirportWCL::OnChannel | AirportWCL::NoiseValid | AirportWCL::SNRValid;
+    metadata->flags = AirportWCL::SSIDPresent;
+    if (rssiKnown) metadata->flags |= AirportWCL::RSSIValid;
+    if (noiseKnown) metadata->flags |= AirportWCL::NoiseValid;
+    if (noiseKnown && rssiKnown && metadata->rssi >= metadata->noise)
+        metadata->flags |= AirportWCL::SNRValid;
+    if (qwz_beaconmeta) {
+        metadata->flags |= AirportWCL::OnChannel;
         if (frame && frameLength >= 1 && (frame[0] & 0xfc) == 0x80)	/* beacon, not a probe response */
             metadata->flags |= AirportWCL::FromBeacon;
     }
@@ -1381,7 +1388,8 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                     if (AirportWCL::makeBeaconUpdate(
                             wclLqmBeacons - wclLqmReportedBeacons,
                             rssiForNode(ic->ic_bss),	/* dBm, smoothed */
-                            fHalService->getDriverInfo()->getBSSNoise(), update)) {
+                            fHalService->getDriverInfo()->getBSSNoise(), update,
+                            fHalService->getDriverInfo()->getChannelBusy(ic->ic_bss->ni_chan->ic_freq))) {
                         instance->postMessage(this, AirportWCL::LqmUpdate,
                             &update, sizeof(update), true);
                         wclLqmReportedBeacons = wclLqmBeacons;
