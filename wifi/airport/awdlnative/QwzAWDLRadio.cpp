@@ -92,7 +92,7 @@ void AirportItlwm::awdlNativeRadioStart()
 	qwz_mon_native_auto_enable(!PE_parse_boot_argn("-qwzawdlmanual", &manual, sizeof(manual)));
 	awdlNativeTimer->setTimeoutMS(50);
 	setProperty("QwzAWDLRadio", "started");
-	setProperty("QwzAWDLRadioBuild", "f2t-20261115");
+	setProperty("QwzAWDLRadioBuild", "f2u-20261115");
 	setProperty("QwzAWDLPeerTimingEnabled", awdlNativePeerTimingEnabled);
 	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
 	qwz_log_publish();
