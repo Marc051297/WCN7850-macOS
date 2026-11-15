@@ -1,0 +1,40 @@
+--- a/IntelBTPatcher/IntelBTPatcher.cpp
++++ b/IntelBTPatcher/IntelBTPatcher.cpp
+@@ -13,6 +13,8 @@
+ 
+ static CIntelBTPatcher ibtPatcher;
+ static CIntelBTPatcher *callbackIBTPatcher = nullptr;
++
++#include "QcaBluetoothHooks.inc"
+ 
+ static const char *bootargOff[] {
+     "-ibtcompatoff"
+@@ -116,6 +118,7 @@
+         if (IntelBTPatcher_IOUsbHostInfo.loadIndex == index) {
+             SYSLOG(DRV_NAME, "%s", IntelBTPatcher_IOUsbHostInfo.id);
+             
++            qcaInit(patcher);
+             KernelPatcher::RouteRequest hostDeviceRequest {
+             "__ZN15IOUSBHostDevice13deviceRequestEP9IOServiceRN11StandardUSB13DeviceRequestEPvP18IOMemoryDescriptorRjP19IOUSBHostCompletionj",
+                 newHostDeviceRequest,
+@@ -124,6 +127,7 @@
+             patcher.routeMultiple(index, &hostDeviceRequest, 1, address, size);
+             if (patcher.getError() == KernelPatcher::Error::NoError) {
+                 SYSLOG(DRV_NAME, "routed %s", hostDeviceRequest.symbol);
++                if (qcaContinuityEnabled) qcaNote("QcaContinuityHciHookRouted", 1);
+             } else {
+                 SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", hostDeviceRequest.symbol, patcher.getError());
+                 patcher.clearError();
+@@ -160,6 +164,12 @@
+ 
+ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion, unsigned int timeout)
+ {
++    if (qcaContinuityEnabled) {
++        if (qcaTarget(that))
++            return qcaRequest(that, provider, request, data, descriptor, length, completion, timeout);
++        // The Qualcomm mode must never inject commands into any other USB device.
++        return FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
++    }
+     HciCommandHdr *hdr = nullptr;
+     uint32_t hdrLen = 0;
+     char hciBuf[MAX_HCI_BUF_LEN] = {0};

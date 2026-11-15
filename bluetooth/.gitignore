@@ -1,0 +1,12 @@
+firmware/dl/
+kext/FwData.cpp
+build/
+build-debug/
+build-exp6/
+build-exp7/
+build-exp8/
+deps/
+tools/qcabt
+tools/usbdesc
+.DS_Store
+__pycache__/
