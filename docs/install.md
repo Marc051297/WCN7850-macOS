@@ -16,7 +16,7 @@ ioreg -p IOUSB | grep -i -B2 -A2 e10a
 
 ## 2. Kexts
 
-Build the four kexts (see the README) and copy them to `EFI/OC/Kexts`. In `Kernel → Add`, in this order after `Lilu.kext`:
+Take the four kexts from the [latest release](https://github.com/Marc051297/WCN7850-macOS/releases), or build them (see the README), and copy them to `EFI/OC/Kexts`. In `Kernel → Add`, in this order after `Lilu.kext`:
 
 1. `BlueToolFixup.kext`
 2. `IntelBTPatcher.kext`

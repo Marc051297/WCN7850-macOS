@@ -11,6 +11,8 @@ Two drivers live here, each in its own folder with its own licence:
 
 All three Bluetooth kexts are needed together. BlueToolFixup and IntelBTPatcher are not the stock builds: they are built from pinned upstream sources plus the patches in [`bluetooth/patches/`](bluetooth/patches/) and [`bluetooth/compat/`](bluetooth/compat/).
 
+**Download:** the built kexts are on the [Releases page](https://github.com/Marc051297/WCN7850-macOS/releases). What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
+
 This is experimental software for one chip, developed and tested on one machine. Read [Status](#status) and [Known limits](#known-limits) before installing.
 
 ## Status
@@ -48,7 +50,7 @@ AirDrop and the Bluetooth advertising path check the macOS build before they sta
 
 The short version; the details and the reasons are in [docs/install.md](docs/install.md).
 
-1. Build the four kexts (see [Building](#building)) and copy them to `EFI/OC/Kexts`.
+1. Download the four kexts from the [latest release](https://github.com/Marc051297/WCN7850-macOS/releases), or build them (see [Building](#building)), and copy them to `EFI/OC/Kexts`.
 2. In `Kernel → Add`, after `Lilu.kext`: `BlueToolFixup.kext`, `IntelBTPatcher.kext`, `BluetoothWCN7850.kext`, `AirportWCN7850.kext`.
 3. Add the boot arguments below.
 4. Set the two Bluetooth NVRAM values and the Wi-Fi device property from the install guide.
