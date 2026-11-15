@@ -26923,12 +26923,7 @@ qwz_scan(struct qwz_softc *sc)
 
 		ic->ic_wcl_join_chan = 0;
 		if (qwz_joinhint && named > 0 && named <= IEEE80211_CHAN_MAX && ic->ic_channels[named].ic_flags != 0) {
-			join_hint = named;
-			arg->dwell_time_active = 120;
-			arg->dwell_time_passive = 160;
-			qwz_log("qwz: join: the channel the join names, %d, is scanned alone first (active %u ms, passive %u ms, channel %s for probes)\n",
-			    named, arg->dwell_time_active, arg->dwell_time_passive,
-			    (ic->ic_channels[named].ic_flags & IEEE80211_CHAN_PASSIVE) ? "closed" : "open");
+			join_hint = named;	/* confirmed against the band filter just before the channel list is built */
 		}
 	}
 #endif
@@ -27010,6 +27005,20 @@ qwz_scan(struct qwz_softc *sc)
 			scan_5ghz = 0;
 	}
 
+	if (join_hint) {	/* JL: the named channel must survive the media band filter, or the list would be empty: then the sweep */
+		const struct ieee80211_channel *named = &ic->ic_channels[join_hint];
+
+		if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(named)) || (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(named)) ||
+		    ieee80211_mhz2ieee(named->ic_freq, 0) != join_hint) {
+			join_hint = 0;
+		} else {
+			arg->dwell_time_active = 120;
+			arg->dwell_time_passive = 160;
+			qwz_log("qwz: join: the channel the join names, %d, is scanned alone first (active %u ms, passive %u ms, channel %s for probes)\n",
+			    join_hint, arg->dwell_time_active, arg->dwell_time_passive,
+			    (named->ic_flags & IEEE80211_CHAN_PASSIVE) ? "closed" : "open");
+		}
+	}
 	lastc = &ic->ic_channels[IEEE80211_CHAN_MAX];
 	num_channels = 0;
 	for (chan = &ic->ic_channels[1]; chan <= lastc; chan++) {

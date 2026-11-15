@@ -38,7 +38,7 @@ assert join.index('AirportWCL::joinHintChannel(join.channelSpec)') < join.index(
 
 hint = between(qwz, '#ifdef AIRPORT_WCL\n\t/*\n\t * JL (join lifecycle), debug.qwz.joinhint', '#endif\n', True)
 scan = qwz[qwz.index(hint):]  # the channel list of the same function, not an earlier one
-channels = between(scan, '\tlastc = &ic->ic_channels[IEEE80211_CHAN_MAX];\n', '#if 0\n\tif (req->flags & NL80211_SCAN_FLAG_RANDOM_ADDR)')
+channels = between(scan, '\tif (join_hint) {\t/* JL: the named channel must survive the media band filter', '#if 0\n\tif (req->flags & NL80211_SCAN_FLAG_RANDOM_ADDR)')
 assert channels.count('if (join_hint && ieee80211_mhz2ieee(chan->ic_freq, 0) != join_hint)') == 2
 
 scan_test = r'''
@@ -68,12 +68,12 @@ struct ieee80211com {
     }
 };
 struct Scan {unsigned dwell_time_active=50,dwell_time_passive=150,num_chan=0;uint32_t *chan_list=nullptr;};
-static int qwz_joinhint=1;
+static int qwz_joinhint=1,scan5=1;
 template<class... T> static void qwz_log(const char *,T...) {}
 struct AnyPointer {void *p;template<class T> operator T *() const {return static_cast<T *>(p);}};
 static AnyPointer mallocarray(size_t n,size_t size,int,int){return {calloc(n,size)};}
 static int submit(ieee80211com *ic,Scan *arg) {
-    int ret=0,num_channels,i,scan_2ghz=1,scan_5ghz=1,join_hint=0;
+    int ret=0,num_channels,i,scan_2ghz=1,scan_5ghz=scan5,join_hint=0;
     ieee80211_channel *chan,*lastc;
 ''' + hint + channels + r'''
 exit:return ret;
@@ -108,6 +108,9 @@ int main() {
         qwz_joinhint=1;ic.ic_wcl_join_chan=52;Scan dfs;
         assert(submit(&ic,&dfs)==0 && dfs.num_chan==all && dfs.dwell_time_active==50 && ic.ic_wcl_join_chan==0);free(dfs.chan_list);
         ic.ic_wcl_join_chan=6;Scan two;assert(submit(&ic,&two)==0 && two.num_chan==1 && two.chan_list[0]==2437);free(two.chan_list);
+        // A media setting that excludes the named channel's band must not leave an empty list: the sweep of the other band.
+        ic.ic_wcl_join_chan=44;scan5=0;Scan band;
+        assert(submit(&ic,&band)==0 && band.num_chan==13 && band.dwell_time_active==50 && ic.ic_wcl_join_chan==0);free(band.chan_list);scan5=1;
     }
     puts("actual join request channel -> one-channel first scan -> full sweep fallback: PASS");
 }

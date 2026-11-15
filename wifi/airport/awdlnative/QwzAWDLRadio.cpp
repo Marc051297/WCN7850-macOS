@@ -221,8 +221,10 @@ int AirportItlwm::awdlNativePlanVisit(uint32_t *delayUS, uint32_t *runUS)
 	auto *interface = static_cast<QwzAWDLInterface *>(fAWDLInterface);
 	uint8_t destinations[ItlAWDL::kVisitPlanLook][6];
 	unsigned count = 0;
+	interface->retain();	/* as buildAWDLTransmit holds it across its queue access */
 	while (count < ItlAWDL::kVisitPlanLook && interface->copyQueuedDestination(count, destinations[count]))
 		++count;
+	interface->release();
 	uint64_t delay = 0, run = 0;
 	if (count == 0 || !ItlAWDL::planVisit(awdlNativePeerTiming, destinations, count, uint8_t(cell), nowUS(), &delay, &run))
 		return 0;
