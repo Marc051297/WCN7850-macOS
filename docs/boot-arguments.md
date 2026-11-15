@@ -11,6 +11,9 @@ Boot arguments go in OpenCore's `boot-args`. Runtime switches are set with `sudo
 | `-qcaadv` | BlueToolFixup, IntelBTPatcher | Turns on LE advertising, extended scanning and connections, and the Qualcomm HCI handling. Needed for iPhones to find the Mac (AirDrop, Handoff) and for Instant Hotspot. Only active on macOS 25G332 and 25G342 |
 | `-qcaadvoff` | BlueToolFixup, IntelBTPatcher | Forces the `-qcaadv` path off |
 | `-qcarpaoff` | BlueToolFixup | Turns off the peer-address handling added in experimental.7 and .8 |
+| `-qcabsleepoff` | BlueToolFixup experimental.9 | Disables both new sleep guards; retains experimental.8 behavior |
+| `-qcabhidoff` | BlueToolFixup experimental.9 | Disables only the sleep-state guard on the LE HID wake notification |
+| `-qcabidleoff` | BlueToolFixup experimental.9 | Disables only the manufacturer-type 21 passive assertion policy |
 | `-qcabtoff` | BluetoothWCN7850 | Disables the firmware loader |
 | `qcabt_stage=<n>` | BluetoothWCN7850 | Stops the loader before stage n, for diagnosis |
 

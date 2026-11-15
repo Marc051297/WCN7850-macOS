@@ -2,6 +2,15 @@
 
 Releases are on the [Releases page](https://github.com/Marc051297/WCN7850-macOS/releases). Each one lists the exact kext builds it contains.
 
+## Unreleased: Bluetooth experimental.9 sleep candidate
+
+- Guard the LE HID user-activity notification during native sleep states.
+- Stop manufacturer-type 21 advertisements continuously refreshing the passive
+  idle-sleep assertion; retain payload processing and session assertions.
+- Add independent boot-argument off switches, verified-page tests and a
+  checksum-verified one-bundle installer with experimental.8 rollback.
+- Hardware testing is pending; see [Bluetooth sleep notes](bluetooth/docs/experimental-9-sleep.md).
+
 ## 1.0.0 beta 1 (2026-11-15)
 
 The first release from this repository. Tested on macOS Tahoe 26.7.3 (25G342).

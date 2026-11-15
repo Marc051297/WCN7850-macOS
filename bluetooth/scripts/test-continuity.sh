@@ -14,4 +14,6 @@ for unit in qca_validated_pages qca_verify_layout; do
   "build/tests/$unit"
 done
 python3 -I tests/qca_page_guard.py
-python3 -I -m py_compile scripts/prepare-deps.py scripts/apply-compat.py tools/check-continuity.py
+python3 -I tests/handoff_exp9.py
+python3 -I -m py_compile scripts/prepare-deps.py scripts/apply-compat.py tools/check-continuity.py \
+  tools/build-sleep-patches.py tests/qca_sleep.py

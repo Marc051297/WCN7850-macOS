@@ -25,7 +25,7 @@ Tested on the machine described under [Tested configuration](#tested-configurati
 | WPA3 transition networks | Works | Joined on the WPA2 side |
 | Signal, noise and rate in macOS | Works | Noise is measured on the home channel |
 | Wi-Fi after sleep and wake, Wi-Fi off and on | Works | The firmware is reloaded on wake. Bluetooth takes longer to come back |
-| Putting the Mac to sleep | Problem | A connected Bluetooth LE mouse cancels sleep; see [Known limits](#known-limits) |
+| Putting the Mac to sleep | Problem; fix awaiting hardware test | A connected Bluetooth LE mouse cancels sleep; [experimental.9 candidate](bluetooth/docs/experimental-9-sleep.md) |
 | AirDrop, both directions (iPhone and Mac) | Works | Receive about 670 kB/s, send about 255 kB/s |
 | Personal Hotspot and Instant Hotspot, 2.4 and 5 GHz | Works | Needs all three Bluetooth kexts and `-qcaadv` |
 | Bluetooth: pairing, audio (A2DP), LE mice, keyboards and game controllers | Works | LE devices need `-btlfxlemask` |
@@ -77,6 +77,10 @@ itlwm_cc=US -qwzawdlnative -itlawdlnativeup -itlawdlcoexdata -itlawdlmitx -itlaw
 | `-qcaadv` | AirDrop discovery by iPhones, Handoff, Instant Hotspot | Turns on LE advertising and the Qualcomm HCI handling in BlueToolFixup and IntelBTPatcher. Only on 25G332 and 25G342 |
 
 Off switches: `-qcaadvoff` (advertising path), `-qcarpaoff` (peer-address handling), `-qcabtoff` (the firmware loader).
+
+The local experimental.9 sleep candidate adds `-qcabsleepoff` for both new sleep
+policies, `-qcabhidoff` for the HID guard and `-qcabidleoff` for the passive
+advertisement assertion policy. See its [test notes](bluetooth/docs/experimental-9-sleep.md).
 
 **Boot once without `-qcaadv` before every macOS update.** With it, reads of `bluetoothd` see patched pages, which can upset the updater's integrity checks.
 

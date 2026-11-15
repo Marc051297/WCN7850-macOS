@@ -23,4 +23,7 @@ xcodebuild -project BrcmPatchRAM.xcodeproj -target BlueToolFixup -configuration 
 rm -rf "$OUT/BlueToolFixup.kext"
 mkdir -p "$OUT"
 cp -R build/Products/Release/BlueToolFixup.kext "$OUT/"
+# Xcode leaves N_OSO debug entries containing absolute build-machine paths.
+# Remove debug metadata only; keep runtime symbols and the upstream UUID.
+xcrun strip -S "$OUT/BlueToolFixup.kext/Contents/MacOS/BlueToolFixup"
 echo "BlueToolFixup $(plutil -extract CFBundleVersion raw "$OUT/BlueToolFixup.kext/Contents/Info.plist") (BrcmPatchRAM $(git rev-parse --short HEAD), Lilu $(git -C "$DEPS/Lilu" rev-parse --short HEAD)) -> $OUT/BlueToolFixup.kext"

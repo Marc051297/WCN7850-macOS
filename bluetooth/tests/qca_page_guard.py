@@ -24,6 +24,7 @@ def function(name):
 prelude = r'''
 #include "QcaValidatedPages.hpp"
 #include "QcaPeerAddress25G342.hpp"
+#include "QcaSleep25G342.hpp"
 #include "QcaBluetoothHci.hpp"
 #include <array>
 #include <atomic>
@@ -44,10 +45,12 @@ static void OSIncrementAtomic(volatile SInt32*p){__atomic_add_fetch(p,1,__ATOMIC
 static void OSBitOrAtomic(UInt32 n,volatile UInt32*p){__atomic_fetch_or(p,n,__ATOMIC_RELAXED);}
 #define arrsize(a) (sizeof(a)/sizeof((a)[0]))
 #define OSDynamicCast(T,p) static_cast<T*>(p)
-struct OSNumber {uint32_t unsigned32BitValue(){return 1;}};
+static uint32_t targetRequests=1;
+struct OSNumber {uint32_t value;uint32_t unsigned32BitValue(){return value;}};
 struct IORegistryEntry {
  static IORegistryEntry*getRegistryRoot(){static IORegistryEntry r;return &r;}
- OSNumber*getProperty(const char*){static OSNumber n;return &n;}
+ OSNumber*getProperty(const char*key){static OSNumber n;
+  n.value=!strcmp(key,"QcaContinuityTargetRequests")?targetRequests:1;return &n;}
 };
 using QcaNativeValidate=void(*)(vnode_t,void*,uint64_t,const void*,int*,int*,int*);
 using QcaNativeVerifier=int(*)(void*);
@@ -67,6 +70,8 @@ static const char*qcaOsBuild="25G342";
 static const char*version="xnu-12377.161.15.701.48~2/RELEASE_X86_64";
 static volatile SInt32 qcaPageRestores,qcaVerifyRestores,qcaVerifyFailures,
  qcaPageRejected,qcaPageRecordsFull,qcaRpaMask;
+static volatile SInt32 qcaSleepMask;
+static bool qcaSleepHid=false,qcaSleepIdle=false,qcaSleepTargetSeen=false;
 static uint64_t qcaLastRejectedOffset;
 static uint32_t qcaLastRejectedReason,qcaLastRejectedFlags;
 static void qcaReportPagesLater(){}
@@ -118,6 +123,37 @@ int main(){
  const Page patched=helper;
  for(int i=0;i<10;++i){assert(validate(0xaa2000,helper.data()));assert(helper==patched);}
  assert(qcaPageRestores>=10 && qcaPageRecordsFull==0);
+ // Every sleep caller and the additive helper share the existing native page
+ // verification path. Independent off switches must leave peer sites intact.
+ for(unsigned enabled=0;enabled<4;++enabled){
+  qcaSleepHid=enabled&1;qcaSleepIdle=enabled&2;qcaSleepMask=0;
+  for(size_t n=0;n<arrsize(QcaSleepPatches::sites);++n){
+   const auto&s=QcaSleepPatches::sites[n];Page page{};
+   uint64_t off=s.offset&~uint64_t(4095);size_t at=s.offset&4095;
+   if(n==0){page=originals.at(0xaa2000);}
+   else memcpy(page.data()+at,s.find,s.size);
+   originals[off]=page;
+   // Use a fresh ledger for each original fixture, as a new boot would.
+   qcaPageRecords=QcaBluetooth::ValidatedPages<32>{};assert(qcaPageRecords.bind(1));
+   assert(validate(off,page.data()));
+   bool patch=enabled && (n==0 || (n==1?qcaSleepHid:qcaSleepIdle));
+   assert(!memcmp(page.data()+at,patch?s.replace:s.find,s.size));
+   Page once=page;assert(validate(off,page.data()));assert(page==once);
+   if(n==0)assert(!memcmp(page.data()+0xba0,helpers.replace,helpers.size));
+  }
+  assert(uint32_t(qcaSleepMask)==(enabled?(1U|(enabled&1?2U:0U)|(enabled&2?4U:0U)):0U));
+ }
+ // A hook for other USB controllers must not activate the new caller routes.
+ qcaSleepHid=qcaSleepIdle=true;qcaSleepTargetSeen=false;targetRequests=0;
+ for(size_t n=1;n<arrsize(QcaSleepPatches::sites);++n){
+  const auto&s=QcaSleepPatches::sites[n];Page page{};size_t at=s.offset&4095;
+  memcpy(page.data()+at,s.find,s.size);qcaApplySleepPage(s.offset-at,page.data());
+  assert(!memcmp(page.data()+at,s.find,s.size));
+ }
+ targetRequests=1;qcaSleepHid=qcaSleepIdle=false;
+ // Restore the original fixture for the concurrent native-verifier checks.
+ qcaPageRecords=QcaBluetooth::ValidatedPages<32>{};assert(qcaPageRecords.bind(1));
+ helper=originals.at(0xaa2000);assert(validate(0xaa2000,helper.data()));
  // The native filesystem verifier gets the original 16 KiB contents while
  // its shared buffer remains patched. It must see unrelated corruption.
  memcpy(originalBlock.data()+8192,originals.at(0xaa2000).data(),4096);
@@ -156,7 +192,8 @@ int main(){
 with tempfile.TemporaryDirectory(prefix='qca-guard-test-') as tmp:
     cpp=Path(tmp)/'test.cpp';exe=Path(tmp)/'test'
     cpp.write_text(prelude+'\n'+function('qcaRejectPage')+'\n'+function('qcaVerifyFileBlock')+'\n'+
-                   function('qcaApplyPeerPage')+'\n'+function('qcaGuardValidate')+'\n'+main)
+                   function('qcaApplyPeerPage')+'\n'+function('qcaApplySleepPage')+'\n'+
+                   function('qcaGuardValidate')+'\n'+main)
     subprocess.run(['xcrun','clang++','-std=c++14','-Wall','-Wextra','-Werror',
                     '-Wno-unused-function','-fsanitize=address,undefined','-pthread',
                     '-I',str(ROOT/'compat'),str(cpp),'-o',str(exe)],check=True)

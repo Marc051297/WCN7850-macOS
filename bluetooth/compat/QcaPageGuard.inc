@@ -4,6 +4,7 @@
 #include "QcaValidatedPages.hpp"
 #include "QcaVerifyLayout.hpp"
 #include "QcaPeerAddress25G342.hpp"
+#include "QcaSleep25G342.hpp"
 #include <IOKit/IOLocks.h>
 #include <kern/thread_call.h>
 #include <sys/vnode.h>
@@ -42,6 +43,8 @@ static bool qcaGuardRequested;
 static thread_call_t qcaPageReport;
 static volatile SInt32 qcaVerifierState, qcaPageRestores, qcaVerifyRestores,
     qcaVerifyFailures, qcaPageRejected, qcaPageRecordsFull, qcaRpaMask;
+static volatile SInt32 qcaSleepMask;
+static bool qcaSleepHid, qcaSleepIdle, qcaSleepTargetSeen;
 static uint64_t qcaLastRejectedOffset;
 static uint32_t qcaLastRejectedReason, qcaLastRejectedFlags;
 
@@ -56,7 +59,12 @@ static void qcaRejectPage(uint32_t reason, uint64_t offset, int validated = 0, i
 
 static void qcaPublishPages(thread_call_param_t, thread_call_param_t) {
     auto *root = IORegistryEntry::getRegistryRoot();
-    root->setProperty("QcaContinuityPageRevision", "experimental.8-extended-legacy-peer");
+    root->setProperty("QcaContinuityPageRevision", "experimental.9-sleep-guards");
+    root->setProperty("QcaSleepRevision", "experimental.9");
+    root->setProperty("QcaSleepHidRequested", qcaSleepHid);
+    root->setProperty("QcaSleepIdleRequested", qcaSleepIdle);
+    root->setProperty("QcaSleepTargetSeen", qcaSleepTargetSeen);
+    root->setProperty("QcaSleepPatchMask", uint32_t(qcaSleepMask), 32);
     root->setProperty("QcaContinuityVerifierState", uint32_t(qcaVerifierState), 32);
     root->setProperty("QcaContinuityRpaPatchMask", uint32_t(qcaRpaMask), 32);
     root->setProperty("QcaContinuityPageRestores", uint32_t(qcaPageRestores), 32);
@@ -167,6 +175,34 @@ static void qcaApplyPeerPage(uint64_t pageOffset, uint8_t *page) {
     }
 }
 
+static void qcaApplySleepPage(uint64_t pageOffset, uint8_t *page) {
+    if (!qcaSleepHid && !qcaSleepIdle) return;
+    // The existing request hook counts only the tested USB VID/PID. Helpers
+    // may be paged before the first HCI request; install their inert code then,
+    // but never redirect a caller until that target has actually been observed.
+    auto *target = OSDynamicCast(OSNumber, IORegistryEntry::getRegistryRoot()->getProperty("QcaContinuityTargetRequests"));
+    if (target && target->unsigned32BitValue()) qcaSleepTargetSeen = true;
+    for (size_t n = 0; n < arrsize(QcaSleepPatches::sites); ++n) {
+        if (n && !qcaSleepTargetSeen) continue;
+        if ((n == 1 && !qcaSleepHid) || (n == 2 && !qcaSleepIdle)) continue;
+        const auto &site = QcaSleepPatches::sites[n];
+        for (size_t i = 0; i + site.size <= 4096; ++i) {
+            if (memcmp(page+i, site.find, site.size)) continue;
+            if (pageOffset + i < site.offset) { qcaRejectPage(1, pageOffset); return; }
+            const uint64_t slice = pageOffset + i - site.offset;
+            if (slice % 4096 || slice > UINT64_MAX - 0xaa3000 ||
+                !qcaPageRecords.hold(reinterpret_cast<uintptr_t>(qcaGuardVnode), pageOffset) ||
+                !qcaPageRecords.hold(reinterpret_cast<uintptr_t>(qcaGuardVnode), slice+0xaa2000)) {
+                OSIncrementAtomic(&qcaPageRecordsFull);
+                return;
+            }
+            memcpy(page+i, site.replace, site.size);
+            OSBitOrAtomic(uint32_t(1) << n, reinterpret_cast<volatile UInt32 *>(&qcaSleepMask));
+            break;
+        }
+    }
+}
+
 static bool qcaGuardValidate(vnode_t vp, memory_object_t pager, memory_object_offset_t offset,
     const void *data, int *validated, int *tainted, int *nx, QcaNativeValidate native,
     void (*patchExisting)(const void *, const char *), const char *path) {
@@ -193,6 +229,7 @@ static bool qcaGuardValidate(vnode_t vp, memory_object_t pager, memory_object_of
     if (room && sameOriginal && *validated && !*tainted) {
         patchExisting(data, path);
         qcaApplyPeerPage(offset, page);
+        qcaApplySleepPage(offset, page);
         if (memcmp(qcaPageBefore, page, 4096) &&
             !qcaPageRecords.record(token, offset, qcaPageBefore, page)) {
             memcpy(page, qcaPageBefore, 4096);
@@ -209,6 +246,9 @@ static bool qcaGuardValidate(vnode_t vp, memory_object_t pager, memory_object_of
 
 static void qcaSetupPageGuard(KernelPatcher &patcher) {
     if (!shouldPatchQcaContinuity || checkKernelArgument("-qcarpaoff")) return;
+    const bool sleep = !checkKernelArgument("-qcabsleepoff");
+    qcaSleepHid = sleep && !checkKernelArgument("-qcabhidoff");
+    qcaSleepIdle = sleep && !checkKernelArgument("-qcabidleoff");
     qcaVerifyDescriptor = patcher.solveSymbol(KernelPatcher::KernelID, "_vnop_verify_desc");
     patcher.clearError();
     const auto fn = patcher.solveSymbol(KernelPatcher::KernelID, "_VNOP_VERIFY");

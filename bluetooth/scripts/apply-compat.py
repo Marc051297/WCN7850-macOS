@@ -23,7 +23,7 @@ def main():
         apply(tree, 'bluetoolfixup-continuity.patch')
         files = ['QcaContinuityPatches.hpp', 'QcaBluetoothHci.hpp',
                  'QcaValidatedPages.hpp', 'QcaVerifyLayout.hpp',
-                 'QcaPeerAddress25G342.hpp', 'QcaPageGuard.inc']
+                 'QcaPeerAddress25G342.hpp', 'QcaSleep25G342.hpp', 'QcaPageGuard.inc']
     elif name == 'IntelBluetoothFirmware':
         destination = tree / 'IntelBTPatcher'
         apply(tree, 'intelbtpatcher-continuity.patch')
