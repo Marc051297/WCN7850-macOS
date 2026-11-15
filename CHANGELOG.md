@@ -2,14 +2,22 @@
 
 Releases are on the [Releases page](https://github.com/Marc051297/WCN7850-macOS/releases). Each one lists the exact kext builds it contains.
 
-## Unreleased: Bluetooth experimental.9 sleep candidate
+## 1.0.0 beta 2 (2026-11-15)
 
-- Guard the LE HID user-activity notification during native sleep states.
-- Stop manufacturer-type 21 advertisements continuously refreshing the passive
-  idle-sleep assertion; retain payload processing and session assertions.
-- Add independent boot-argument off switches, verified-page tests and a
-  checksum-verified one-bundle installer with experimental.8 rollback.
-- Hardware testing is pending; see [Bluetooth sleep notes](bluetooth/docs/experimental-9-sleep.md).
+Bluetooth experimental.9: the Mac can be put to sleep again. Only `BlueToolFixup.kext` changes.
+
+| Kext | Version | Build |
+|---|---|---|
+| `AirportWCN7850.kext` | 0.0.2 | `f2v-20261115` (unchanged) |
+| `BlueToolFixup.kext` | 2.7.3 | `experimental.9-sleep-guards` |
+| `IntelBTPatcher.kext` | 2.5.0 | `1.1.0-experimental.6` (unchanged) |
+| `BluetoothWCN7850.kext` | 1.1.0 | (unchanged) |
+
+- A Bluetooth LE mouse or keyboard no longer cancels sleep: its activity is not reported as user activity while the Mac is going to sleep.
+- Bluetooth no longer keeps the Mac awake when idle: nearby devices' advertisements of one kind no longer renew the stay-awake request. Their content is still processed.
+- New off switches: `-qcabsleepoff` (both), `-qcabhidoff`, `-qcabidleoff`.
+
+Tested on the test machine on 2026-11-15: a manual sleep with a Bluetooth LE mouse connected reached sleep and woke by the power button, and Bluetooth held no stay-awake request in ten samples over a minute of idle time (before: 24 of 24). Not confirmed yet: automatic sleep when idle, a long sleep, and the full device check after a wake. Details in the [Bluetooth sleep notes](bluetooth/docs/experimental-9-sleep.md).
 
 ## 1.0.0 beta 1 (2026-11-15)
 
@@ -36,6 +44,6 @@ Changes in the last Wi-Fi builds before this release:
 - **f2t:** the beacon counters macOS's link watchdog reads are kept valid, which ended a disconnect 60 seconds after every join.
 - **f2s:** a join scans the channel macOS names first (joins in about 0.25 s); a failed join leaves the network cleanly instead of blocking all scans; measured noise.
 
-Known problem in this release: with a Bluetooth LE mouse connected, macOS cancels sleep about a second after it begins, and Bluetooth keeps the Mac from sleeping on its own when idle.
+Known problem in this release: with a Bluetooth LE mouse connected, macOS cancels sleep about a second after it begins, and Bluetooth keeps the Mac from sleeping on its own when idle. Fixed in beta 2.
 
 The other known limits are in the [README](README.md#known-limits).

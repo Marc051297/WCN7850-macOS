@@ -25,7 +25,7 @@ Tested on the machine described under [Tested configuration](#tested-configurati
 | WPA3 transition networks | Works | Joined on the WPA2 side |
 | Signal, noise and rate in macOS | Works | Noise is measured on the home channel |
 | Wi-Fi after sleep and wake, Wi-Fi off and on | Works | The firmware is reloaded on wake. Bluetooth takes longer to come back |
-| Putting the Mac to sleep | Problem; fix awaiting hardware test | A connected Bluetooth LE mouse cancels sleep; [experimental.9 candidate](bluetooth/docs/experimental-9-sleep.md) |
+| Putting the Mac to sleep | Works in a first test | Fixed in Bluetooth experimental.9: a manual sleep with a Bluetooth LE mouse connected reaches sleep. Automatic sleep and a long sleep are not confirmed yet; see [Known limits](#known-limits) |
 | AirDrop, both directions (iPhone and Mac) | Works | Receive about 670 kB/s, send about 255 kB/s |
 | Personal Hotspot and Instant Hotspot, 2.4 and 5 GHz | Works | Needs all three Bluetooth kexts and `-qcaadv` |
 | Bluetooth: pairing, audio (A2DP), LE mice, keyboards and game controllers | Works | LE devices need `-btlfxlemask` |
@@ -78,9 +78,7 @@ itlwm_cc=US -qwzawdlnative -itlawdlnativeup -itlawdlcoexdata -itlawdlmitx -itlaw
 
 Off switches: `-qcaadvoff` (advertising path), `-qcarpaoff` (peer-address handling), `-qcabtoff` (the firmware loader).
 
-The local experimental.9 sleep candidate adds `-qcabsleepoff` for both new sleep
-policies, `-qcabhidoff` for the HID guard and `-qcabidleoff` for the passive
-advertisement assertion policy. See its [test notes](bluetooth/docs/experimental-9-sleep.md).
+The sleep fix in experimental.9 has its own off switches: `-qcabsleepoff` (both parts), `-qcabhidoff` (the mouse and keyboard part) and `-qcabidleoff` (the idle part). See the [sleep notes](bluetooth/docs/experimental-9-sleep.md).
 
 **Boot once without `-qcaadv` before every macOS update.** With it, reads of `bluetoothd` see patched pages, which can upset the updater's integrity checks.
 
@@ -101,7 +99,7 @@ Without the five AirDrop arguments the kext is a plain Wi-Fi driver. The full li
 
 - **One machine.** Everything above was tested on one board. Other WCN785x devices share the firmware but are untested.
 - **Tied to macOS builds.** AirDrop depends on the layout of Apple's AWDL classes, and the Bluetooth advertising path patches `bluetoothd` in memory. Both are checked per build and must be re-verified for every macOS update.
-- **Sleep with a Bluetooth LE mouse.** On the test machine on 2026-11-15, with a Bluetooth LE mouse connected, macOS cancelled sleep about a second after it began (the Bluetooth daemon reported the mouse as user activity), and Bluetooth kept the Mac from sleeping on its own when idle. Not fixed yet. The Wi-Fi driver itself recovers after a wake.
+- **Sleep is newly fixed and lightly tested.** Up to Bluetooth experimental.8 a connected Bluetooth LE mouse cancelled sleep about a second after it began, and Bluetooth kept the Mac from sleeping on its own when idle. Experimental.9 (release 1.0.0 beta 2) fixed both in a first test on 2026-11-15: one manual sleep with the mouse connected, and no sleep-blocking request from Bluetooth while idle. Automatic sleep and a long sleep are not confirmed yet. The Wi-Fi driver itself recovers after a wake.
 - **AirDrop sending is slower than receiving.** Outgoing data goes one frame at a time through the firmware's management path.
 - **The `bluetoothd` patches are process-wide.** Use the WCN7850 as the only Bluetooth controller.
 - **Not tested with AMFI on.** The test machine relaxes AMFI for its graphics driver.

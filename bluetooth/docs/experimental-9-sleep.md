@@ -1,7 +1,7 @@
 # Experimental.9: Bluetooth sleep guards
 
-Hardware validation is pending. This is a local test candidate, not a published
-release or a claim that all sleep and wake cases are fixed.
+Released in 1.0.0 beta 2 after a first hardware test (see [Hardware results](#hardware-results)). It is not a
+claim that all sleep and wake cases are fixed.
 
 Only BlueToolFixup changes. Keep IntelBTPatcher experimental.6,
 BluetoothWCN7850 1.1.0 and the current Wi-Fi build. Existing experimental.8
@@ -104,6 +104,17 @@ Keep private logs outside the repository. Record the local time of each attempt.
    switch restores the old policies. The package's `install.sh --rollback`
    reinstalls the checksum-verified experimental.8 BlueToolFixup only.
 
-Do not publish until the hardware results are recorded and the user requests
-publication. Then update the top-level status row and changelog with the actual
-results, and make a normal GitHub release with the exact tested kexts and notes.
+## Hardware results
+
+2026-11-15, macOS 25G342, BlueToolFixup experimental.9 with IntelBTPatcher experimental.6 and Wi-Fi f2v.
+
+- After the reboot: `QcaSleepRevision` `experimental.9`, `QcaSleepPatchMask` 7, both policies requested, verifier
+  state 1, no verify failures, page revision `experimental.9-sleep-guards`.
+- Checklist item 2, once: with an LE mouse connected and active 15 s before, a manual sleep at 18:50:39 was followed by
+  `Wake from Normal Sleep` by the power button at 18:51:08. The same action on experimental.8 ended in an invalid
+  dark wake one second after sleep began.
+- Checklist item 3, in part: with no user input for about three minutes, bluetoothd held no
+  `PreventUserIdleSystemSleep` assertion in 10 of 10 samples over a minute (experimental.8: held in 24 of 24). The
+  `sleep` setting was still 0, so automatic sleep itself was not exercised.
+- Not done yet: the three repeats of item 2, a keyboard, an overnight sleep, and the device checks of item 4.
+- Seen as before this change: bluetoothd restarts across a sleep and wake.
