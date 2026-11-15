@@ -178,10 +178,12 @@ int main() {
 '''
 
 deauth = function(net, 'void\nieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,')
+disassoc = function(net, 'void\nieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,')
 part2 = r'''
 #include <cassert>
 #include <cstddef>
 #include <cstdio>
+#include <initializer_list>
 #include <sys/types.h>
 #include <utility>
 #include <vector>
@@ -197,11 +199,11 @@ struct ieee80211_frame {u_int8_t i_fc[2],i_dur[2],i_addr1[6],i_addr2[6],i_addr3[
 enum {IEEE80211_S_INIT,IEEE80211_S_SCAN,IEEE80211_S_AUTH,IEEE80211_S_ASSOC,IEEE80211_S_RUN};
 enum {IEEE80211_M_STA=1};
 enum {IEEE80211_F_BGSCAN=1,IEEE80211_F_DISABLE_BG_AUTO_CONNECT=2,IEEE80211_F_STAYAUTH=4};
-enum {IEEE80211_FC0_SUBTYPE_DEAUTH=0xc0,IEEE80211_EVT_STA_DEAUTH=2};
+enum {IEEE80211_FC0_SUBTYPE_DEAUTH=0xc0,IEEE80211_FC0_SUBTYPE_DISASSOC=0xa0,IEEE80211_EVT_STA_DEAUTH=2};
 struct ieee80211_node {};
 struct ieee80211com {
     u_int16_t ic_deauth_reason=0;int ic_opmode=IEEE80211_M_STA,ic_state=IEEE80211_S_RUN;
-    unsigned ic_flags=0,ic_userflags=0;struct {unsigned is_rx_deauth=0;} ic_stats;
+    unsigned ic_flags=0,ic_userflags=0;struct {unsigned is_rx_deauth=0,is_rx_disassoc=0;} ic_stats;
     void (*ic_event_handler)(ieee80211com *,int,void *)=nullptr;
 };
 static std::vector<std::pair<int,int>> transitions;
@@ -212,7 +214,16 @@ static void handler(ieee80211com *ic,int code,void *){
 static void ieee80211_new_state(ieee80211com *ic,int state,int arg){transitions.push_back({state,arg});ic->ic_state=state;}
 template<class... T> static int qwz_log(const char *,T...) {return 0;}
 static bool qwz_log_ratelimit(unsigned *,unsigned,unsigned){return true;}
-''' + deauth + r'''
+''' + deauth + '\n' + disassoc + r'''
+// A disassociation, reason 8. Returns how often the event handler ran.
+static int leave(ieee80211com &ic,int state,unsigned flags=0) {
+    unsigned char frame[26]={0xa0,0};frame[24]=8;frame[25]=0;
+    mbuf m={sizeof(frame),frame};ieee80211_node node;
+    ic.ic_state=state;ic.ic_flags=flags;ic.ic_event_handler=handler;ic.ic_deauth_reason=0;transitions.clear();handlerCalls=0;
+    ieee80211_recv_disassoc(&ic,&m,&node);
+    if(handlerCalls)assert(handlerCalls==1 && stateAtHandler==state && transitionsAtHandler==0 && ic.ic_deauth_reason==8);
+    return handlerCalls;
+}
 static void deliver(ieee80211com &ic,int state,unsigned flags=0) {
     unsigned char frame[26]={0xc0,0};frame[24]=2;frame[25]=0;
     mbuf m={sizeof(frame),frame};ieee80211_node node;
@@ -233,12 +244,23 @@ int main() {
     // A stray frame while scanning or down changes nothing (and never starts an authentication).
     deliver(ic,IEEE80211_S_SCAN);assert(transitions.empty());
     deliver(ic,IEEE80211_S_INIT);assert(transitions.empty());
-    puts("actual ieee80211_recv_deauth as AIRPORT_WCL: reported first, then the scan state, never re-authentication: PASS");
+    // A disassociation ends the association the same way: reported through the same event, then the scan state.
+    for(int state:{IEEE80211_S_RUN,IEEE80211_S_ASSOC}) {
+        assert(leave(ic,state)==1);
+        assert(transitions.size()==1 && transitions[0].first==IEEE80211_S_SCAN && transitions[0].second==-1);
+    }
+    assert(leave(ic,IEEE80211_S_RUN,IEEE80211_F_BGSCAN)==1 && transitions.size()==1 && transitions[0].first==IEEE80211_S_SCAN);
+    for(int state:{IEEE80211_S_AUTH,IEEE80211_S_SCAN,IEEE80211_S_INIT})
+        assert(leave(ic,state)==0 && transitions.empty() && ic.ic_deauth_reason==0);
+    puts("actual ieee80211_recv_deauth and ieee80211_recv_disassoc as AIRPORT_WCL: reported first, then the scan state, never a reconnect: PASS");
 #else
     deliver(ic,IEEE80211_S_RUN);
     assert(transitions.size()==1 && transitions[0].first==IEEE80211_S_AUTH && transitions[0].second==IEEE80211_FC0_SUBTYPE_DEAUTH);
     deliver(ic,IEEE80211_S_RUN,IEEE80211_F_BGSCAN);assert(transitions.empty()); // OpenBSD ignores it during a roaming scan.
-    puts("actual ieee80211_recv_deauth without AIRPORT_WCL: OpenBSD behaviour unchanged: PASS");
+    assert(leave(ic,IEEE80211_S_RUN)==0);
+    assert(transitions.size()==1 && transitions[0].first==IEEE80211_S_ASSOC && transitions[0].second==IEEE80211_FC0_SUBTYPE_DISASSOC);
+    assert(leave(ic,IEEE80211_S_RUN,IEEE80211_F_BGSCAN)==0 && transitions.empty());
+    puts("actual ieee80211_recv_deauth and ieee80211_recv_disassoc without AIRPORT_WCL: OpenBSD behaviour unchanged: PASS");
 #endif
 }
 '''

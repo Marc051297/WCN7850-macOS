@@ -3060,7 +3060,27 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
     reason = LE_READ_2(frm);
     
     XYLog("Disassoc received, reason %d\n", reason);
-    
+
+#ifdef AIRPORT_WCL
+    /*
+     * JL (join lifecycle): macOS owns every join here, so a disassociation ends the association exactly as a
+     * deauthentication does (ieee80211_recv_deauth): macOS is told through the same event, the WCL glue
+     * forgets the network, and below the stack goes to the idle scan state. OpenBSD's own re-association
+     * left macOS believing the link was down while the driver was associated, and it cannot complete a key
+     * handshake once a failed join has wiped the key. Only while associated or associating; a stray frame
+     * in AUTH, SCAN or INIT changes nothing.
+     */
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_state >= IEEE80211_S_ASSOC) {
+        static unsigned int disassocLines;
+
+        ic->ic_deauth_reason = reason;
+        if (qwz_log_ratelimit(&disassocLines, 32, 16))
+            qwz_log("airport: rsn: disassociation rx -> reason %u, ic state %d: reported as the end of the association\n",
+                    (unsigned int)reason, (int)ic->ic_state);
+        if (ic->ic_event_handler)
+            (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
+    }
+#endif
     ic->ic_stats.is_rx_disassoc++;
     switch (ic->ic_opmode) {
         case IEEE80211_M_STA: {
@@ -3068,9 +3088,15 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
                           ic->ic_state == IEEE80211_S_RUN);
             int roamscan = bgscan &&
                         (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
+#ifdef AIRPORT_WCL
+            (void)roamscan;	/* JL: see above; never re-associate from here */
+            if (ic->ic_state >= IEEE80211_S_ASSOC)
+                ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+#else
             if (!roamscan) /* ignore disassoc during bgscan */
                 ieee80211_new_state(ic, IEEE80211_S_ASSOC,
                                     IEEE80211_FC0_SUBTYPE_DISASSOC);
+#endif
         }
             break;
 #ifndef IEEE80211_STA_ONLY

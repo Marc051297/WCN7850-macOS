@@ -436,6 +436,7 @@ enum ath12k_dev_flags {
 #define QWZ_STAT_PM_OK		22	/* probe 1: management-path data frames completed with status 0 (C24) */
 #define QWZ_STAT_PM_FAIL	23	/* ... with another status (C24) */
 #define QWZ_TXF_AWDL		0x01	/* struct qwz_tx_data.flags: slot holds an AWDL frame (C20) */
+#define QWZ_TXF_EAPOL		0x02	/* JL: slot holds a key-handshake (EAPOL) frame: its completion status goes to the ring */
 #define QWZ_AWDL_INFLIGHT_MAX	32	/* C20 */
 struct qwz_flight_ent { uint32_t t_ms; uint32_t id; };
 

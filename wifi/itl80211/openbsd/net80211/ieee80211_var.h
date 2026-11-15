@@ -455,6 +455,7 @@ struct ieee80211com {
     uint64_t ic_wcl_tx_packets[4];
     uint64_t ic_wcl_rx_packets[4];
     bool ic_wcl_scan_idle;   /* scan finished, nothing asked for: wait for macOS */
+    uint8_t ic_wcl_join_chan; /* JL: the 20 MHz channel the pending join named, scanned alone first; 0 = none or already tried */
 #endif
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
 

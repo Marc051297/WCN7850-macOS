@@ -13164,6 +13164,20 @@ qwz_wmi_process_mgmt_tx_comp(struct qwz_softc *sc,
 			qwz_log("qwz: probe: data frame completion status %u\n", tx_compl_param->status);
 	}
 #endif
+	/*
+	 * JL (join lifecycle), debug.qwz.authfast (default 1): the station's authentication frame to the BSS it is joining came
+	 * back unacknowledged. The stack would wait out its 5 s management timer before trying again (two recorded joins took
+	 * 8 s because of it; the second frame was acknowledged within milliseconds). Read the frame here, before it is freed;
+	 * the timer is shortened below. Nothing is sent from this completion: the retry is the stack's own, in its own context,
+	 * and its count stays the stack's (ieee80211_watchdog gives up after three failures of the node).
+	 */
+	int auth_unacked = 0;
+	if (qwz_authfast && arvif == &sc->sc_vif && tx_compl_param->status != 0 && ic->ic_state == IEEE80211_S_AUTH &&
+	    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL && tx_data->m != NULL && M_LEN(tx_data->m) >= 24) {
+		const uint8_t *h = mtod(tx_data->m, const uint8_t *);
+
+		auth_unacked = (h[0] & 0xfc) == IEEE80211_FC0_SUBTYPE_AUTH && IEEE80211_ADDR_EQ(h + 4, ic->ic_bss->ni_macaddr);
+	}
 	bus_dmamap_unload(sc->sc_dmat, tx_data->map);
 	m_freem(tx_data->m);
 	tx_data->m = NULL;
@@ -13180,6 +13194,12 @@ qwz_wmi_process_mgmt_tx_comp(struct qwz_softc *sc,
 	    QWZ_JOINLOG(3))
 		qwz_log("qwz: join: mgmt tx compl desc %u status %u (ic state %d)\n",
 		    tx_compl_param->desc_id, tx_compl_param->status, ic->ic_state);
+	if (auth_unacked && ic->ic_state == IEEE80211_S_AUTH && ic->ic_mgt_timer > 1) {
+		qwz_log("qwz: join: the authentication frame was not acknowledged (status %u): the retry comes within a second, not after %d s\n",
+		    tx_compl_param->status, ic->ic_mgt_timer);
+		ic->ic_mgt_timer = 1;	/* JL: the next ieee80211_watchdog tick retries (ieee80211_node_join_bss), bounded there */
+		ifp->if_timer = 1;
+	}
 
 	/* The BSS ring keeps its 8 slots (QWZ_BSS_TXMGMT_SLOTS, see the top of this file): clear the full bit as the 8-slot ring did. */
 	if (arvif == &sc->sc_vif && arvif->txmgmt.queued >= QWZ_BSS_TXMGMT_SLOTS - 1)
@@ -15880,6 +15900,46 @@ qwz_dp_tx_status_parse(struct qwz_softc *sc, struct hal_wbm_release_ring *desc,
 		ts->rate_stats = 0;
 }
 
+/*
+ * JL (join lifecycle), evidence only: whether a key-handshake frame was acknowledged. The stack logs that it queued
+ * one (airport: rsn: eapol-key tx queued); this is the radio's answer. Only the status is printed, never the frame.
+ */
+static int
+qwz_frame_is_eapol(struct mbuf *m)
+{
+	const struct ieee80211_frame *wh;
+	const uint8_t *p;
+	int hdrlen;
+
+	if (m == NULL || M_LEN(m) < (int)sizeof(*wh))
+		return 0;
+	wh = mtod(m, const struct ieee80211_frame *);
+	if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) != IEEE80211_FC0_TYPE_DATA)
+		return 0;
+	hdrlen = ieee80211_get_hdrlen(wh);
+	if (M_LEN(m) < hdrlen + 8)
+		return 0;
+	p = mtod(m, const uint8_t *) + hdrlen;
+	return p[0] == 0xaa && p[1] == 0xaa && p[2] == 0x03 && p[6] == 0x88 && p[7] == 0x8e;
+}
+
+static void
+qwz_eapol_tx_done(struct qwz_tx_data *tx_data, int status)
+{
+	static unsigned int lines;
+
+	if (!(tx_data->flags & QWZ_TXF_EAPOL))
+		return;
+	tx_data->flags &= ~QWZ_TXF_EAPOL;
+	if (!qwz_log_ratelimit(&lines, 96, 8))
+		return;
+	if (status < 0)
+		qwz_log("airport: rsn: eapol frame tx done: released by the firmware without a transmit status\n");
+	else
+		qwz_log("airport: rsn: eapol frame tx done: status %d (%s)\n", status,
+		    status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED ? "acknowledged" : "not acknowledged");
+}
+
 void
 qwz_dp_tx_free_txbuf(struct qwz_softc *sc, int msdu_id,
     struct dp_tx_ring *tx_ring)
@@ -15907,6 +15967,7 @@ qwz_dp_tx_free_txbuf(struct qwz_softc *sc, int msdu_id,
 				sc->sc_awdl_inflight--;
 			sc->sc_stat[QWZ_STAT_AWDL_DONE]++;
 		}
+		qwz_eapol_tx_done(tx_data, -1);	/* JL: released through an HTT completion, no TQM status */
 	}
 
 	if (tx_data->ni) {
@@ -16078,6 +16139,7 @@ qwz_dp_tx_complete_msdu(struct qwz_softc *sc, struct dp_tx_ring *tx_ring,
 				sc->sc_awdl_inflight--;
 			sc->sc_stat[QWZ_STAT_AWDL_DONE]++;
 		}
+		qwz_eapol_tx_done(tx_data, (int)ts->status);	/* JL */
 	}
 
 	if (tx_data->ni == NULL)
@@ -25999,6 +26061,7 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 	int ret, msdu_id, off, n;	/* n: M0 (C20), the slot scan */
 	uint32_t ring_selector = 0;
 	uint8_t ring_map = 0;
+	const int is_eapol = arvif == &sc->sc_vif && qwz_frame_is_eapol(m);	/* JL: read before the encapsulation changes the frame */
 
 	if (QWZ_CRASHED(sc)) {		/* M0 (C05): the transient flag or DEAD */
 		m_freem(m);
@@ -26221,6 +26284,10 @@ qwz_dp_tx(struct qwz_softc *sc, struct qwz_vif *arvif, uint8_t pdev_id,
 		sc->sc_awdl_inflight++;
 		sc->sc_stat[QWZ_STAT_AWDL_TX]++;
 	}
+	if (is_eapol)
+		tx_data->flags |= QWZ_TXF_EAPOL;	/* JL */
+	else
+		tx_data->flags &= ~QWZ_TXF_EAPOL;
 
 	qwz_hal_tx_cmd_desc_setup(sc, hal_tcl_desc, &ti);
 	if (arvif != &sc->sc_vif || qwz_awdlx.tcl_left[1] != 0) {	/* M2a (WP3, I9): the first AWDL descriptors, and a few infra ones to compare; log only */
@@ -26753,6 +26820,7 @@ qwz_scan(struct qwz_softc *sc)
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct qwz_vif *arvif = &sc->sc_vif;
 	struct scan_req_params *arg = NULL;
+	int join_hint = 0;	/* JL: the one channel this scan is limited to, 0 = no limit */
 	struct ieee80211_channel *chan, *lastc;
 	int ret = 0, num_channels, i;
 	uint32_t scan_timeout;
@@ -26828,6 +26896,30 @@ qwz_scan(struct qwz_softc *sc)
 	qwz_wmi_start_scan_init(sc, arg);
 	arg->vdev_id = arvif->vdev_id;
 	arg->scan_id = ATH12K_SCAN_ID;
+
+#ifdef AIRPORT_WCL
+	/*
+	 * JL (join lifecycle), debug.qwz.joinhint (default 1): a join names its BSS's channel, and the first scan of that join
+	 * takes that channel alone, with a dwell long enough to hear a beacon where probe requests may not be sent. Every join
+	 * used to start with a sweep of all 41 channels (3.8 s) at 50 ms each, and a phone hotspot on channel 44 was not found
+	 * in six such sweeps while macOS already knew its channel. One attempt: the field is cleared here, so when the BSS is
+	 * not found the stack's next scan of the same join is the full sweep, exactly as before. Only for a join's own scan
+	 * (not a scan macOS asked for, not while associated).
+	 */
+	if (ic->ic_wcl_join_requested && !ic->ic_wcl_scan_requested && ic->ic_state != IEEE80211_S_RUN) {
+		const int named = ic->ic_wcl_join_chan;
+
+		ic->ic_wcl_join_chan = 0;
+		if (qwz_joinhint && named > 0 && named <= IEEE80211_CHAN_MAX && ic->ic_channels[named].ic_flags != 0) {
+			join_hint = named;
+			arg->dwell_time_active = 120;
+			arg->dwell_time_passive = 160;
+			qwz_log("qwz: join: the channel the join names, %d, is scanned alone first (active %u ms, passive %u ms, channel %s for probes)\n",
+			    named, arg->dwell_time_active, arg->dwell_time_passive,
+			    (ic->ic_channels[named].ic_flags & IEEE80211_CHAN_PASSIVE) ? "closed" : "open");
+		}
+	}
+#endif
 
 #ifdef AIRPORT_WCL
 	/*
@@ -26914,6 +27006,8 @@ qwz_scan(struct qwz_softc *sc)
 		if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(chan)) ||
 		    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(chan)))
 			continue;
+		if (join_hint && ieee80211_mhz2ieee(chan->ic_freq, 0) != join_hint)	/* JL */
+			continue;
 #ifdef AIRPORT_WCL
 		if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
 		    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
@@ -26938,6 +27032,8 @@ qwz_scan(struct qwz_softc *sc)
 				continue;
 			if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(chan)) ||
 			    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(chan)))
+				continue;
+			if (join_hint && ieee80211_mhz2ieee(chan->ic_freq, 0) != join_hint)	/* JL */
 				continue;
 #ifdef AIRPORT_WCL
 			if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,

@@ -47,6 +47,8 @@ extern unsigned int qwz_hwm_offered_mask;
 extern int qwz_scanraw;
 /* K2c: debug.qwz.monreap, default 0 = K2b: 1 = the capture TX ring's stale-slot reaper (3 s, every 100 ms) and live-slot guard (250 ms) in qwz_mon.c; debug.qwz.hintfix, default 1: the scan-start hint-BSSID copy goes params -> message, 0 = the old swapped copy (qwz.c). Defined in qwz_sysctl.cpp. qwz_scanraw_gen (K2c C6) is declared in qwz_log.h */
 extern int qwz_monreap, qwz_hintfix;
+/* JL (join lifecycle): debug.qwz.joinhint (1 = a join scans the channel it names alone first, qwz_scan), debug.qwz.authfast (1 = an unacknowledged authentication frame is retried within a second). Defined in qwz_sysctl.cpp. */
+extern int qwz_joinhint, qwz_authfast;
 /* K4 (M1): debug.qwz.monfmt, default 0 = tx_params_valid 0 for every cell frame: 1 = user frames under 150 bytes carry a tx_params block (retry limit 2, OFDM 12 Mbit/s); 2 = also user DATA frames (retry limit 1 with the header's NO_ACK flag, else 4; rate from the header's rate byte); 3 (offchan data command) is not implemented and acts as 2 */
 extern int qwz_monfmt;
 /* K3 (docs/research-scan-rssi-2026-11-06.md F1/F2/F3, K3 diagnosis), all default 0 = the build before K3; plain globals read at call time, defined in qwz_sysctl.cpp.

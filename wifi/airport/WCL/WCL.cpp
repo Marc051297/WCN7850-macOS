@@ -1020,6 +1020,12 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     memcpy(joinBSSID, join.bssid, 6);
     ic->ic_flags |= IEEE80211_F_DESBSSID;
     ic->ic_wcl_join_requested = true;
+    {
+        // JL: the request names the BSS's channel. The join's first scan takes that channel alone
+        // (qwz_scan); only when the BSS is not found there does the full sweep follow, as before.
+        const uint8_t named = AirportWCL::joinHintChannel(join.channelSpec);
+        ic->ic_wcl_join_chan = named && ic->ic_channels[named].ic_flags ? named : 0;
+    }
     ic->ic_wcl_scan_requested = false;
     current_authtype_lower = join.lowerAuth;
     current_authtype_upper = join.upperAuth;
@@ -1452,10 +1458,11 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
             }
             instance->postMessage(this, AirportWCL::Deauth, &event, sizeof(event), true);
             finishWCLJoin(1, event.reason, kIOReturnOffline);
-            // JL (join lifecycle): the AP ended the association, during a join or after it. macOS has been told and decides
-            // whether to join again; ieee80211_recv_deauth (which called us) then moves the stack to the idle
-            // scan state. No state change from inside this handler.
-            forgetWCLNetwork("deauthentication");
+            // JL (join lifecycle): the AP ended the association (a deauthentication or a disassociation), during a join or
+            // after it. macOS has been told and decides whether to join again; ieee80211_recv_deauth or
+            // ieee80211_recv_disassoc (which called us) then moves the stack to the idle scan state. No state
+            // change from inside this handler.
+            forgetWCLNetwork("the AP ending the association");
             break;
         }
         default: break;

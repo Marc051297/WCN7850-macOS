@@ -555,6 +555,18 @@ struct JoinRequest {
     uint8_t rsn[257];
 };
 
+// JL (join lifecycle): the 20 MHz channel a join request names, or 0. The request carries a Broadcom-style
+// channel spec: channel in bits 0-7, bandwidth in bits 11-13 (0x1000 = 20 MHz), band in bits 14-15
+// (0x0000 = 2.4 GHz, 0xc000 = 5 GHz). Seen on 25G342: 0xd024 (36), 0xd02c (44), 0x1006 (6). Anything else
+// (a wider spec names a centre channel, not the primary) gives 0, and the join scans as it always did.
+inline uint8_t joinHintChannel(uint16_t spec) {
+    const unsigned channel = spec & 0xffU, width = spec & 0x3800U, band = spec & 0xc000U;
+    if (width != 0x1000U) return 0;
+    if (band == 0x0000U) return channel >= 1 && channel <= 14 ? uint8_t(channel) : 0;
+    if (band == 0xc000U) return channel >= 36 && channel <= 177 ? uint8_t(channel) : 0;
+    return 0;
+}
+
 inline bool validCipherKey(uint32_t cipher, uint32_t length, uint16_t flags,
                            uint16_t index, uint32_t rscLength) {
     // Native WCL accepts PMK/MSK for enterprise, not legacy PTK/GTK.
