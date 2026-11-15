@@ -15,7 +15,7 @@ The first release from this repository. Tested on macOS Tahoe 26.7.3 (25G342).
 
 What works on the test machine with this set:
 
-- Wi-Fi with WPA2 and WPA3 transition networks, 802.11ac, sleep and wake.
+- Wi-Fi with WPA2 and WPA3 transition networks, 802.11ac; the driver recovers after sleep and wake.
 - AirDrop in both directions through a native `awdl0` interface: about 670 kB/s receiving, about 255 kB/s sending.
 - Personal Hotspot and Instant Hotspot on 2.4 and 5 GHz.
 - Bluetooth pairing, audio, and LE mice, keyboards and game controllers.
@@ -27,4 +27,6 @@ Changes in the last Wi-Fi builds before this release:
 - **f2t:** the beacon counters macOS's link watchdog reads are kept valid, which ended a disconnect 60 seconds after every join.
 - **f2s:** a join scans the channel macOS names first (joins in about 0.25 s); a failed join leaves the network cleanly instead of blocking all scans; measured noise.
 
-Known limits are in the [README](README.md#known-limits).
+Known problem in this release: with a Bluetooth LE mouse connected, macOS cancels sleep about a second after it begins, and Bluetooth keeps the Mac from sleeping on its own when idle.
+
+The other known limits are in the [README](README.md#known-limits).

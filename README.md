@@ -24,7 +24,8 @@ Tested on the machine described under [Tested configuration](#tested-configurati
 | Wi-Fi: scan, join, WPA2-Personal, 802.11ac (80 MHz, 2 streams) | Works | Joins take about 0.25 s |
 | WPA3 transition networks | Works | Joined on the WPA2 side |
 | Signal, noise and rate in macOS | Works | Noise is measured on the home channel |
-| Sleep and wake, Wi-Fi off and on | Works | The firmware is reloaded on wake. Bluetooth takes longer to come back |
+| Wi-Fi after sleep and wake, Wi-Fi off and on | Works | The firmware is reloaded on wake. Bluetooth takes longer to come back |
+| Putting the Mac to sleep | Problem | A connected Bluetooth LE mouse cancels sleep; see [Known limits](#known-limits) |
 | AirDrop, both directions (iPhone and Mac) | Works | Receive about 670 kB/s, send about 255 kB/s |
 | Personal Hotspot and Instant Hotspot, 2.4 and 5 GHz | Works | Needs all three Bluetooth kexts and `-qcaadv` |
 | Bluetooth: pairing, audio (A2DP), LE mice, keyboards and game controllers | Works | LE devices need `-btlfxlemask` |
@@ -96,6 +97,7 @@ Without the five AirDrop arguments the kext is a plain Wi-Fi driver. The full li
 
 - **One machine.** Everything above was tested on one board. Other WCN785x devices share the firmware but are untested.
 - **Tied to macOS builds.** AirDrop depends on the layout of Apple's AWDL classes, and the Bluetooth advertising path patches `bluetoothd` in memory. Both are checked per build and must be re-verified for every macOS update.
+- **Sleep with a Bluetooth LE mouse.** On the test machine on 2026-11-15, with a Bluetooth LE mouse connected, macOS cancelled sleep about a second after it began (the Bluetooth daemon reported the mouse as user activity), and Bluetooth kept the Mac from sleeping on its own when idle. Not fixed yet. The Wi-Fi driver itself recovers after a wake.
 - **AirDrop sending is slower than receiving.** Outgoing data goes one frame at a time through the firmware's management path.
 - **The `bluetoothd` patches are process-wide.** Use the WCN7850 as the only Bluetooth controller.
 - **Not tested with AMFI on.** The test machine relaxes AMFI for its graphics driver.
