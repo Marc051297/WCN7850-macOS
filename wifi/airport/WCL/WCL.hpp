@@ -125,9 +125,15 @@ inline bool makeBeaconUpdate(uint32_t receivedDelta, int rssi, int noise, LqmBea
     if (!receivedDelta)
         return false;
     out.receivedDelta = receivedDelta;
-    // We counted received beacons, not scheduled ones. Do not report zero
-    // loss by inventing an equal scheduled count. Radio fields stand alone.
-    out.snapshotValid = 1;
+    // The beacon counters are what WCL's network manager watches. With them left invalid (f2s, the noise
+    // work) it saw no beacons at all and left the network 60 s after every join:
+    //   [wcl] leaveNetworkCommand: ask to leave network due to <missed beacons timeout>   (25G342, 2026-11-15 14:28:39)
+    // This update is only built when beacons of the joined BSS were received since the last one
+    // (receivedDelta > 0), so the counters say exactly that: these beacons arrived. The scheduled count
+    // equals the received one, as in f2r, which ran for days this way. It is not a measurement of beacon
+    // loss; a real schedule count needs the beacon interval and the time the radio spent on AWDL visits.
+    out.scheduledDelta = receivedDelta;
+    out.beaconValid = out.snapshotValid = out.countersValid = 1;
     if (rssi >= -127 && rssi < 0) {
         out.rssiValid = 1;
         out.rssi = rssi;

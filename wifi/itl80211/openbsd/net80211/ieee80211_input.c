@@ -2753,6 +2753,10 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     status =  LE_READ_2(frm); frm += 2;
 
     ic->ic_assoc_status = status;
+#ifdef AIRPORT_WCL
+    if (status != IEEE80211_STATUS_SUCCESS)
+        ic->ic_wcl_early_m1_len = 0;	/* JL: nothing to answer on a refused association */
+#endif
 #ifndef AIRPORT_WCL
     if (status == IEEE80211_STATUS_SUCCESS)
 #endif
@@ -2936,6 +2940,13 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     
     ieee80211_new_state(ic, IEEE80211_S_RUN,
                         IEEE80211_FC0_SUBTYPE_ASSOC_RESP);
+#ifdef AIRPORT_WCL
+    /* JL: a message 1 that overtook this response is answered now, in the order the access point sent them */
+    if (ic->ic_flags & IEEE80211_F_RSNON)
+        ieee80211_wcl_replay_early_msg1(ic, ni);
+    else
+        ic->ic_wcl_early_m1_len = 0;
+#endif
 }
 
 /*-

@@ -151,11 +151,12 @@ int main() {
     QwzSignal::Reading bad{};QwzSignal::record(bad,5180,1,0,0,0,1);assert(QwzSignal::busy(bad,5180,1,0)==-1);
     QwzSignal::record(bad,5180,1,0,0,100,101);assert(QwzSignal::busy(bad,5180,1,0)==-1);
     assert(!QwzSignal::record(bad,5180,1,0,0x123400a4,0,0));
-    // Actual native LQM constructor: no invented CCA, beacon schedule or SNR.
+    // Actual native LQM constructor: no invented CCA or SNR. The beacon counters stay valid and equal:
+    // WCL leaves the network after 60 s without them (recorded on f2s, missed beacons timeout).
     AirportWCL::LqmBeaconUpdate u;
     assert(AirportWCL::makeBeaconUpdate(8,-55,-92,u));
     assert(u.rssiValid && u.noiseValid && u.snrValid && u.snr==37 && !u.ccaValid);
-    assert(u.receivedDelta==8 && u.scheduledDelta==0 && !u.beaconValid && !u.countersValid && u.snapshotValid);
+    assert(u.receivedDelta==8 && u.scheduledDelta==8 && u.beaconValid && u.countersValid && u.snapshotValid);
     assert(AirportWCL::makeBeaconUpdate(8,-55,0,u,0) && !u.noiseValid && !u.snrValid && u.ccaValid && u.cca==0);
     assert(AirportWCL::makeBeaconUpdate(8,-100,-80,u,101) && !u.snrValid && !u.ccaValid);
     assert(AirportWCL::makeBeaconUpdate(8,0,-1,u) && !u.rssiValid && !u.noiseValid && !u.snrValid);

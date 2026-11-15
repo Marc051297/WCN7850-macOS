@@ -20,7 +20,12 @@ constexpr uint64_t kPeerScheduleStaleUS = 2000000;  // No sync heard for this lo
 constexpr uint64_t kPeerPauseEarlyUS = 3000;        // Pause this long before the peer leaves.
 constexpr uint64_t kPeerResumeLateUS = 1000;        // Resume this long after it returns.
 constexpr uint64_t kPeerPauseMaxUS = 150000;        // Longest pause when the away run isn't known.
-constexpr uint64_t kPeerPauseCeilingUS = 450000;    // Longest pause even for a long predicted run.
+// WCN7850 (JL): 600 ms, was 450 ms upstream. A receiver in the sparse idle sequence recorded on 2026-11-15
+// (on our channel in entries 2 and 9 only) is away for 8 entries, 524 ms, once per sequence. At 450 ms the hold
+// was broken 74 ms before the receiver returned, and for the next 50 ms (kPeerPauseHoldOffUS) frames went out
+// to a receiver that was not there: about one forced release a second and 15 % of data frames unacknowledged in
+// the recorded sends, and a transfer's last packets (a cancel) could be lost that way. 600 ms covers nine entries.
+constexpr uint64_t kPeerPauseCeilingUS = 600000;    // Longest pause even for a long predicted run.
 constexpr uint64_t kPeerEdgeUS = 1500;              // Frames this close to an entry edge aren't counted.
 constexpr uint32_t kPeerCalibrateFrames = 300;
 constexpr uint32_t kPeerCalibrateMaxAwayPercent = 3;

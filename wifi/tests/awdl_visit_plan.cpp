@@ -69,5 +69,19 @@ int main() {
         assert(!planVisit(timing, queue, 4, 44, t0 + 100, &delay, &run));    // Schedules are for another cell channel.
         assert(!planVisit(timing, queue, 0, 149, t0 + 100, &delay, &run) && !planVisit(timing, nullptr, 4, 149, t0, &delay, &run));
     }
+    {   // The idle phone's longest absence, 8 entries (524 ms), is held through without a forced release:
+        // the hold ends when the receiver is back, not 74 ms before (the ceiling was 450 ms).
+        const uint8_t seq[16] = {44, 44, 149, 0, 0, 0, 0, 0, 6, 149, 44, 0, 0, 0, 0, 0};
+        const auto s = schedule(seq, t0);
+        const uint64_t away = t0 + 10 * E + 5000;                       // Just after entry 9 ends.
+        assert(s.shouldPause(away));
+        const uint64_t limit = s.pauseLimitUS(away);
+        assert(limit > 8 * E - 5000 && limit < kPeerPauseCeilingUS);   // Set by the run, not cut by the ceiling.
+        PeerPauseState pause{};
+        assert(pause.step(true, away, limit) == 1);
+        for (uint64_t t = away; t < t0 + 18 * E - 2000; t += 1000)     // Entry 2 of the next sequence starts at 18 E.
+            assert(pause.step(s.shouldPause(t), t, s.pauseLimitUS(t)) == 0 && pause.paused);
+        assert(pause.step(s.shouldPause(t0 + 18 * E + 2000), t0 + 18 * E + 2000, 0) == -1 && pause.forcedResumes == 0);
+    }
     puts("receiver schedule -> next run on our channel -> visit plan: PASS");
 }

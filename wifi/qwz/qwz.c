@@ -15935,6 +15935,7 @@ qwz_frame_is_eapol(struct mbuf *m)
 	return p[0] == 0xaa && p[1] == 0xaa && p[2] == 0x03 && p[6] == 0x88 && p[7] == 0x8e;
 }
 
+/* status: a TQM release reason (0 = acknowledged), -1 = released with no verdict, -2 = the firmware's own completion says acknowledged, -3 = it says dropped or expired */
 static void
 qwz_eapol_tx_done(struct qwz_tx_data *tx_data, int status)
 {
@@ -15945,8 +15946,10 @@ qwz_eapol_tx_done(struct qwz_tx_data *tx_data, int status)
 	tx_data->flags &= ~QWZ_TXF_EAPOL;
 	if (!qwz_log_ratelimit(&lines, 96, 8))
 		return;
-	if (status < 0)
+	if (status == -1)
 		qwz_log("airport: rsn: eapol frame tx done: released by the firmware without a transmit status\n");
+	else if (status < -1)
+		qwz_log("airport: rsn: eapol frame tx done: firmware completion (%s)\n", status == -2 ? "acknowledged" : "not acknowledged: dropped or expired");
 	else
 		qwz_log("airport: rsn: eapol frame tx done: status %d (%s)\n", status,
 		    status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED ? "acknowledged" : "not acknowledged");
@@ -15993,6 +15996,8 @@ qwz_dp_tx_htt_tx_complete_buf(struct qwz_softc *sc, struct dp_tx_ring *tx_ring,
     struct qwz_dp_htt_wbm_tx_status *ts)
 {
 	/* Not using Tx status info for now. Just free the buffer. */
+	if (ts->msdu_id < sc->hw_params.tx_ring_size)	/* JL: the verdict for a key-handshake frame, before the slot is freed */
+		qwz_eapol_tx_done(&tx_ring->data[ts->msdu_id], ts->acked ? -2 : -3);
 	qwz_dp_tx_free_txbuf(sc, ts->msdu_id, tx_ring);
 }
 

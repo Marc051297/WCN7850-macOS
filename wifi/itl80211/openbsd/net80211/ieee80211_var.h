@@ -456,6 +456,11 @@ struct ieee80211com {
     uint64_t ic_wcl_rx_packets[4];
     bool ic_wcl_scan_idle;   /* scan finished, nothing asked for: wait for macOS */
     uint8_t ic_wcl_join_chan; /* JL: the 20 MHz channel the pending join named, scanned alone first; 0 = none or already tried */
+    /* JL: a 4-way message 1 that arrived before the association response was processed (data and management frames
+     * come up through different rings): kept here and answered when the association completes. Length 0 = none. */
+    uint16_t ic_wcl_early_m1_len;
+    uint8_t ic_wcl_early_m1_bssid[6];
+    uint8_t ic_wcl_early_m1[256];
 #endif
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
 
@@ -706,6 +711,8 @@ struct ieee80211_ess {
 #define IEEE80211_EVT_DRIVER_STOPPED 7
 #define IEEE80211_EVT_DRIVER_RESET_BEGIN 8
 #define IEEE80211_EVT_DRIVER_INIT_FAILED 9 /* data is a positive errno cast through uintptr_t */
+struct ieee80211_node;
+void ieee80211_wcl_replay_early_msg1(struct ieee80211com *, struct ieee80211_node *);	/* JL: ieee80211_pae_input.c */
 struct ieee80211_beacon_event {
     const struct ieee80211_node *node;
     const uint8_t *ies;

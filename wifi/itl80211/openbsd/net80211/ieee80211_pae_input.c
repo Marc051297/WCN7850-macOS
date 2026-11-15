@@ -270,6 +270,28 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
      */
     if (ni->ni_rsn_supp_state == RSNA_SUPP_INITIALIZE) {
         DPRINTF(("unexpected in state: %d\n", ni->ni_rsn_supp_state));
+#ifdef AIRPORT_WCL
+        /*
+         * JL (join lifecycle): message 1 overtook the association response. The response is a management
+         * frame (the firmware's WMI event), message 1 a data frame (the receive ring), and the access point
+         * sends them milliseconds apart; when the ring is served first the supplicant has not been armed yet.
+         * The message used to be dropped and the join waited a second for the access point to repeat it
+         * (recorded 2026-11-15 14:24, join of 1.2 s instead of 0.2 s). It is kept, for the BSS being
+         * associated only, and answered by ieee80211_recv_assoc_resp as soon as the association completes.
+         */
+        {
+            const size_t total = 4 + (size_t)BE_READ_2(key->len);
+
+            if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_state == IEEE80211_S_ASSOC && ni == ic->ic_bss &&
+                total >= sizeof(*key) && total <= sizeof(ic->ic_wcl_early_m1)) {
+                memcpy(ic->ic_wcl_early_m1, key, total);
+                IEEE80211_ADDR_COPY(ic->ic_wcl_early_m1_bssid, ni->ni_macaddr);
+                ic->ic_wcl_early_m1_len = (uint16_t)total;
+                qwz_log("airport: rsn: 4-way msg1 arrived before the association response was processed: kept, to be answered when the association completes\n");
+                return;
+            }
+        }
+#endif
         {
             static unsigned int earlyLines;	/* JL: an AP repeats message 1; the ring is small */
 
@@ -347,6 +369,30 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
     
     /* send message 2 to authenticator using TPTK */
     (void)ieee80211_send_4way_msg2(ic, ni, key->replaycnt, &tptk);
+}
+
+/*
+ * JL (join lifecycle): answer a message 1 that was kept because it arrived before the association response
+ * (see ieee80211_recv_4way_msg1). Called once the supplicant is armed for `ni`. The kept copy is used once and
+ * only for the BSS it came from; anything else is discarded.
+ */
+void
+ieee80211_wcl_replay_early_msg1(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+#ifdef AIRPORT_WCL
+    const uint16_t length = ic->ic_wcl_early_m1_len;
+
+    ic->ic_wcl_early_m1_len = 0;
+    if (length < sizeof(struct ieee80211_eapol_key) || length > sizeof(ic->ic_wcl_early_m1) || ni == NULL ||
+        !IEEE80211_ADDR_EQ(ic->ic_wcl_early_m1_bssid, ni->ni_macaddr) ||
+        ni->ni_rsn_supp_state == RSNA_SUPP_INITIALIZE)
+        return;
+    qwz_log("airport: rsn: answering the 4-way msg1 that arrived before the association response\n");
+    ieee80211_recv_4way_msg1(ic, (struct ieee80211_eapol_key *)ic->ic_wcl_early_m1, ni);
+#else
+    (void)ic;
+    (void)ni;
+#endif
 }
 
 #ifndef IEEE80211_STA_ONLY

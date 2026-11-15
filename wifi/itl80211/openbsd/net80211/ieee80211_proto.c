@@ -1444,6 +1444,9 @@ justcleanup:
 			break;
 		}
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
+#ifdef AIRPORT_WCL
+		ic->ic_wcl_early_m1_len = 0;	/* JL: a kept message 1 belongs to one association attempt */
+#endif
 		ni->ni_assoc_fail = 0;
 		if (ic->ic_flags & IEEE80211_F_RSNON)
 			ieee80211_crypto_clear_groupkeys(ic);
@@ -1458,6 +1461,9 @@ justcleanup:
 		ni->ni_associd = 0;
 		ni->ni_rstamp = 0;
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
+#ifdef AIRPORT_WCL
+		ic->ic_wcl_early_m1_len = 0;	/* JL: a kept message 1 belongs to one association attempt */
+#endif
 		if (ic->ic_flags & IEEE80211_F_RSNON)
 			ieee80211_crypto_clear_groupkeys(ic);
 		switch (ostate) {
@@ -1509,6 +1515,9 @@ justcleanup:
 		if (ostate == IEEE80211_S_RUN)
 			ieee80211_check_wpa_supplicant_failure(ic, ni);
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
+#ifdef AIRPORT_WCL
+		ic->ic_wcl_early_m1_len = 0;	/* JL: a kept message 1 belongs to one association attempt */
+#endif
 		if (ic->ic_flags & IEEE80211_F_RSNON)
 			ieee80211_crypto_clear_groupkeys(ic);
 		switch (ostate) {
