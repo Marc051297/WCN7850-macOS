@@ -48,7 +48,9 @@ int qwz_monreap = 0, qwz_hintfix = 1;	/* K2c: debug.qwz.monreap (0 = off = K2b, 
 int qwz_monfmt = 0;		/* K4 (M1): debug.qwz.monfmt, see qwz_life.h */
 int qwz_nativepeerpause = 1;
 int qwz_moncoexalign = 130;	/* AL (aligned visits): the longest visit timed to a receiver's schedule, ms; 0 = off; read live */
-int qwz_nativeresend = 6, qwz_monrate = 12, qwz_regcc = 1;	/* f2u: debug.qwz.nativeresend, debug.qwz.monrate, debug.qwz.regcc, see qwz_life.h */
+int qwz_nativeresend = 6, qwz_monrate = 24, qwz_regcc = 1;	/* f2u: debug.qwz.nativeresend, debug.qwz.monrate (24 since f2v: run on hardware 2026-11-15), debug.qwz.regcc, see qwz_life.h */
+int qwz_nativescanrest = 120;	/* f2v (SD): debug.qwz.nativescanrest, see qwz_life.h */
+int qwz_pmfstrict = 1, qwz_joinidle = 1;	/* f2v (PM, JR): debug.qwz.pmfstrict, debug.qwz.joinidle, see qwz_life.h */
 int qwz_joinhint = 1, qwz_authfast = 1;	/* JL (join lifecycle): debug.qwz.joinhint, debug.qwz.authfast */
 int qwz_nativefmt = 0;
 /* K5 (L1-C1): debug.qwz.moncoex and its sub-switches, see qwz_mon.h; moncoex 0 = K4 exactly; scan and cred default to 1 and only act while a coex cell runs */
@@ -785,9 +787,15 @@ SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexalign, CTLFLAG_RW | CTLFLAG_LOCKED,
 SYSCTL_INT(_debug_qwz, OID_AUTO, nativeresend, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_nativeresend, 0, "RS: the most submissions one native AirDrop data frame gets when the receiver does not acknowledge it; a frame waits, in order, until the receiver is expected on the channel, at most 700 ms from its first submission (default 6, at most 16); 0 = sent once and dropped, as up to f2t; read at each completion");
 SYSCTL_INT(_debug_qwz, OID_AUTO, monrate, CTLFLAG_RW | CTLFLAG_LOCKED,
-    &qwz_monrate, 0, "RT: the AirDrop cell's send rate in Mbit/s, the vdev MGMT_RATE (6, 9, 12, 18, 24, 36, 48 or 54; default 12); 0 = the firmware's own (6 on 5 GHz); set when the cell starts and, when changed, at the cell's next visit; debug.qwz.monparams above 0 keeps its own fixed 12");
+    &qwz_monrate, 0, "RT: the AirDrop cell's send rate in Mbit/s, the vdev MGMT_RATE (6, 9, 12, 18, 24, 36, 48 or 54; default 24); 0 = the firmware's own (6 on 5 GHz); set when the cell starts and, when changed, at the cell's next visit; debug.qwz.monparams above 0 keeps its own fixed 12");
 SYSCTL_INT(_debug_qwz, OID_AUTO, regcc, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_regcc, 0, "CC: 1 = the itlwm_cc country is asked of the firmware with WMI_SET_CURRENT_COUNTRY first (Linux's command for WCN7850), the init form only when that is not taken (default); 0 = the init form only, as up to f2t; read at each firmware start; channel permissions always come from the firmware's reply");
+SYSCTL_INT(_debug_qwz, OID_AUTO, nativescanrest, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_nativescanrest, 0, "SD: while a native AirDrop transfer is running, an undirected background scan is answered at once from the list of networks already known, and a real scan takes the radio at most once in this many seconds (default 120); 0 = every scan takes the radio, as up to f2u; directed scans, join scans and scans while not associated always run; read at each scan request");
+SYSCTL_INT(_debug_qwz, OID_AUTO, pmfstrict, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_pmfstrict, 0, "PM: 1 = the firmware protects management frames for a peer only when the association agreed it: the AP offers it and this station's own RSN element offers it too (default); 0 = whenever the AP offers it, as up to f2u; read at each association");
+SYSCTL_INT(_debug_qwz, OID_AUTO, joinidle, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_joinidle, 0, "JR: 1 = when the station leaves a BSS and macOS has asked for neither a scan nor a join, no sweep of all channels starts; the next request starts at once (default); 0 = the sweep, as up to f2u; read at each such transition");
 SYSCTL_INT(_debug_qwz, OID_AUTO, joinhint, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_joinhint, 0, "JL: 1 = the first scan of a join takes the channel the join request names, alone, with a 120/160 ms dwell; the full sweep follows only when the BSS is not found there (default); 0 = every join starts with the full sweep; read at each join scan");
 SYSCTL_INT(_debug_qwz, OID_AUTO, authfast, CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -979,6 +987,9 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_monreap);
 	sysctl_register_oid(&sysctl__debug_qwz_hintfix);
 	sysctl_register_oid(&sysctl__debug_qwz_joinhint);
+	sysctl_register_oid(&sysctl__debug_qwz_pmfstrict);
+	sysctl_register_oid(&sysctl__debug_qwz_joinidle);
+	sysctl_register_oid(&sysctl__debug_qwz_nativescanrest);
 	sysctl_register_oid(&sysctl__debug_qwz_nativeresend);
 	sysctl_register_oid(&sysctl__debug_qwz_monrate);
 	sysctl_register_oid(&sysctl__debug_qwz_regcc);
@@ -1058,6 +1069,9 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_monreap);
 	sysctl_unregister_oid(&sysctl__debug_qwz_hintfix);
 	sysctl_unregister_oid(&sysctl__debug_qwz_joinhint);
+	sysctl_unregister_oid(&sysctl__debug_qwz_pmfstrict);
+	sysctl_unregister_oid(&sysctl__debug_qwz_joinidle);
+	sysctl_unregister_oid(&sysctl__debug_qwz_nativescanrest);
 	sysctl_unregister_oid(&sysctl__debug_qwz_nativeresend);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monrate);
 	sysctl_unregister_oid(&sysctl__debug_qwz_regcc);

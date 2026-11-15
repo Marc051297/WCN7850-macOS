@@ -211,6 +211,8 @@ void	qwz_mon_native_get_tx_stats(struct qwz_mon_native_tx_stats *);
 int	qwz_mon_native_resend_first(unsigned int from, uint8_t *dest);
 int	qwz_mon_native_resend_blocks(const uint8_t *dest);
 int	qwz_mon_native_resend_send(unsigned int index);
+/* SD (f2v): 1 while a native AirDrop transfer is running: 50 native data frames, sent and received, in a second, and for 6 s after the last such second. */
+int	qwz_mon_native_busy(void);
 /* qwz_attach(): allocates the capture ring and remembers the softc. */
 void	qwz_mon_attach(struct qwz_softc *);
 /* ItlQwz::detachGated (merge glue F): ends a cell host-only, frees the capture buffers, the lock and the 64 maps, forgets the softc. */

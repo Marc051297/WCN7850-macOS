@@ -450,10 +450,29 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         if (!usable)
             return kIOReturnUnsupported;
     }
+    // SD (f2v), debug.qwz.nativescanrest: while a native AirDrop transfer is running, an undirected background scan of the associated station is
+    // answered at once from the node table, as the coex branch above does, and the radio stays with the transfer. A real scan still runs once the last
+    // one is nativescanrest seconds old, so the table never grows older than that. Directed scans (an SSID, a hotspot list: scanNeedsRadio), a scan for
+    // one BSSID, join scans and scans outside RUN never come here.
+    if (qwz_nativescanrest > 0 && ic->ic_state == IEEE80211_S_RUN && !AirportWCL::scanNeedsRadio(scan, request, 0x1550) &&
+        !(scan.bssid[0] | scan.bssid[1] | scan.bssid[2] | scan.bssid[3] | scan.bssid[4] | scan.bssid[5]) &&
+        wclLastRadioScanMs != 0 && wclScanNowMs() - wclLastRadioScanMs < uint64_t(qwz_nativescanrest) * 1000 && qwz_mon_native_busy()) {
+        static unsigned int transferScans;
+        if (qwz_log_ratelimit(&transferScans, 24, 8))
+            scanLog("transfer", "native AirDrop transfer running: answered from the node table");
+        wclScanStartMs = wclScanNowMs();
+        wclScanStartId = scan.identifier;
+        scanPending = true;
+        scanCompleted = false;
+        scanRestartPending = scanSkipCompletion = false;
+        finishWCLScan(kIOReturnSuccess);
+        return kIOReturnSuccess;
+    }
     const int logState = ic->ic_state, logIdle = ic->ic_wcl_scan_idle, logPrev = ic->ic_wcl_scan_ssid_length;
     wclScanStartMs = wclScanNowMs();
     wclScanStartId = scan.identifier;
     scanPending = true;
+    wclScanUsedRadio = true;	// SD (f2v)
     scanCompleted = false;
     scanRestartPending = false;
     // The in-flight firmware sweep was built before this request was latched.
@@ -478,6 +497,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         ieee80211_begin_cache_bgscan(&ic->ic_if);
         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
             scanPending = false;
+            wclScanUsedRadio = false;
             ic->ic_wcl_scan_requested = false;
             scanSource->cancelTimeout();
             scanLog("Busy", "bgscan declined in RUN", logState, logIdle, logPrev);
@@ -488,6 +508,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         int error = ic->ic_newstate(ic, IEEE80211_S_SCAN, -1);
         if (error) {
             scanPending = false;
+            wclScanUsedRadio = false;
             ic->ic_wcl_scan_requested = false;
             scanSource->cancelTimeout();
             scanLog("Error", "ic_newstate(SCAN) failed", logState, logIdle, logPrev);
@@ -530,6 +551,9 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
                     status == kIOReturnAborted ? "Aborted" : "other", (unsigned long long)(wclScanNowMs() - wclScanStartMs),
                     scanCompleted, scanSkipCompletion, ieee80211_state_name[lic->ic_state], lic->ic_wcl_scan_idle);
     }
+    if (wclScanUsedRadio && status == kIOReturnSuccess)	// SD (f2v): the node table is this fresh
+        wclLastRadioScanMs = wclScanNowMs();
+    wclScanUsedRadio = false;
     scanPending = false;
     scanCompleted = false;
     scanRestartPending = scanSkipCompletion = false;

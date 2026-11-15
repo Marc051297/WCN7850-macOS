@@ -97,6 +97,8 @@ static int qwz_nativeresend=6;
 static int txReady=1,slotsFree=1;
 static int qwz_mon_native_tx_ready() {return txReady;}
 static std::deque<unsigned> inFlight;   // slot ids in the order the firmware took them
+static unsigned busyNotes;
+static void qwz_mon_busy_note(qwz_softc *) {++busyNotes;}   // SD (f2v): every native data submission counts toward "a transfer is running"
 ''' + helpers + r'''
 // The submit path in miniature: its own copy of the frame in a free slot of the cell's ring (ids 8 to 63), then the
 // production statements that record the frame's history in that slot.
@@ -293,6 +295,7 @@ int main() {
     assert(sc.mon_rs_count==0 && !sc.mon_rs[0].m && !sc.mon_tx_tries[8] && !sc.mon_rs_ctx_tries);
     reset(sc);
     assert(allocated==freed);
+    assert(busyNotes>100);   // first submissions and resends alike
     puts("ok: unacknowledged native data frames wait in order, go again when their receiver is back, keep their place after another miss, and stay bounded");
 }
 '''

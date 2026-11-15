@@ -571,6 +571,36 @@ qwz_mon_rx_hook(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint16_t
 }
 
 /*
+ * SD (f2v), debug.qwz.nativescanrest. Whether a native AirDrop transfer is running, for the scan path (WCL.cpp): a background scan takes the radio off
+ * the AirDrop channel for 0.6 to 4.2 s (f2u hardware: 13 s of scans in 61 s of a transfer). Native data frames, sent and received, are counted in
+ * one-second windows; QWZ_MON_BUSY_FRAMES in a window is a transfer (idle AWDL traffic is a few frames a second), and it counts as running for
+ * QWZ_MON_BUSY_HOLD_NS after the last such window, longer than the longest scan, so that the second scan of a pair is judged as the first was.
+ */
+#define QWZ_MON_BUSY_FRAMES	50
+#define QWZ_MON_BUSY_HOLD_NS	6000000000ULL
+
+static void
+qwz_mon_busy_note(struct qwz_softc *sc)
+{
+	const uint64_t now = getnsecuptime();
+
+	if (now - sc->mon_busy_win_ns >= 1000000000ULL) {
+		sc->mon_busy_win_ns = now;
+		sc->mon_busy_cur = 0;
+	}
+	if (++sc->mon_busy_cur >= QWZ_MON_BUSY_FRAMES)
+		sc->mon_busy_until_ns = now + QWZ_MON_BUSY_HOLD_NS;
+}
+
+int
+qwz_mon_native_busy(void)
+{
+	struct qwz_softc *sc = qwz_mon_sc;
+
+	return sc != NULL && sc->mon_active && sc->mon_native_owned && getnsecuptime() < sc->mon_busy_until_ns;
+}
+
+/*
  * RS (f2u), debug.qwz.nativeresend. A native AirDrop data frame (qwz_mon_tx_raw) the receiver did not acknowledge is no longer dropped. The completion
  * says the firmware has finished with it, so its mbuf leaves the transmit slot and waits in sc->mon_rs, ordered by the frame's first submission. The
  * native pump sends the oldest waiting frame of a receiver again when that receiver is expected on the channel (the per-destination hold), with the Retry
@@ -927,6 +957,7 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 	sc->mon_tx_kind[slot] = kind;
 	if (slot >= 0 && slot < (int)nitems(sc->mon_tx_tries)) {	/* RS (f2u): only a native data frame has a history; every other frame clears the slot's */
 		if (nativeMode >= 0 && kind == 2) {
+			qwz_mon_busy_note(sc);	/* SD (f2v) */
 			sc->mon_tx_tries[slot] = sc->mon_rs_ctx_tries != 0 ? sc->mon_rs_ctx_tries : 1;
 			sc->mon_tx_serial[slot] = sc->mon_rs_ctx_tries != 0 ? sc->mon_rs_ctx_serial : ++sc->mon_rs_serial;
 			sc->mon_tx_first_ns[slot] = sc->mon_rs_ctx_tries != 0 ? sc->mon_rs_ctx_first_ns : getnsecuptime();
@@ -1443,6 +1474,8 @@ moncap_put(const uint8_t *frame, size_t len, uint16_t flags, uint8_t decap,
 		qwz_mon_sc->mon_lat.rx_bytes += len;
 		qwz_mon_sc->mon_lat.rx_frames++;
 	}
+	if (native != NULL && qwz_mon_sc != NULL && len >= 24 && (frame[0] & 0x0c) == 0x08)
+		qwz_mon_busy_note(qwz_mon_sc);	/* SD (f2v): a data frame received for the native path */
 	if (native != NULL)	/* F2: the native AWDL path sees the frame first; the userspace ring is unaffected */
 		native(__atomic_load_n(&qwz_mon_native_rx_arg, __ATOMIC_ACQUIRE), frame, len, flags, chan, rssi);
 	if (moncap_ring == NULL)
@@ -2639,6 +2672,8 @@ qwz_mon_start(struct qwz_softc *sc, int chan)
 k5_coex_guards_done:	/* K5 (L1-C2) */
 	memset(&sc->mon_stats, 0, sizeof(sc->mon_stats));
 	qwz_mon_rs_flush(sc);	/* RS (f2u): nothing waits from an earlier cell */
+	sc->mon_busy_win_ns = sc->mon_busy_until_ns = 0;	/* SD (f2v) */
+	sc->mon_busy_cur = 0;
 	sc->mon_rate_applied = -1;	/* RT (f2u) */
 	sc->mon_stats.ufr_inflight = 0;	/* K2b (W1b): no user frame is in flight in a new cell */
 	memset(sc->mon_tx_kind, 0, sizeof(sc->mon_tx_kind));	/* K2b (W1b): no stale per-slot kind from the previous cell may count against the cap */

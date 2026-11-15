@@ -458,6 +458,8 @@ private:
     bool scanCompleted;
     bool scanSkipCompletion;
     bool scanRestartPending = false;
+    bool wclScanUsedRadio = false;      // SD (f2v): the pending scan was given to the radio, not answered from the node table
+    uint64_t wclLastRadioScanMs = 0;    // SD (f2v): when the last scan that used the radio ended with success; 0 = none yet
     bool wclBssValid;
     bool wclLinkIndicated;
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];

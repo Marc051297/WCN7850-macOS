@@ -1734,6 +1734,15 @@ qwz_newstate_task(void *arg)
 				splx(s);
 				return;
 			}
+#ifdef AIRPORT_WCL
+			/* JR (f2v): idle in SCAN with nothing asked by macOS: a second request to be in SCAN (the AP's deauthentication and macOS's own
+			 * disassociate arrive together) starts no sweep either. beginWCLScan and startWCLJoin clear ic_wcl_scan_idle before they ask. */
+			if (qwz_joinidle != 0 && ic->ic_wcl_scan_idle && !ic->ic_wcl_scan_requested && !ic->ic_wcl_join_requested) {
+				refcnt_rele_wake(&sc->task_refs);
+				splx(s);
+				return;
+			}
+#endif
 			/* Firmware is no longer scanning. Do another scan. */
 			goto next_scan;
 		}
@@ -1777,10 +1786,26 @@ qwz_newstate_task(void *arg)
 		break;
 
 	case IEEE80211_S_SCAN:
+		/*
+		 * JR (f2v), debug.qwz.joinidle. macOS asks for every scan and names what it joins (ieee80211_end_scan relies on the same and idles after a
+		 * sweep). Leaving a BSS with neither asked used to start a sweep of every channel here: 39 channels, 4.8 s, and the node table had just
+		 * been emptied. The join macOS sent 0.2 s after an iPhone hotspot's deauthentication waited behind that sweep (f2u hardware, 591.2 to
+		 * 596.0 s). Now the stack goes straight to the state that sweep ends in: SCAN, idle, waiting for beginWCLScan or startWCLJoin, which
+		 * both restart it from there.
+		 */
+#ifdef AIRPORT_WCL
+		if (qwz_joinidle != 0 && ostate > IEEE80211_S_SCAN && !ic->ic_wcl_scan_requested && !ic->ic_wcl_join_requested) {
+			ieee80211_reset_scan(ifp);
+			ic->ic_wcl_scan_idle = true;
+			qwz_log("qwz: join: left the BSS with no scan or join asked: no sweep, waiting for the next request\n");
+			goto scan_entered;
+		}
+#endif
 next_scan:
 		err = qwz_scan(sc);
 		if (err)
 			break;
+scan_entered:
 		if (ifp->if_flags & IFF_DEBUG)
 			printf("%s: %s -> %s\n", ifp->if_xname,
 			    ieee80211_state_name[ic->ic_state],
@@ -27524,6 +27549,39 @@ qwz_peer_assoc_h_basic(struct qwz_softc *sc, struct qwz_vif *arvif,
 	arg->qos_flag = 1;
 }
 
+/*
+ * PM (f2v): 1 when this station's own RSN element, as it goes into the association request, offers management frame protection (MFPC). That element is
+ * the one ieee80211_send_mgmt writes: a supplicant-supplied one (ic_rsn_ie_override, builds with USE_APPLE_SUPPLICANT only) when there is one, else the
+ * stack's own, which offers protection only with IEEE80211_C_MFP in ic_caps. This driver does not set that, so today the answer is 0.
+ */
+static int
+qwz_sta_offers_mfp(struct ieee80211com *ic)
+{
+#ifdef USE_APPLE_SUPPLICANT
+	const uint8_t *ie = ic->ic_rsn_ie_override;
+	const size_t len = ie[1];
+	size_t off, n;
+
+	if (len != 0) {
+		if (ie[0] != IEEE80211_ELEMID_RSN)
+			return 0;
+		off = 2 + 4;	/* version, group cipher suite */
+		if (len < off + 2)
+			return 0;
+		n = ie[2 + off] | (ie[2 + off + 1] << 8);
+		off += 2 + 4 * n;	/* pairwise cipher suites */
+		if (len < off + 2)
+			return 0;
+		n = ie[2 + off] | (ie[2 + off + 1] << 8);
+		off += 2 + 4 * n;	/* AKM suites */
+		if (len < off + 2)
+			return 0;	/* no RSN capabilities field: nothing offered */
+		return ((ie[2 + off] | (ie[2 + off + 1] << 8)) & IEEE80211_RSNCAP_MFPC) != 0;
+	}
+#endif
+	return (ic->ic_caps & IEEE80211_C_MFP) != 0;
+}
+
 void
 qwz_peer_assoc_h_crypto(struct qwz_softc *sc, struct qwz_vif *arvif,
     struct ieee80211_node *ni, struct peer_assoc_params *arg)
@@ -27535,10 +27593,21 @@ qwz_peer_assoc_h_crypto(struct qwz_softc *sc, struct qwz_vif *arvif,
 		if (ni->ni_rsnprotos == IEEE80211_PROTO_WPA)
 			arg->need_gtk_2_way = 1;
 
-		/* Enable PMF if the AP advertises MFP Capable or Required.
-		 * SAE (WPA3) mandates PMF (MFPR). */
-		if (ni->ni_rsncaps & (IEEE80211_RSNCAP_MFPC | IEEE80211_RSNCAP_MFPR))
-			arg->is_pmf_enabled = 1;
+		/*
+		 * PM (f2v), debug.qwz.pmfstrict. Management frame protection is in force only when the association agreed it: the AP offers it in its RSN
+		 * capabilities and this station offered it in the RSN element of its association request (Linux ath12k sets is_pmf_enabled from sta->mfp,
+		 * the negotiated state). The AP's offer alone used to switch it on in the firmware: an iPhone hotspot in WPA3 transition mode offers it,
+		 * macOS joined with WPA2 and no protection (f2u hardware, 2026-11-15 15:50), and the firmware was told to protect management frames
+		 * toward an AP that expected none from this station. SAE (WPA3) mandates PMF; that join carries the offer in its own RSN element.
+		 */
+		if (ni->ni_rsncaps & (IEEE80211_RSNCAP_MFPC | IEEE80211_RSNCAP_MFPR)) {
+			const int offered = qwz_sta_offers_mfp(ic);
+
+			if (qwz_pmfstrict == 0 || offered)
+				arg->is_pmf_enabled = 1;
+			qwz_log("qwz: join: pmf: the AP offers management frame protection (rsn caps 0x%04x), this station's RSN element %s it: firmware PMF %s (debug.qwz.pmfstrict %d)\n",
+			    (unsigned)ni->ni_rsncaps, offered ? "offers" : "does not offer", arg->is_pmf_enabled ? "on" : "off", qwz_pmfstrict);
+		}
 	}
 }
 

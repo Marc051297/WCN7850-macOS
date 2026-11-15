@@ -2456,6 +2456,9 @@ struct qwz_softc {
 	uint8_t				 mon_tx_tries[64];
 	uint32_t			 mon_tx_serial[64];
 	uint64_t			 mon_tx_first_ns[64];
+	/* SD (f2v), debug.qwz.nativescanrest: native AirDrop data frames, sent and received, counted in one-second windows; mon_busy_until_ns is until when a transfer counts as running (qwz_mon_native_busy) */
+	uint64_t			 mon_busy_win_ns, mon_busy_until_ns;
+	uint32_t			 mon_busy_cur;
 	int				 mon_rate_applied;	/* RT (f2u): the debug.qwz.monrate value the cell vdev was last given, -1 none since the cell started */
 	int				 mon_txp_valid, mon_txp_err;	/* K4 (M1), debug.qwz.monfmt: the next capture-vdev management send carries a tx_params TLV (set and cleared around one call by qwz_mon_tx_bytes); the error the firmware send returned for it */
 	uint32_t			 mon_txp_d0, mon_txp_d1;	/* K4 (M1): the two tx_params dwords of that send */

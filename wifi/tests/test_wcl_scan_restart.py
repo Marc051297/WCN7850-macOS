@@ -52,6 +52,9 @@ static uint64_t wclScanNowMs(){return nowMS;}
 static int qwz_mon_native_pause(ieee80211com *){return ENOTSUP;}
 static int qwz_mon_scan_hold(ieee80211com *){return 0;}
 static int qwz_mon_holding(ieee80211com *){return 0;}
+// SD (f2v): whether a native AirDrop transfer is running, and the switch.
+static int transferRunning,busyAsked,qwz_nativescanrest=120;
+static int qwz_mon_native_busy(){++busyAsked;return transferRunning;}
 static bool wclScanDecodeFault(const void *,char *,size_t){return false;}
 struct WCLScanLogState {bool scanPending,joinPending,skip,bgscan;int state,idle,prevSsidLength;};
 template<class... T> static void logWCLScanRequest(T...) {}
@@ -87,6 +90,7 @@ struct AirportItlwmSkywalkInterface {
     HAL hal;HAL *fHalService=&hal;Timer timer;Timer *scanSource=&timer;Driver driver;Driver *instance=&driver;
     bool scanPending=false,scanCompleted=false,scanSkipCompletion=false,scanRestartPending=false;
     bool joinPending=false,wclStopping=false;
+    bool wclScanUsedRadio=false;uint64_t wclLastRadioScanMs=0;   // SD (f2v)
     AirportItlwmSkywalkInterface(){hal.ic.ic_newstate=newstate;}
     IOReturn beginWCLScan(apple80211ScanRequest *);
     void finishWCLScan(IOReturn);void completeWCLScan();
@@ -148,6 +152,56 @@ int main() {
         assert(submissions==before+1 && !normal.scanSkipCompletion && !normal.scanRestartPending);
         normal.event(IEEE80211_EVT_SCAN_DONE);normal.completeWCLScan();
         assert(normal.driver.results.size()==1 && normal.driver.results[0]==kIOReturnSuccess);
+    }
+    // SD (f2v): while a native AirDrop transfer runs, an undirected background scan of the associated station is
+    // answered from the node table; the radio is taken at most once in debug.qwz.nativescanrest seconds.
+    {
+        uint8_t plain[0x1550];memset(plain,0,sizeof(plain));plain[0]=9;plain[0x40]=1;   // no SSID, no list, no channels, no BSSID
+        AirportItlwmSkywalkInterface t;auto &tc=t.hal.ic;tc.ic_state=IEEE80211_S_RUN;
+        auto radioScan=[&](uint8_t *request) {   // one scan that takes the radio and completes
+            const unsigned before=submissions;
+            assert(t.beginWCLScan(request)==kIOReturnSuccess && submissions==before+1 && t.scanPending && t.wclScanUsedRadio);
+            t.event(IEEE80211_EVT_SCAN_DONE);tc.ic_flags&=~IEEE80211_F_BGSCAN;t.completeWCLScan();
+            assert(!t.scanPending && !t.wclScanUsedRadio && t.driver.results.back()==kIOReturnSuccess);
+        };
+        auto answered=[&](uint8_t *request) {    // answered at once, the radio untouched
+            const unsigned before=submissions;const size_t results=t.driver.results.size();
+            assert(t.beginWCLScan(request)==kIOReturnSuccess && submissions==before);
+            assert(!t.scanPending && !tc.ic_wcl_scan_requested && !(tc.ic_flags&IEEE80211_F_BGSCAN));
+            assert(t.driver.results.size()==results+1 && t.driver.results.back()==kIOReturnSuccess);
+        };
+        // No radio scan has completed yet: the first one runs even during a transfer (the table would be empty).
+        transferRunning=1;radioScan(plain);
+        const uint64_t fresh=t.wclLastRadioScanMs;assert(fresh==nowMS);
+        // During the transfer the next ones are answered from the table, and the table's age is not renewed by them.
+        nowMS+=1000;answered(plain);nowMS+=60000;answered(plain);assert(t.wclLastRadioScanMs==fresh);
+        // Once the last radio scan is nativescanrest old, one real scan runs again.
+        nowMS+=59000;radioScan(plain);assert(t.wclLastRadioScanMs==nowMS);
+        nowMS+=5000;answered(plain);
+        // No transfer: every scan takes the radio, as before.
+        transferRunning=0;radioScan(plain);
+        // Switched off: as up to f2u, transfer or not.
+        transferRunning=1;qwz_nativescanrest=0;nowMS+=1000;radioScan(plain);qwz_nativescanrest=120;
+        // Never answered this way: a scan for an SSID, a hotspot list, one BSSID, or a scan while not associated.
+        nowMS+=1000;
+        {uint8_t r[0x1550];memcpy(r,plain,sizeof(r));r[0x1c]=4;memcpy(r+0x20,"abcd",4);radioScan(r);}
+        nowMS+=1000;{uint8_t r[0x1550];request(r);radioScan(r);}
+        nowMS+=1000;{uint8_t r[0x1550];memcpy(r,plain,sizeof(r));
+            AirportWCL::ScanRequest probe;assert(AirportWCL::decodeScan(r,0x1550,probe));
+            // the BSSID field of the request: find it by decoding, so the test follows WCL.hpp's layout
+            for(unsigned off=4;off<0x58;++off){memcpy(r,plain,sizeof(r));r[off]=0x5a;
+                AirportWCL::ScanRequest q;if(AirportWCL::decodeScan(r,0x1550,q)&&q.bssid[0]==0x5a){radioScan(r);break;}
+                assert(off<0x57);}}
+        nowMS+=1000;tc.ic_state=IEEE80211_S_SCAN;tc.ic_wcl_scan_idle=true;
+        {const unsigned before=submissions;assert(t.beginWCLScan(plain)==kIOReturnSuccess && submissions==before+1 && t.wclScanUsedRadio);
+         t.finishWCLScan(kIOReturnAborted);assert(!t.wclScanUsedRadio);}
+        // A scan the radio refused or that did not complete does not count as a fresh table.
+        tc.ic_state=IEEE80211_S_RUN;tc.ic_wcl_scan_idle=false;transferRunning=0;
+        const uint64_t last=t.wclLastRadioScanMs;nowMS+=1000;
+        declineBG=true;assert(t.beginWCLScan(plain)==kIOReturnBusy && !t.wclScanUsedRadio && t.wclLastRadioScanMs==last);declineBG=false;
+        assert(t.beginWCLScan(plain)==kIOReturnSuccess);nowMS+=20000;t.completeWCLScan();
+        assert(t.driver.results.back()==kIOReturnTimeout && t.wclLastRadioScanMs==last && !t.wclScanUsedRadio);
+        assert(busyAsked>0);
     }
     puts("actual WCL list-only overlap, real completion, deferred restart, deadline and abort: PASS");
 }
