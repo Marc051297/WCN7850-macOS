@@ -32,8 +32,11 @@ def digest(file):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--rollback-bundle', type=Path, required=True)
+    parser.add_argument('--source-base', required=True,
+                        help='Commit before the experimental.9 changes, for the review patch')
     parser.add_argument('--output', type=Path, default=ROOT/'build'/RELEASE)
     args = parser.parse_args()
+    args.rollback_bundle = args.rollback_bundle.resolve()
     target = args.output.resolve()
     if target.exists() or target.with_suffix('.zip').exists():
         raise SystemExit('Refusing to overwrite an existing versioned package')
@@ -54,6 +57,8 @@ def main():
     if info['CFBundleExecutable'] != 'BlueToolFixup':
         raise SystemExit('Unexpected bundle executable')
     commit = output('git', 'rev-parse', 'HEAD')
+    source_base = output('git', 'rev-parse', args.source_base+'^{commit}')
+    subprocess.run(['git', 'merge-base', '--is-ancestor', source_base, commit], cwd=REPO, check=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='qca-exp9-package-', dir=target.parent) as tmp:
         stage = Path(tmp)/RELEASE
@@ -105,11 +110,11 @@ published release. Private captures and Apple executables are excluded.
                 for item in tar:
                     gz.addfile(item, tar.extractfile(item) if item.isfile() else None)
         (stage/'source.tar').unlink()
-        patch = subprocess.check_output(['git', 'diff', commit+'^', commit,
+        patch = subprocess.check_output(['git', 'diff', source_base, commit,
                                          '--', 'bluetooth', 'docs/boot-arguments.md',
                                          'README.md', 'CHANGELOG.md'], cwd=REPO)
         (stage/'experimental-9.patch').write_bytes(patch)
-        manifest = dict(release=RELEASE, source_commit=commit, hardware_verified=False,
+        manifest = dict(release=RELEASE, source_commit=commit, source_base=source_base, hardware_verified=False,
                         changed_bundles=['BlueToolFixup'], target_builds=['25G342'],
                         dependencies=json.loads((ROOT/'dependencies.lock.json').read_text()),
                         rollback_executable_sha256=ROLLBACK_SHA,
