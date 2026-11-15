@@ -23,3 +23,7 @@ __pycache__/
 build-f2q/
 build-editor/
 compile_commands.json
+build-f2r/
+build*/
+deps
+firmware/FwBinary.cpp

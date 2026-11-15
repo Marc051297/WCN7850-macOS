@@ -86,6 +86,22 @@ static int qwz_awdltest_last = -1;	/* debug.qwz.awdltest read-back */
 static int qwz_logfile_on;	/* debug.qwz.logfile: file sink kept open */
 static bool qwz_sysctl_registered;
 
+/* F2q hardware test: native DATA tx_params produced repeated firmware RDDM.
+ * Keep the old node so diagnostic scripts can restore/read zero, but refuse
+ * every opt-in until a supported transmit path has been established. */
+static int
+qwz_sysctl_nativefmt(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int v = 0;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err || req->newptr == USER_ADDR_NULL)
+		return err;
+	if (v != 0)
+		return ENOTSUP;
+	qwz_nativefmt = 0;
+	return 0;
+}
+
 static int
 qwz_sysctl_start(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
 {
@@ -767,8 +783,8 @@ SYSCTL_INT(_debug_qwz, OID_AUTO, monfmt, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_monfmt, 0, "K4 M1: capture cell user frames with a per-frame tx_params block: 1 = frames under 150 bytes with retry limit 2 and OFDM 12 Mbit/s, 2 = also user DATA frames (retry limit 1 when the frame header says NO_ACK, else 4; rate from the header's rate byte, zero or unknown = OFDM 12); 0 = off (default, tx_params_valid 0); 3 and above act as 2");
 SYSCTL_INT(_debug_qwz, OID_AUTO, nativepeerpause, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_nativepeerpause, 0, "Native AWDL calibrated destination holds: 1 on (default), 0 bypass; does not discard frames or stop observations");
-SYSCTL_INT(_debug_qwz, OID_AUTO, nativefmt, CTLFLAG_RW | CTLFLAG_LOCKED,
-    &qwz_nativefmt, 0, "Experimental native bulk unicast WMI parameters: 0 firmware default (default), 1 request legacy OFDM 12 Mbit/s, 2 request legacy OFDM 24 Mbit/s; applies only to DATA >=1200 bytes; other values disable; requested profile is not a measured PHY rate");
+SYSCTL_PROC(_debug_qwz, OID_AUTO, nativefmt, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 0, qwz_sysctl_nativefmt, "I", "Native bulk WMI rate profile disabled after firmware crashes; only 0 is accepted");
 SYSCTL_INT(_debug_qwz, OID_AUTO, rssisigned, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_rssisigned, 0, "K3 S1: 1 = the 5 GHz SCAN-state RSSI compare reads ni_rssi as a signed byte (strongest sample kept); 0 = today's compare (default)");
 SYSCTL_INT(_debug_qwz, OID_AUTO, beaconmeta, CTLFLAG_RW | CTLFLAG_LOCKED,

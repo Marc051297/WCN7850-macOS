@@ -175,12 +175,12 @@ int main() {
     frame[10]^=2;
     assert(frequency(&sc,&sc.sc_monvif)==5745);
     assert(frequency(&sc,&sc.sc_vif)==0); // station stays unchanged
-    // Native-only rate experiments leave sync, small and multicast frames
-    // unchanged; malformed settings do not inherit an injection context.
+    // No native packet may use the withdrawn rate profile, even if a stale
+    // internal setting remains; injection context must never be inherited.
     uint8_t bulk[1400]={0x08};bulk[4]=2;memcpy(bulk+10,address,6);
     assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);
-    qwz_nativefmt=1;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==1);
-    qwz_nativefmt=2;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==2);
+    qwz_nativefmt=1;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);
+    qwz_nativefmt=2;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);
     bulk[4]=3;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);
     bulk[4]=2;assert(qwz_mon_tx_raw(bulk,1199)==0 && last_native_mode==0);
     bulk[0]=0xd0;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);

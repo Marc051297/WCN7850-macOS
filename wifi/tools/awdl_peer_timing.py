@@ -113,14 +113,23 @@ def main():
         return {}
 
     with os.fdopen(descriptor, 'w') as file:
-        timing.ingest(read(), save=False)  # discard the old, possibly full ring
         start = time.monotonic()
-        while time.monotonic() - start < args.seconds:
-            timing.ingest(read())
-            samples.append(dict(elapsed=time.monotonic() - start, stats=stats()))
-            time.sleep(0.5)
-        json.dump(dict(duration=time.monotonic() - start, counts=dict(timing.counts),
-                       events=timing.events, samples=samples), file, indent=2)
+        interruption = None
+        try:
+            timing.ingest(read(), save=False)  # discard the old, possibly full ring
+            start = time.monotonic()
+            while time.monotonic() - start < args.seconds:
+                timing.ingest(read())
+                samples.append(dict(elapsed=time.monotonic() - start, stats=stats()))
+                time.sleep(0.5)
+        except (subprocess.SubprocessError, KeyboardInterrupt) as error:
+            # A radio reset can close SSH mid-sample. Retain the observations
+            # already collected instead of leaving a zero-byte diagnostic.
+            interruption = type(error).__name__
+            raise
+        finally:
+            json.dump(dict(duration=time.monotonic() - start, counts=dict(timing.counts),
+                           events=timing.events, samples=samples, interruption=interruption), file, indent=2)
     print(json.dumps(dict(path=args.output, events=len(timing.events),
                           counts=dict(timing.counts))))
 

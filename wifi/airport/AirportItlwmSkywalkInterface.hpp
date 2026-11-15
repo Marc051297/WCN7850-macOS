@@ -455,6 +455,7 @@ private:
     bool scanPending;
     bool scanCompleted;
     bool scanSkipCompletion;
+    bool scanRestartPending = false;
     bool wclBssValid;
     bool wclLinkIndicated;
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];

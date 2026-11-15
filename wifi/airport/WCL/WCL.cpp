@@ -104,6 +104,7 @@ void AirportItlwmSkywalkInterface::stopWCL()
     if (scanSource)
         scanSource->cancelTimeout();
     scanPending = joinPending = false;
+    scanRestartPending = scanSkipCompletion = false;
     joinDeferred = false;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     if (fHalService) {
@@ -454,9 +455,11 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     wclScanStartId = scan.identifier;
     scanPending = true;
     scanCompleted = false;
-    scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
-        ((scan.type != 2 && scan.ssidLength != 0) ||
-         ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
+    scanRestartPending = false;
+    // The in-flight firmware sweep was built before this request was latched.
+    // Its completion cannot satisfy this request, including a list-bearing
+    // hotspot scan whose primary SSID is empty. Restart after its real end.
+    scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN && !ic->ic_wcl_scan_idle;
     ic->ic_wcl_scan_requested = true;
     ic->ic_wcl_scan_active = scan.type != 2;
     ic->ic_wcl_scan_ssid_length = scan.type == 2 ? 0 : scan.ssidLength;
@@ -495,7 +498,8 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
         scanSkipCompletion = false;
         ieee80211_next_scan(&ic->ic_if);
     }
-    // S2: which of the launch branches above ran (state and idle as they were before them). STRANDED: none ran.
+    // The active old sweep owns the radio until its real completion. Its
+    // event schedules a deferred restart with the parameters latched above.
     if (logState == IEEE80211_S_RUN)
         scanLog("launched", "bgscan", logState, logIdle, logPrev);
     else if (logState != IEEE80211_S_SCAN)
@@ -503,7 +507,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     else if (logIdle)
         scanLog("launched", "restart", logState, logIdle, logPrev);
     else
-        scanLog("STRANDED", "state SCAN and scan not idle: no launch branch ran", logState, logIdle, logPrev);
+        scanLog("deferred", "waiting for the in-flight scan before restart", logState, logIdle, logPrev);
     return kIOReturnSuccess;
 }
 
@@ -527,6 +531,7 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
     }
     scanPending = false;
     scanCompleted = false;
+    scanRestartPending = scanSkipCompletion = false;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
@@ -534,8 +539,34 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
 
 void AirportItlwmSkywalkInterface::completeWCLScan()
 {
-    if (!wclStopping)
-        finishWCLScan(scanCompleted ? kIOReturnSuccess : kIOReturnTimeout);
+    if (wclStopping || !scanPending)
+        return;
+    if (scanRestartPending) {
+        ieee80211com *ic = fHalService->get80211Controller();
+        const uint64_t age = wclScanNowMs() - wclScanStartMs;
+        if (age >= 20000) {
+            finishWCLScan(kIOReturnTimeout);
+            return;
+        }
+        if (ic->ic_state != IEEE80211_S_SCAN) {
+            finishWCLScan(kIOReturnAborted);
+            return;
+        }
+        if (!ic->ic_wcl_scan_idle) {
+            // SCAN_DONE is posted before net80211 finishes end_scan. Yield
+            // to that owner; never mark its firmware scan idle ourselves.
+            scanSource->setTimeoutMS(10);
+            return;
+        }
+        scanRestartPending = false;
+        scanCompleted = false;
+        ic->ic_wcl_scan_idle = false;
+        scanSource->setTimeoutMS(uint32_t(20000 - age));
+        qwz_log("airport: WCL deferred scan restarted after %llu ms\n", (unsigned long long)age);
+        ieee80211_next_scan(&ic->ic_if);
+        return;
+    }
+    finishWCLScan(scanCompleted ? kIOReturnSuccess : kIOReturnTimeout);
 }
 
 void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length, const uint8_t *frame, size_t frameLength)
@@ -1315,9 +1346,11 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
         }
         case IEEE80211_EVT_SCAN_DONE:
             if (scanPending) {
-                if (scanSkipCompletion)
+                if (scanSkipCompletion) {
                     scanSkipCompletion = false;
-                else {
+                    scanRestartPending = true;
+                    scanSource->setTimeoutMS(0);
+                } else if (!scanRestartPending) {
                     scanCompleted = true;
                     scanSource->setTimeoutMS(0);
                 }

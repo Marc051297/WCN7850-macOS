@@ -30,12 +30,8 @@ int main() {
     qwz_monfmt=2;qwz_mon_fmt_user=1;qwz_mon_fmt_rate=108;
     for(int mode=0;mode<=5;++mode) {
         d0=d1=77;retry=rate=88;
-        bool valid=mode==1 || mode==2;
-        assert(bool(qwz_mon_fmt_pick(2,1200,&d0,&d1,&retry,&rate,mode))==valid);
-        if(!valid) {assert(d0==77 && d1==77 && retry==88 && rate==88);continue;}
-        assert((d0&255)==40 && ((d0>>20)&255)==1 && (d0>>28)==4);
-        assert(((d0>>8)&0xfff)==(1U<<(mode==1 ? 6 : 8)));
-        assert(d1==QWZ_MON_TXP_DATA1 && retry==4 && rate==(mode==1 ? 24U : 48U));
+        assert(!qwz_mon_fmt_pick(2,1200,&d0,&d1,&retry,&rate,mode));
+        assert(d0==77 && d1==77 && retry==88 && rate==88);
         assert(!qwz_mon_fmt_pick(1,1400,&d0,&d1,&retry,&rate,mode));
         assert(!qwz_mon_fmt_pick(3,1400,&d0,&d1,&retry,&rate,mode));
         assert(!qwz_mon_fmt_pick(2,1199,&d0,&d1,&retry,&rate,mode));
@@ -50,7 +46,7 @@ int main() {
     assert(retry==2 && rate==24 && !(d1&(1U<<20)));
     qwz_mon_fmt_user=0;
     assert(!qwz_mon_fmt_pick(1,149,&d0,&d1,&retry,&rate));
-    puts("native bulk TX parameter scoping, off state and legacy regression: PASS");
+    puts("native bulk TX profiles blocked, explicit context and legacy regression: PASS");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='qwz-native-format-') as directory:

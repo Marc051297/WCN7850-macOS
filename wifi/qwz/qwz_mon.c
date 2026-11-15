@@ -685,16 +685,9 @@ qwz_mon_fmt_pick(uint8_t kind, size_t len, uint32_t *d0, uint32_t *d1, unsigned 
 	if (nativeMode >= 0) {
 		// Explicit native context never inherits a userspace injection header,
 		// including while another gated WMI sender is asleep on a credit.
-		if ((nativeMode != 1 && nativeMode != 2) || kind != 2 || len < 1200)
-			return 0;
-		idx = nativeMode == 1 ? 2 : 4;	/* request 12 / 24 Mbit/s */
-		r = QWZ_MON_TXP_UC0 >> 28;
-		*d0 = (QWZ_MON_TXP_UC0 & 0x000000ffu) | ((1u << (4 + idx)) << 8) |
-		    (QWZ_MON_TXP_UC0 & 0x0ff00000u) | (r << 28);
-		*d1 = QWZ_MON_TXP_DATA1;
-		*retry = r;
-		*rate = nativeMode == 1 ? 24 : 48;	/* 500 kbit/s units */
-		return 1;
+		// The f2q native rate experiment coincided with repeated firmware
+		// asserts. No native mode may emit that tx_params block.
+		return 0;
 	}
 
 	if (mode <= 0 || !qwz_mon_fmt_user)
@@ -914,9 +907,7 @@ qwz_mon_tx_raw(const uint8_t *frame, size_t len)
 		return EADDRNOTAVAIL;
 	type = (frame[0] >> 2) & 3;
 	kind = type == 0 ? 1 : type == 2 ? 2 : 3;
-	const int nativeMode = kind == 2 && len >= 1200 && !(frame[4] & 1) &&
-	    (qwz_nativefmt == 1 || qwz_nativefmt == 2) ? qwz_nativefmt : 0;
-	ret = qwz_mon_tx_bytes(sc, frame, len, kind, nativeMode);
+	ret = qwz_mon_tx_bytes(sc, frame, len, kind, 0);
 	if (ret == 0)
 		sc->mon_stats.ufr_sent++;
 	else if (ret == ENOSPC)
