@@ -67,16 +67,19 @@ static const char*qcaOsBuild="25G342";
 static const char*version="xnu-12377.161.15.701.48~2/RELEASE_X86_64";
 static volatile SInt32 qcaPageRestores,qcaVerifyRestores,qcaVerifyFailures,
  qcaPageRejected,qcaPageRecordsFull,qcaRpaMask;
+static uint64_t qcaLastRejectedOffset;
+static uint32_t qcaLastRejectedReason,qcaLastRejectedFlags;
 static void qcaReportPagesLater(){}
 static bool qcaInstallVerifier(vnode_t){return true;}
 using Page=std::array<uint8_t,4096>;
 static std::map<uint64_t,Page> originals;
 static std::atomic<int> nativeChecks{0},fileChecks{0};
-static bool rejectPage=false;
+static bool rejectPage=false,forceTaint=false;
+static int rejectedTaint=1;
 static void nativeValidate(vnode_t,void*,uint64_t offset,const void*data,int*v,int*t,int*n){
  ++nativeChecks;
  bool good=originals.count(offset) && !memcmp(data,originals.at(offset).data(),4096) && !rejectPage;
- *v=good;*t=!good;*n=0;
+ *v=good;*t=good ? forceTaint : rejectedTaint;*n=0;
 }
 static void existingPatch(const void*,const char*){}
 static std::array<uint8_t,16384> originalBlock;
@@ -135,10 +138,16 @@ int main(){
  // A corrupt code page must not receive a newly trusted snapshot or patches.
  helper=originals.at(0xaa2000);helper[50]^=1;
  assert(!validate(0xaa2000,helper.data()));assert(helper[50]==1);
+ assert(qcaLastRejectedReason==3 && qcaLastRejectedOffset==0xaa2000);
  assert(memcmp(helper.data()+0xba0,helpers.replace,helpers.size));
  // Native authentication failure is propagated even for pristine bytes.
  helper=originals.at(0xaa2000);rejectPage=true;
  assert(!validate(0xaa2000,helper.data()));assert(helper==originals.at(0xaa2000));
+ assert(qcaLastRejectedReason==4 && qcaLastRejectedFlags==2);
+ rejectedTaint=0;
+ assert(!validate(0xaa2000,helper.data()));assert(qcaLastRejectedReason==4 && qcaLastRejectedFlags==0);
+ rejectPage=false;forceTaint=true;
+ assert(!validate(0xaa2000,helper.data()));assert(qcaLastRejectedReason==5 && qcaLastRejectedFlags==3);
  assert(qcaPageRejected>=2 && qcaVerifyFailures>=1);
  puts("PASS: actual page callbacks, helper reservation, 500 untouched pages, native failures, corruption and concurrent refault/verification");
 }
@@ -146,7 +155,7 @@ int main(){
 
 with tempfile.TemporaryDirectory(prefix='qca-guard-test-') as tmp:
     cpp=Path(tmp)/'test.cpp';exe=Path(tmp)/'test'
-    cpp.write_text(prelude+'\n'+function('qcaVerifyFileBlock')+'\n'+
+    cpp.write_text(prelude+'\n'+function('qcaRejectPage')+'\n'+function('qcaVerifyFileBlock')+'\n'+
                    function('qcaApplyPeerPage')+'\n'+function('qcaGuardValidate')+'\n'+main)
     subprocess.run(['xcrun','clang++','-std=c++14','-Wall','-Wextra','-Werror',
                     '-Wno-unused-function','-fsanitize=address,undefined','-pthread',

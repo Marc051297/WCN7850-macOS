@@ -102,6 +102,8 @@ def build(binary):
     site('Update', 0x6d11ea, 196,
          [(14, redirect(0x6d11f8, 0x714166, 'list')),
           (191, redirect(0x6d12a9, 0x706900, 'get'))])
+    site('Extended', 0x20dc4a, 46,
+         [(32, redirect(0x20dc6a, 0x223424, 'extended'))])
     return helpers, decoder, labels, sites
 
 

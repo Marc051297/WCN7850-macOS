@@ -42,10 +42,21 @@ static bool qcaGuardRequested;
 static thread_call_t qcaPageReport;
 static volatile SInt32 qcaVerifierState, qcaPageRestores, qcaVerifyRestores,
     qcaVerifyFailures, qcaPageRejected, qcaPageRecordsFull, qcaRpaMask;
+static uint64_t qcaLastRejectedOffset;
+static uint32_t qcaLastRejectedReason, qcaLastRejectedFlags;
+
+// Reasons distinguish a native unsigned/tainted page from a mismatched saved
+// original or a failed record. Reporting never changes the native verdict.
+static void qcaRejectPage(uint32_t reason, uint64_t offset, int validated = 0, int tainted = 0) {
+    OSIncrementAtomic(&qcaPageRejected);
+    qcaLastRejectedOffset = offset;
+    qcaLastRejectedReason = reason;
+    qcaLastRejectedFlags = (validated ? 1U : 0U) | (tainted ? 2U : 0U);
+}
 
 static void qcaPublishPages(thread_call_param_t, thread_call_param_t) {
     auto *root = IORegistryEntry::getRegistryRoot();
-    root->setProperty("QcaContinuityPageRevision", "experimental.7-peer-address");
+    root->setProperty("QcaContinuityPageRevision", "experimental.8-extended-legacy-peer");
     root->setProperty("QcaContinuityVerifierState", uint32_t(qcaVerifierState), 32);
     root->setProperty("QcaContinuityRpaPatchMask", uint32_t(qcaRpaMask), 32);
     root->setProperty("QcaContinuityPageRestores", uint32_t(qcaPageRestores), 32);
@@ -53,6 +64,9 @@ static void qcaPublishPages(thread_call_param_t, thread_call_param_t) {
     root->setProperty("QcaContinuityVerifyFailures", uint32_t(qcaVerifyFailures), 32);
     root->setProperty("QcaContinuityPageRejected", uint32_t(qcaPageRejected), 32);
     root->setProperty("QcaContinuityPageRecordsFull", uint32_t(qcaPageRecordsFull), 32);
+    root->setProperty("QcaContinuityLastRejectedOffset", qcaLastRejectedOffset, 64);
+    root->setProperty("QcaContinuityLastRejectedReason", qcaLastRejectedReason, 32);
+    root->setProperty("QcaContinuityLastRejectedFlags", qcaLastRejectedFlags, 32);
 }
 static void qcaReportPagesLater() {
     if (qcaPageReport) thread_call_enter(qcaPageReport);
@@ -129,13 +143,14 @@ static bool qcaInstallVerifier(vnode_t vp) {
 }
 
 static void qcaApplyPeerPage(uint64_t pageOffset, uint8_t *page) {
-    // Thin-image file offsets corresponding to the seven checked signatures.
-    static const uint32_t offsets[] = {0xaa2ba0,0x20c3dd,0x2234c3,0x729844,0x717012,0x7140d3,0x6d11ea};
+    // Thin-image file offsets corresponding to the checked signatures.
+    static const uint32_t offsets[] = {0xaa2ba0,0x20c3dd,0x2234c3,0x729844,0x717012,0x7140d3,0x6d11ea,0x20dc4a};
+    static_assert(arrsize(offsets) == arrsize(QcaPeerPatches::sites), "peer patch offsets");
     for (size_t n = 0; n < arrsize(QcaPeerPatches::sites); ++n) {
         const auto &site = QcaPeerPatches::sites[n];
         for (size_t i = 0; i + site.size <= 4096; ++i) {
             if (memcmp(page+i, site.find, site.size)) continue;
-            if (pageOffset + i < offsets[n]) { OSIncrementAtomic(&qcaPageRejected); return; }
+            if (pageOffset + i < offsets[n]) { qcaRejectPage(1, pageOffset); return; }
             const uint64_t slice = pageOffset + i - offsets[n];
             // Hold the helper page's ledger slot before redirecting any call.
             // Fat Mach-O slices on this build start on a 4 KiB boundary.
@@ -181,11 +196,11 @@ static bool qcaGuardValidate(vnode_t vp, memory_object_t pager, memory_object_of
         if (memcmp(qcaPageBefore, page, 4096) &&
             !qcaPageRecords.record(token, offset, qcaPageBefore, page)) {
             memcpy(page, qcaPageBefore, 4096);
-            OSIncrementAtomic(&qcaPageRejected);
+            qcaRejectPage(2, offset, *validated, *tainted);
         }
     } else {
         if (!room) OSIncrementAtomic(&qcaPageRecordsFull);
-        else OSIncrementAtomic(&qcaPageRejected);
+        else qcaRejectPage(!sameOriginal ? 3 : !*validated ? 4 : 5, offset, *validated, *tainted);
     }
     IOLockUnlock(qcaPageLock);
     qcaReportPagesLater();

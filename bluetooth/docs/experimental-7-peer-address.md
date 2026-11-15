@@ -86,3 +86,23 @@ connections before promotion from experimental status.
 The Wi-Fi scan disappearance reported later on f2n occurred **before** this
 update was installed. It remains a separate unresolved recovery regression.
 This build does not claim full WPA3-SAE, Camera video or secure Watch ranging.
+
+## Observed hardware result
+
+The user installed experimental.7 on the 14 November 19:59:36 SAST boot.
+PageRevision is experimental.7-peer-address, VerifierState=1 and RpaPatchMask=127.
+PageRecordsFull and VerifyFailures remain zero. PageRejected=1 was unchanged
+over subsequent reads; the current counter cannot identify its reason, so it
+must not be dismissed as harmless or described as a successful validation.
+
+AirDrop still works according to the user. Instant Hotspot still fails:
+airportd reports RPErrorDomain -71143 after 22.3 seconds at 20:01:16, and
+later control attempts show the same BLE connect timeout. Filter Accept List
+additions still log Public addresses. The seven installed patch sites do not
+prove that the RPA branch is exercised for this phone. Further diagnostics must
+distinguish native peer/address-path selection from page-validation outcomes.
+This hardware result does not establish a Hotspot fix.
+
+The immutable experimental.7 package/source snapshot remains the originally
+transferred version. This section records subsequent findings in the working
+tree; it does not rewrite that snapshot.

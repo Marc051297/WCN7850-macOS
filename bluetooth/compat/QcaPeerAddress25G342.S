@@ -21,15 +21,18 @@
 
 .globl _qca_peer_begin, _qca_peer_clear, _qca_peer_keep, _qca_peer_device
 .globl _qca_peer_get, _qca_peer_list, _qca_peer_end
+.globl _qca_peer_extended
 .alt_entry _qca_peer_clear
 .alt_entry _qca_peer_keep
 .alt_entry _qca_peer_device
 .alt_entry _qca_peer_get
 .alt_entry _qca_peer_list
 .alt_entry _qca_peer_end
+.alt_entry _qca_peer_extended
 _qca_peer_begin:
 Lqca_begin:
 _qca_peer_clear:
+Lqca_clear:
     // The legacy descriptor is reused for every report. Its seven unused
     // direct-address bytes must not retain the previous peer's RPA.
     movl $0, 0x33(%rdi)
@@ -37,14 +40,42 @@ _qca_peer_clear:
     movb $0, 0x39(%rdi)
     native_jump 0x223424
 
+_qca_peer_extended:
+    // Standard LE Extended Advertising Report can carry a legacy ADV_IND.
+    // The audited parser normalizes its event to 0xb0, retains raw 0x13 at
+    // +0x1a and keeps the non-legacy flag at +0x2b clear. The private spare
+    // bytes are not the real directed-address field (+0x24). Other extended
+    // reports keep every native field and go directly to the native resolver.
+    cmpb $0xb0, (%rdi)
+    jne Lqca_extended_native
+    cmpw $0x13, 0x1a(%rdi)
+    jne Lqca_extended_native
+    cmpb $0, 0x2b(%rdi)
+    jne Lqca_extended_native
+    jmp Lqca_clear
+Lqca_extended_native:
+    native_jump 0x223424
+
 _qca_peer_keep:
     // Enter only after native AH verification succeeds. The return frame
     // proves this is a legacy report, and event 0 proves it is undirected.
     address_rax 0x20c3f1
     cmpq %rax, 8(%rbp)
+    je Lqca_legacy_keep
+    address_rax 0x20dc6f
+    cmpq %rax, 8(%rbp)
     jne Lqca_copy_identity
+    cmpb $0xb0, (%rbx)
+    jne Lqca_copy_identity
+    cmpw $0x13, 0x1a(%rbx)
+    jne Lqca_copy_identity
+    cmpb $0, 0x2b(%rbx)
+    jne Lqca_copy_identity
+    jmp Lqca_check_controller
+Lqca_legacy_keep:
     cmpb $0, (%rbx)
     jne Lqca_copy_identity
+Lqca_check_controller:
     load_controller_rax
     testq %rax, %rax
     je Lqca_copy_identity
@@ -146,7 +177,10 @@ _qca_decode_begin:
     cmpl $0x81, %eax
     jne Lqca_no_address
     cmpb $0, (%r14)
+    je Lqca_decode_legacy
+    cmpb $0xb0, (%r14)
     jne Lqca_no_address
+Lqca_decode_legacy:
     cmpb $0, 0x1756(%r14)
     jne Lqca_no_address
     movzbl 1(%rsi), %eax

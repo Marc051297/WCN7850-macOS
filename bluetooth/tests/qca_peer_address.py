@@ -104,11 +104,40 @@ for slide in [0, 0x100000, 0x33000000]:
                 for r,v in before.items():
                     if r not in [UC_X86_REG_RAX,UC_X86_REG_RCX]: assert m.reg(r)==v
 
+    # Standard Extended Advertising Report carrying a legacy ADV_IND. Native
+    # 25G342 parser encodes event 0xb0, raw type 0x13, non-legacy byte zero.
+    # Real directed-address storage (+0x24) and the flag at +0x3a stay intact.
+    for event in [0,0xb0,0xb1,0xb3,0xb4]:
+        for raw in [0,0x12,0x13,0x15,0x1b]:
+            for nonlegacy in [0,1]:
+                m.reset();m.put(desc,original)
+                m.put(desc,bytes([event]));m.put(desc+0x1a,struct.pack('<H',raw))
+                m.put(desc+0x2b,bytes([nonlegacy]))
+                before=bytes(m.uc.mem_read(desc,len(original)))
+                m.set(UC_X86_REG_RDI,desc)
+                m.run('extended')
+                eligible=event==0xb0 and raw==0x13 and nonlegacy==0
+                expected=bytearray(before)
+                if eligible:expected[0x33:0x3a]=bytes(7)
+                assert bytes(m.uc.mem_read(desc,len(original)))==bytes(expected)
+                assert m.ended==m.vm+0x223424 and m.reg(UC_X86_REG_RDI)==desc
+                for chip in [0,1,3,None]:
+                    m.reset();m.put(desc,expected)
+                    m.qword(m.vm+0xb3abb0,m.chip if chip is not None else 0)
+                    m.put(m.chip+0x334,struct.pack('<I',chip or 0))
+                    m.put(m.fp-0x48,identity);m.qword(m.fp+8,m.vm+0x20dc6f)
+                    m.set(UC_X86_REG_RBX,desc);m.set(UC_X86_REG_R12,desc+1)
+                    m.run('keep')
+                    want=b'\x81'+original[2:8] if eligible and chip==0 else bytes(expected[0x33:0x3a])
+                    assert bytes(m.uc.mem_read(desc+0x33,7))==want,(slide,event,raw,nonlegacy,chip)
+                    assert bytes(m.uc.mem_read(desc+1,7))==identity
+                    assert bytes(m.uc.mem_read(desc+0x24,7))==before[0x24:0x2b]
+
     rng=random.Random(0x7850)
     packet = DATA+0x4000
     for _ in range(500):
         m.reset()
-        typ=rng.choice([0,1,2,0x81,0xff]); event=rng.randrange(3); extended=rng.randrange(2)
+        typ=rng.choice([0,1,2,0x81,0xff]); event=rng.choice([0,1,2,0xb0,0xb1,0xb3]); extended=rng.randrange(2)
         address=bytes(rng.randrange(256) for _ in range(6))
         typed=bytes([typ])+address
         m.put(desc+0x33,typed)
@@ -117,7 +146,7 @@ for slide in [0, 0x100000, 0x33000000]:
         m.set(UC_X86_REG_R14,packet)
         cl,dl=m.reg(UC_X86_REG_RCX),m.reg(UC_X86_REG_RDX)
         m.run('decode')
-        valid=typ in [0,1] or (typ==0x81 and event==0 and extended==0 and address[0]&0xc0==0x40)
+        valid=typ in [0,1] or (typ==0x81 and event in [0,0xb0] and extended==0 and address[0]&0xc0==0x40)
         assert m.reg(UC_X86_REG_RAX)==(int.from_bytes(typed,'big') if valid else 0)
         assert m.reg(UC_X86_REG_RCX)==cl and m.reg(UC_X86_REG_RDX)==dl
         assert m.reg(UC_X86_REG_RSP)==m.sp
