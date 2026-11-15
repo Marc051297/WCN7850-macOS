@@ -2412,6 +2412,8 @@ struct qwz_softc {
 	int				 mon_dwell_submitting;	/* a WMI sender may sleep while a scan waits */
 	uint32_t			 mon_dwell_scan_id;	/* changes each visit, survives cell stop/restart */
 	uint64_t			 mon_dwell_arrived_ns;
+	uint64_t			 mon_dwell_ended_ns;	/* AL (aligned visits): when the last visit ended, 0 before the first */
+	int				 mon_dwell_plan_ms;	/* AL: the length of the visit being started when it follows a receiver's schedule, 0 = debug.qwz.moncoexdwell */
 	uint64_t			 mon_dwell_next_ns, mon_dwell_sent_ns;
 	int				 mon_coex_swap_ring;	/* F2d: with debug.qwz.moncoexfilter 3 (mon_coex_swapped 2) the one rx_mac_buf_ring that carries the monitor filter, else -1 */
 	uint8_t				 mon_coex_sta_addr[IEEE80211_ADDR_LEN];
@@ -2452,6 +2454,7 @@ struct qwz_softc {
 		int coex_scan_rssi_min, coex_scan_rssi_max;
 		uint32_t dwell_start, dwell_done, dwell_onchan, dwell_fail, dwell_lost;	/* F2e: visits asked, completed, arrivals on the cell's channel, refused or failed, never answered */
 		uint32_t dwell_wrongfreq, dwell_lastfreq, dwell_lastms;
+		uint32_t dwell_aligned, dwell_deferred;	/* AL: visits started for a receiver's run on the channel; starts put off until one */
 		uint32_t coex_awdl_otherfreq;	/* F2d: AWDL-BSS management frames the firmware reported on another frequency than the cell's (refused as before; evidence) */	/* K5 (L1-C6, C7, C15): while a coex cell runs, frames the claim tests sent to the station (st_*), to the cell's capture (cell_*), or dropped (drop); reset with the rest of mon_stats at cell start */
 		uint32_t coex_wbm_taken, coex_wbm_skipped, coex_wbm_badhdr;	/* K6 (K6-1): coex cell, WBM error ring: peer-less data frames copied to the capture (taken), multi-buffer or already-processed frames left alone (skipped), frames whose descriptor or length could not be used (badhdr); reset at cell start */
 		uint64_t last_log;

@@ -40,6 +40,7 @@ public:
     unsigned queuedTransmit() const { return transmitQueued; }
     unsigned heldShortTransmit() const { return transmitHeldShort; }
     bool copyTransmitDestination(uint8_t *) const;
+    bool copyQueuedDestination(unsigned index, uint8_t *) const;  // AL (aligned visits): the index-th queued frame's destination
     IOReturn initializeNetwork(IO80211Controller*, IOWorkLoop*, const ether_addr&);
     IOReturn receiveManagementFrame(IO80211Controller*, const uint8_t*, size_t, uint32_t, int32_t);
     void stop(IOService*) override;

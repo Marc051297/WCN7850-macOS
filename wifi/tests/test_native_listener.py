@@ -63,7 +63,7 @@ struct qwz_softc {
     qwz_vif sc_vif, sc_monvif;
     int mon_active, mon_coex, mon_coex_halt, mon_dwell_inflight, mon_dwell_onchannel;
     uint32_t mon_freq, mon_dwell_scan_id;
-    uint64_t mon_dwell_arrived_ns, mon_dwell_next_ns;
+    uint64_t mon_dwell_arrived_ns, mon_dwell_next_ns, mon_dwell_ended_ns; // AL: the visit's end, read by the planner
     struct { uint32_t dwell_lastms, dwell_lastfreq, dwell_wrongfreq,
              dwell_onchan, dwell_fail, dwell_done, ufr_sent, ufr_full, ufr_fail; } mon_stats;
     struct { int state; } scan;

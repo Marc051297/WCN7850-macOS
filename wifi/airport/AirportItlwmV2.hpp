@@ -432,6 +432,8 @@ public:
     static void awdlNativeRadioRx(void *arg, const uint8_t *frame, size_t len, uint16_t flags, uint8_t chan, int8_t rssi);
     void awdlNativeRadioInput(const uint8_t *frame, size_t len, uint16_t flags, uint8_t chan, int8_t rssi);
     static void awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *sender);
+    static int awdlNativeRadioPlan(void *arg, uint32_t *delayUS, uint32_t *runUS);  // AL (aligned visits), qwz_mon_set_native_plan
+    int awdlNativePlanVisit(uint32_t *delayUS, uint32_t *runUS);
     IOTimerEventSource *awdlNativeTimer;
     uint8_t *awdlNativeScratch;
     uint64_t awdlNativeLastSyncUS, awdlNativeLastDataUS, awdlNativeLastPublishUS;

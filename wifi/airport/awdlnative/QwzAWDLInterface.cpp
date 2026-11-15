@@ -463,6 +463,20 @@ bool QwzAWDLInterface::copyTransmitDestination(uint8_t *destination) const
     return true;
 }
 
+// AL (aligned visits): the destination of the index-th frame still queued, oldest first. A frame too short to have one
+// reads as the broadcast address (it plans nothing). False past the end of the queue.
+bool QwzAWDLInterface::copyQueuedDestination(unsigned index, uint8_t *destination) const
+{
+    if (!destination || !transmitFrames || !transmitFrameCount || index >= transmitQueued)
+        return false;
+    const auto &frame = transmitFrames[(transmitHead + index) % transmitFrameCount];
+    if (frame.length < 14)
+        memset(destination, 0xff, 6);
+    else
+        memcpy(destination, frame.bytes, 6);
+    return true;
+}
+
 bool QwzAWDLInterface::popTransmit(uint8_t *output, size_t available, size_t *written,
                                    const uint8_t *holdPayloadFor, bool holdEverySize,
                                    ItlAWDL::NativePeerTiming *timing, uint8_t channel, uint64_t nowUS)

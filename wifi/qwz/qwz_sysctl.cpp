@@ -47,6 +47,7 @@ int qwz_rssisigned = 0, qwz_beaconmeta = 0, qwz_scanprobe = 0, qwz_rssisrc = 0, 
 int qwz_monreap = 0, qwz_hintfix = 1;	/* K2c: debug.qwz.monreap (0 = off = K2b, the stale-slot reaper and the live-slot guard of the capture TX ring), debug.qwz.hintfix (1 = the scan-start hint-BSSID copy goes the right way, 0 = the old swapped copy); see qwz_life.h */
 int qwz_monfmt = 0;		/* K4 (M1): debug.qwz.monfmt, see qwz_life.h */
 int qwz_nativepeerpause = 1;
+int qwz_moncoexalign = 130;	/* AL (aligned visits): the longest visit timed to a receiver's schedule, ms; 0 = off; read live */
 int qwz_joinhint = 1, qwz_authfast = 1;	/* JL (join lifecycle): debug.qwz.joinhint, debug.qwz.authfast */
 int qwz_nativefmt = 0;
 /* K5 (L1-C1): debug.qwz.moncoex and its sub-switches, see qwz_mon.h; moncoex 0 = K4 exactly; scan and cred default to 1 and only act while a coex cell runs */
@@ -778,6 +779,8 @@ SYSCTL_PROC(_debug_qwz, OID_AUTO, scanraw, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LO
     0, 0, qwz_sysctl_scanraw, "I", "K1 W2c / K2c: 1 = log the non-zero 32-bit words of the scan request tail for the first three non-plain scan requests, 2 = also for the first three plain launched ones (a scan answered empty during the monitor hold counts as plain); 0 = off (default); any write re-arms the per-boot budgets (these words, the join-pick line, the IOC 85 blobs); may hold SSID text, redact before sharing");
 SYSCTL_INT(_debug_qwz, OID_AUTO, monreap, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_monreap, 0, "K2c C2: 1 = capture TX ring: every 100 ms a slot older than 3 s is unloaded and freed (queued and in-flight counts corrected, 'qwz: mon: tx reap' logged for the first 8), and a send that would take a still-occupied slot reaps it when older than 250 ms or answers ENOSPC; 0 = off (default, as K2b)");
+SYSCTL_INT(_debug_qwz, OID_AUTO, moncoexalign, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_moncoexalign, 0, "AL: while native AWDL has frames queued for a receiver whose channel schedule is known, visits to the cell's channel start when that receiver is there and last for its run, at most this many ms (30..500, default 130); a start is put off at most until 350 ms after the last visit; 0 = off, every visit is the fixed moncoexdwell one; read live");
 SYSCTL_INT(_debug_qwz, OID_AUTO, joinhint, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_joinhint, 0, "JL: 1 = the first scan of a join takes the channel the join request names, alone, with a 120/160 ms dwell; the full sweep follows only when the BSS is not found there (default); 0 = every join starts with the full sweep; read at each join scan");
 SYSCTL_INT(_debug_qwz, OID_AUTO, authfast, CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -969,6 +972,7 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_monreap);
 	sysctl_register_oid(&sysctl__debug_qwz_hintfix);
 	sysctl_register_oid(&sysctl__debug_qwz_joinhint);
+	sysctl_register_oid(&sysctl__debug_qwz_moncoexalign);
 	sysctl_register_oid(&sysctl__debug_qwz_authfast);
 	sysctl_register_oid(&sysctl__debug_qwz_monfmt);
 	sysctl_register_oid(&sysctl__debug_qwz_nativepeerpause);
@@ -1044,6 +1048,7 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_monreap);
 	sysctl_unregister_oid(&sysctl__debug_qwz_hintfix);
 	sysctl_unregister_oid(&sysctl__debug_qwz_joinhint);
+	sysctl_unregister_oid(&sysctl__debug_qwz_moncoexalign);
 	sysctl_unregister_oid(&sysctl__debug_qwz_authfast);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monfmt);
 	sysctl_unregister_oid(&sysctl__debug_qwz_nativepeerpause);

@@ -23,6 +23,7 @@
 #include <AWDLFrameParser.hpp>
 #include <AWDLProbePolicy.hpp>
 #include "qwz_mon.h"
+#include <AWDLVisitPlan.hpp>
 #include "qwz_log.h"
 #include <sys/mbuf.h>
 
@@ -81,6 +82,7 @@ void AirportItlwm::awdlNativeRadioStart()
 		return;
 	}
 	qwz_mon_set_native_rx(awdlNativeRadioRx, this);
+	qwz_mon_set_native_plan(awdlNativeRadioPlan, this);	/* AL (aligned visits) */
 	if (auto *channel = OSDynamicCast(OSNumber, getProperty("QwzAWDLPreferredChannel"))) {
 		const int configured = int(channel->unsigned32BitValue());
 		const int error = qwz_mon_native_set_preferred_channel(configured);
@@ -99,6 +101,7 @@ void AirportItlwm::awdlNativeRadioStart()
 void AirportItlwm::awdlNativeRadioStop()
 {
 	awdlNativePeerTiming.clearPeers();
+	qwz_mon_set_native_plan(nullptr, nullptr);	/* AL */
 	qwz_mon_set_native_rx(nullptr, nullptr);
 	if (fHalService != nullptr)
 		static_cast<ItlQwz *>(fHalService)->setAwdlAddress(nullptr);
@@ -195,6 +198,37 @@ void AirportItlwm::awdlNativeRadioInput(const uint8_t *frame, size_t len, uint16
 		st.rxDataBytes += body;
 		awdlNativeLastDataUS = nowUS();
 	}
+}
+
+/*
+ * AL (aligned visits): the capture cell's timer asks, in the gate, when the receiver of the frames waiting on awdl0 is next
+ * on the cell's channel (qwz_mon.h). The answer comes from the same peer schedules the per-destination holds use, for the
+ * first few queued frames. Only when the holds are on and a schedule is known; otherwise 0, and the visit is the fixed one.
+ */
+int AirportItlwm::awdlNativeRadioPlan(void *arg, uint32_t *delayUS, uint32_t *runUS)
+{
+	return arg != nullptr ? static_cast<AirportItlwm *>(arg)->awdlNativePlanVisit(delayUS, runUS) : 0;
+}
+
+int AirportItlwm::awdlNativePlanVisit(uint32_t *delayUS, uint32_t *runUS)
+{
+	if (delayUS == nullptr || runUS == nullptr || awdlNativeTimer == nullptr || !awdlInterfaceTest || fAWDLInterface == nullptr ||
+	    !awdlManagementInputEnabled || !awdlNativePeerTimingEnabled || !qwz_nativepeerpause || _fWorkloop == nullptr || !_fWorkloop->inGate())
+		return 0;
+	const int cell = qwz_mon_status();
+	if (cell <= 0)
+		return 0;
+	auto *interface = static_cast<QwzAWDLInterface *>(fAWDLInterface);
+	uint8_t destinations[ItlAWDL::kVisitPlanLook][6];
+	unsigned count = 0;
+	while (count < ItlAWDL::kVisitPlanLook && interface->copyQueuedDestination(count, destinations[count]))
+		++count;
+	uint64_t delay = 0, run = 0;
+	if (count == 0 || !ItlAWDL::planVisit(awdlNativePeerTiming, destinations, count, uint8_t(cell), nowUS(), &delay, &run))
+		return 0;
+	*delayUS = delay > 0xffffffffULL ? 0xffffffffU : uint32_t(delay);
+	*runUS = run > 0xffffffffULL ? 0xffffffffU : uint32_t(run);
+	return 1;
 }
 
 void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)

@@ -1154,6 +1154,17 @@ moncap_free(void)
 /* F2 (native AWDL): the second consumer of every captured frame (qwz_mon.h). */
 static qwz_mon_native_rx_fn qwz_mon_native_rx;
 static void *qwz_mon_native_rx_arg;
+static qwz_mon_native_plan_fn qwz_mon_native_plan;	/* AL (aligned visits) */
+static void *qwz_mon_native_plan_arg;
+
+void
+qwz_mon_set_native_plan(qwz_mon_native_plan_fn fn, void *arg)
+{
+	if (fn == NULL)
+		__atomic_store_n(&qwz_mon_native_plan, (qwz_mon_native_plan_fn)NULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&qwz_mon_native_plan_arg, arg, __ATOMIC_RELEASE);
+	__atomic_store_n(&qwz_mon_native_plan, fn, __ATOMIC_RELEASE);
+}
 static const char *qwz_mon_native_state = "disabled";
 
 void
@@ -1645,6 +1656,50 @@ qwz_mon_reap_ring(struct qwz_softc *sc)
 	return nbuf;
 }
 
+/*
+ * AL (aligned visits), debug.qwz.moncoexalign (the longest such visit in ms, default 130; 0 = off, every visit the fixed
+ * one). A visit is due. With frames queued for a receiver whose schedule is known, the visit is put where that receiver is:
+ * - it is on the channel now, or will be within the lead: start, for what is left of its run (30 ms to the limit);
+ * - it arrives later: put the start off until QWZ_MON_ALIGN_LEAD_US before then, unless that would leave more than
+ *   QWZ_MON_ALIGN_MAXGAP_NS since the last visit ended; then an ordinary visit goes first (discovery, other peers).
+ * Fixed visits met a receiver's entries by chance: an idle iPhone is on the channel in 2 to 5 of 16 entries. The rest
+ * between visits (debug.qwz.moncoexrest) is unchanged, and an aligned visit is never longer than the limit, so the
+ * station is away no more than before. Returns 1 to start a visit now, 0 when the start was put off.
+ */
+#define QWZ_MON_ALIGN_LEAD_US	12000U		/* command to on-channel is about 6 ms, the timer tick 10 ms */
+#define QWZ_MON_ALIGN_MAXGAP_NS	350000000ULL
+#define QWZ_MON_ALIGN_MIN_MS	30
+static int
+qwz_mon_dwell_plan(struct qwz_softc *sc, uint64_t now)
+{
+	const qwz_mon_native_plan_fn plan = __atomic_load_n(&qwz_mon_native_plan, __ATOMIC_ACQUIRE);
+	const int limit = qwz_moncoexalign > 500 ? 500 : qwz_moncoexalign;
+	uint32_t delay_us = 0, run_us = 0;
+	int ms;
+
+	sc->mon_dwell_plan_ms = 0;
+	if (limit < QWZ_MON_ALIGN_MIN_MS || plan == NULL ||
+	    !plan(__atomic_load_n(&qwz_mon_native_plan_arg, __ATOMIC_ACQUIRE), &delay_us, &run_us))
+		return 1;
+	if (delay_us > QWZ_MON_ALIGN_LEAD_US) {
+		const uint64_t wait_ns = (uint64_t)(delay_us - QWZ_MON_ALIGN_LEAD_US) * 1000ULL;
+
+		if (sc->mon_dwell_ended_ns != 0 && now >= sc->mon_dwell_ended_ns &&
+		    now + wait_ns - sc->mon_dwell_ended_ns <= QWZ_MON_ALIGN_MAXGAP_NS) {
+			sc->mon_dwell_next_ns = now + wait_ns;
+			sc->mon_stats.dwell_deferred++;
+			return 0;
+		}
+		return 1;
+	}
+	ms = (int)(((uint64_t)delay_us + run_us) / 1000ULL);
+	sc->mon_dwell_plan_ms = ms < QWZ_MON_ALIGN_MIN_MS ? QWZ_MON_ALIGN_MIN_MS : ms > limit ? limit : ms;
+	if (++sc->mon_stats.dwell_aligned == 1)
+		printf("qwz: mon: coex: dwell: first visit timed to a receiver's schedule (%d ms; debug.qwz.moncoexalign %d)\n",
+		    sc->mon_dwell_plan_ms, qwz_moncoexalign);
+	return 1;
+}
+
 static void
 qwz_mon_reap(void *arg)
 {
@@ -1666,7 +1721,7 @@ qwz_mon_reap(void *arg)
 			sc->mon_dwell_onchannel = 0;
 			sc->mon_stats.dwell_lost++;
 		}
-		if (!sc->mon_dwell_inflight && now >= sc->mon_dwell_next_ns) {
+		if (!sc->mon_dwell_inflight && now >= sc->mon_dwell_next_ns && qwz_mon_dwell_plan(sc, now)) {	/* AL */
 			sc->mon_dwell_inflight = 1;
 			sc->mon_dwell_onchannel = 0;
 			sc->mon_dwell_sent_ns = now;
@@ -1701,9 +1756,10 @@ qwz_mon_reap(void *arg)
 			printf("qwz: mon: native scan: beacons/probe responses handed %u rssi %d..%d dBm\n",
 			    sc->mon_stats.coex_scan_mgmt, sc->mon_stats.coex_scan_rssi_min, sc->mon_stats.coex_scan_rssi_max);
 		if (sc->mon_coex && (qwz_moncoexdwell > 0 || sc->mon_stats.dwell_start))	/* F2e */
-			printf("qwz: mon: coex: dwell: asked %u onchan %u done %u fail %u lost %u; dwell %d ms rest %d ms; freq %u wrongfreq %u lastvisit %u ms ready %d\n", sc->mon_stats.dwell_start,
+			printf("qwz: mon: coex: dwell: asked %u onchan %u done %u fail %u lost %u; dwell %d ms rest %d ms; freq %u wrongfreq %u lastvisit %u ms ready %d; aligned %u deferred %u align %d\n", sc->mon_stats.dwell_start,
 			    sc->mon_stats.dwell_onchan, sc->mon_stats.dwell_done, sc->mon_stats.dwell_fail, sc->mon_stats.dwell_lost, qwz_moncoexdwell, qwz_moncoexrest,
-			    sc->mon_stats.dwell_lastfreq, sc->mon_stats.dwell_wrongfreq, sc->mon_stats.dwell_lastms, sc->mon_dwell_onchannel);
+			    sc->mon_stats.dwell_lastfreq, sc->mon_stats.dwell_wrongfreq, sc->mon_stats.dwell_lastms, sc->mon_dwell_onchannel,
+			    sc->mon_stats.dwell_aligned, sc->mon_stats.dwell_deferred, qwz_moncoexalign);	/* AL */
 		if (sc->mon_coex)	/* K6 (K6-1): the WBM error ring tap, adjacent additive line */
 			printf("qwz: mon: coex: wbm counters taken %u skipped %u badhdr %u wbm_err %u; moncoexwbm %d\n",
 			    sc->mon_stats.coex_wbm_taken, sc->mon_stats.coex_wbm_skipped, sc->mon_stats.coex_wbm_badhdr, sc->mon_stats.wbm_err, qwz_moncoexwbm);
@@ -2345,6 +2401,8 @@ k5_coex_guards_done:	/* K5 (L1-C2) */
 		sc->mon_dwell_onchannel = 0;
 		sc->mon_dwell_arrived_ns = 0;
 		sc->mon_dwell_next_ns = 0;
+		sc->mon_dwell_ended_ns = 0;	/* AL */
+		sc->mon_dwell_plan_ms = 0;
 		if (qwz_moncoexfilter == 3) {
 			/*
 			 * F2d: the cell on another band runs on its own MAC (DBS), and the firmware forwards only that AP vdev's own frames from there
@@ -2843,7 +2901,8 @@ qwz_mon_dwell_task_fn(void *arg)
 	}
 	const uint32_t epoch = sc->sc_fw_epoch;
 	sc->mon_dwell_submitting = 1;
-	ret = qwz_mon_dwell_start(sc, sc->mon_freq, qwz_mon_dwell_clamp(qwz_moncoexdwell, 20, 1000));
+	ret = qwz_mon_dwell_start(sc, sc->mon_freq, sc->mon_dwell_plan_ms > 0 ? sc->mon_dwell_plan_ms :	/* AL: a visit timed to a receiver */
+	    qwz_mon_dwell_clamp(qwz_moncoexdwell, 20, 1000));
 	sc->mon_dwell_submitting = 0;
 	/* The WMI send may sleep with the gate released across a reset. */
 	if (epoch != sc->sc_fw_epoch)
@@ -2932,6 +2991,7 @@ qwz_mon_dwell_event(struct qwz_softc *sc, uint32_t type, uint32_t freq, uint32_t
 		if (type == WMI_SCAN_EVENT_COMPLETED)
 			sc->mon_stats.dwell_done++;
 		sc->mon_dwell_next_ns = now + (uint64_t)qwz_mon_dwell_clamp(qwz_moncoexrest, 20, 5000) * 1000000ULL;
+		sc->mon_dwell_ended_ns = now;	/* AL */
 		sc->mon_dwell_inflight = 0;
 		break;
 	default:

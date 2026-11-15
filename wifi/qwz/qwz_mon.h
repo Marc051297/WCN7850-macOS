@@ -168,6 +168,16 @@ extern char qwz_mon_bssid_str[32];	/* room for the terminator sysctl(8) sends */
  */
 typedef void (*qwz_mon_native_rx_fn)(void *arg, const uint8_t *frame, size_t len, uint16_t flags, uint8_t chan, int8_t rssi);
 void	qwz_mon_set_native_rx(qwz_mon_native_rx_fn fn, void *arg);
+/*
+ * AL (aligned visits), debug.qwz.moncoexalign: the native AWDL side says when the receiver of its queued frames is next on
+ * the cell's channel (delay_us from now, 0 = it is there) and for how long (run_us). Returns 0 when nothing is queued for a
+ * receiver whose schedule is known; the visit is then the ordinary fixed one. Called in the gate from the cell's timer; it
+ * must only compute. qwz_mon.c starts the visit QWZ_MON_ALIGN_LEAD_US early and never lets QWZ_MON_ALIGN_MAXGAP_NS pass
+ * without a visit.
+ */
+typedef int (*qwz_mon_native_plan_fn)(void *arg, uint32_t *delay_us, uint32_t *run_us);
+void	qwz_mon_set_native_plan(qwz_mon_native_plan_fn fn, void *arg);
+extern int qwz_moncoexalign;
 /* F2: free transmit slots on the cell for data frames right now (0 when no cell, the firmware is unavailable or TX is blocked). */
 int	qwz_mon_tx_room(void);
 /* Native frames wait for the matching listener address and, during ROC,

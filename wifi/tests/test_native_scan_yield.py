@@ -38,6 +38,7 @@ struct qwz_softc {
     uint32_t sc_fw_epoch=1,mon_freq=5745;
     int mon_chan=149,dead=0,hold=0;
     uint64_t mon_dwell_next_ns=0;
+    int mon_dwell_plan_ms=0; // AL: 0 = the fixed visit
     struct {int state=ATH12K_SCAN_STARTING;} scan;
     struct {unsigned dwell_fail=0,dwell_start=0,coex_st_mgmt=0,coex_cell_mgmt=0,coex_drop=0,coex_scan_mgmt=0;
             int coex_scan_rssi_min=0,coex_scan_rssi_max=0;} mon_stats;
