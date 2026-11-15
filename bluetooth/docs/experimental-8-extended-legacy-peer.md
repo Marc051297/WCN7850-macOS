@@ -72,3 +72,24 @@ neighbour RSSI -86 to -28 dBm and no descriptor mismatch. One outgoing AirDrop
 session times out over AWDL while the Hotspot control session times out over
 BLE. They are distinct observed failures; this Bluetooth patch is not claimed
 as a complete fix for both.
+
+## First hardware result — 15 November, 06:38:11 SAST boot
+
+Exp8 is loaded: mask 255, VerifierState 1. LastRejectedOffset=0, Reason=4,
+Flags=0 identifies a native validated=false page; native failure is preserved.
+No verification failure or full page ledger is reported.
+
+Fresh hotspot-enable requests now pass BLE control. At 06:40:40.798 airportd
+reports that Personal Hotspot was enabled on channel 44, then repeatedly
+fails to match the hotspot Wi-Fi network and returns -3905. Rapport records
+NoError for the BLE request. This is progress beyond exp7's BLE connection
+timeout, not proof of a complete hotspot connection or of every Bluetooth
+feature. The next blocker is Wi-Fi scan/matching before authentication.
+AirDrop still has Waiting/slow-send stalls; live queues drain rather than
+remaining full. Camera, Watch and Bluetooth wake recovery remain unverified.
+
+Subsequent controlled hotspot tests succeed on the same f2o/exp8 boot: the
+user confirms working internet with Maximize Compatibility enabled (channel
+6), then a successful join with it disabled (channel 44). The latter selects
+WPA2-PSK from the transition-mode network. The Wi-Fi scan/list probe omission
+is being corrected in f2p; full SAE, Camera and Watch are still separate work.
