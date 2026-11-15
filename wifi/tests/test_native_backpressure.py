@@ -29,6 +29,7 @@ code = r'''
 #include <vector>
 #include <AWDLObservation.hpp>
 #include <AWDLPeerProbe.hpp>
+#include <AWDLNativePeerTiming.hpp>
 using UInt32=unsigned;
 using IOReturn=int;
 using std::min;
@@ -94,7 +95,8 @@ struct QwzAWDLInterface {
     UInt32 acceptTransmit(IOSkywalkPacket *const *,UInt32);
     bool serviceTransmit();
     bool copyTransmitDestination(uint8_t *) const;
-    bool popTransmit(uint8_t *,size_t,size_t *,const uint8_t * = nullptr,bool = false);
+    bool popTransmit(uint8_t *,size_t,size_t *,const uint8_t * = nullptr,bool = false,
+                     ItlAWDL::NativePeerTiming * = nullptr,uint8_t = 0,uint64_t = 0);
 };
 void MockQueue::dequeue() {
     requested=false;
@@ -171,6 +173,36 @@ int main() {
     assert(j.transmitDropped==1 && r.completed.back()==&packets[5]);
     j.transmitBackpressured=true; j.dataTransmitEnabled=false;
     unsigned requests=r.requests; j.serviceTransmit(); assert(r.requests==requests);
+    // A blocked destination must not hold a different peer's traffic behind
+    // it. Stable removal works at every ring wrap and preserves per-peer order.
+    for(unsigned head=0;head<4;++head) {
+        QwzAWDLInterface k;MockQueue queue;queue.owner=&k;k.packetQueues[0]=k.packetQueues[1]=&queue;
+        k.transmitHead=head;
+        IOSkywalkPacket batch[4];
+        for(unsigned n=0;n<4;++n) {
+            auto *eth=batch[n].bytes+batch[n].offset;
+            eth[0]=n<2 ? 4 : 6;memcpy(eth+6,k.localFrameAddress,6);
+            eth[12]=0x86;eth[13]=0xdd;eth[14]=0x60;eth[21]=uint8_t(n);
+            queue.waiting.push_back(&batch[n]);
+        }
+        queue.dequeue();
+        ItlAWDL::NativePeerTiming timing{};
+        const uint8_t a[6]={4};auto *peer=timing.admit(a);
+        auto &s=peer->schedule;s.valid=s.calibrated=true;s.ourChannel=149;
+        s.heardUS=1000000;s.anchorEndUS=1030000;s.eawUS=65536;s.channels[1]=149;
+        uint8_t output[1600];size_t length=0;
+        assert(k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000));
+        assert(output[47]==2 && k.transmitQueued==3 && k.transmitSequence==1);
+        assert(k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000));
+        assert(output[47]==3 && timing.bypasses==2 && k.transmitQueued==2);
+        assert(!k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000));
+        assert(k.transmitQueued==2 && k.transmitSequence==2 && !k.transmitDropped);
+        k.serviceTransmit();assert(queue.completed.size()==4); // even while A waits
+        s.valid=false; // stale/unknown timing opens the gate
+        assert(k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000) && output[47]==0);
+        assert(k.popTransmit(output,sizeof(output),&length,nullptr,false,&timing,149,1000000) && output[47]==1);
+        assert(k.transmitSequence==4 && !k.transmitQueued && !k.transmitDropped);
+    }
     puts("ok: full FIFO keeps ownership in Skywalk, resumes without loss/reordering/double completion");
 }
 '''

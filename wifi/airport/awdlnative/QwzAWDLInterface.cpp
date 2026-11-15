@@ -464,11 +464,37 @@ bool QwzAWDLInterface::copyTransmitDestination(uint8_t *destination) const
 }
 
 bool QwzAWDLInterface::popTransmit(uint8_t *output, size_t available, size_t *written,
-                                   const uint8_t *holdPayloadFor, bool holdEverySize)
+                                   const uint8_t *holdPayloadFor, bool holdEverySize,
+                                   ItlAWDL::NativePeerTiming *timing, uint8_t channel, uint64_t nowUS)
 {
     ++transmitDepthBins[ItlAWDL::depthBin(transmitQueued)];
     while (transmitQueued) {
-        const auto &frame = transmitFrames[transmitHead];
+        unsigned selected = 0;
+        if (timing) {
+            bool found = false;
+            for (unsigned offset = 0; offset < transmitQueued; ++offset) {
+                const auto &candidate = transmitFrames[(transmitHead + offset) % transmitFrameCount];
+                if (candidate.length < 14) { selected = offset; found = true; break; }
+                bool earlier = false;
+                // Only the oldest frame for a destination may pass. A second
+                // call to a deadline-bearing hold predicate must not let a
+                // later packet overtake an earlier packet for the same peer.
+                for (unsigned previous = 0; previous < offset; ++previous) {
+                    const auto &first = transmitFrames[(transmitHead + previous) % transmitFrameCount];
+                    if (first.length >= 14 && !memcmp(first.bytes, candidate.bytes, 6)) {
+                        earlier = true;
+                        break;
+                    }
+                }
+                if (!earlier && !timing->hold(candidate.bytes, channel, nowUS)) {
+                    selected = offset;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        const auto &frame = transmitFrames[(transmitHead + selected) % transmitFrameCount];
         const auto result = ItlAWDL::buildDataFrameFromEthernet(frame.bytes, frame.length, localFrameAddress,
                                                                 transmitSequence, output, available, written);
         // Hold what is for the capped peer. Leave the FIFO head and sequence intact. With holdEverySize
@@ -484,10 +510,16 @@ bool QwzAWDLInterface::popTransmit(uint8_t *output, size_t available, size_t *wr
             }
             return false;
         }
+        // Stable removal: all remaining destinations retain their original
+        // order. Only software copies move; no firmware-owned slot is touched.
+        for (unsigned offset = selected; offset > 0; --offset)
+            transmitFrames[(transmitHead + offset) % transmitFrameCount] =
+                transmitFrames[(transmitHead + offset - 1) % transmitFrameCount];
         transmitHead = (transmitHead + 1) % transmitFrameCount;
         --transmitQueued;
         ++transmitPopped;
         if (result == ItlAWDL::BuildResult::Ready) {
+            if (timing && selected) ++timing->bypasses;
             ++transmitSequence;
             return true;
         }

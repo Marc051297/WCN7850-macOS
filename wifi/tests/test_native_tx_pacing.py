@@ -70,7 +70,8 @@ struct MockSelf {
     bool copyAWDLTransmitDestination(uint8_t *a) {a[0]=2;return queued>0;}
     bool serviceAWDLTransmit() {++services;return queued>0;}
     unsigned queuedAWDLTransmit() {return queued;}
-    IOReturn buildAWDLTransmit(mbuf_t *p) {
+    IOReturn buildAWDLTransmit(mbuf_t *p,const uint8_t * = nullptr,bool = false,uint64_t = 0) {
+        if(peerHeld && awdlNativePeerTimingEnabled) return kIOReturnNotReady;
         if(!queued) return kIOReturnNotReady;
         --queued; ++dequeued; *p=new Packet{}; return kIOReturnSuccess;
     }

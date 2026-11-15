@@ -88,8 +88,8 @@ static uint64_t mock_time=1000000000;
 static uint64_t getnsecuptime() { return mock_time; }
 static int qwz_mon_fw_unavail(qwz_softc *sc) { return !sc->fw_initialized || sc->crashed; }
 static void native_rx() {}
-static int sent, send_result;
-static int qwz_mon_tx_bytes(qwz_softc *,const uint8_t *,size_t,uint8_t) { ++sent; return send_result; }
+static int sent, send_result, last_native_mode=-1,qwz_nativefmt=0;
+static int qwz_mon_tx_bytes(qwz_softc *,const uint8_t *,size_t,uint8_t,int mode=-1) { ++sent;last_native_mode=mode;return send_result; }
 static int allocations, fail_alloc, live_alloc;
 static void *bsd_malloc(size_t n,int,int) {
     if (++allocations==fail_alloc) return nullptr;
@@ -175,6 +175,16 @@ int main() {
     frame[10]^=2;
     assert(frequency(&sc,&sc.sc_monvif)==5745);
     assert(frequency(&sc,&sc.sc_vif)==0); // station stays unchanged
+    // Native-only rate experiments leave sync, small and multicast frames
+    // unchanged; malformed settings do not inherit an injection context.
+    uint8_t bulk[1400]={0x08};bulk[4]=2;memcpy(bulk+10,address,6);
+    assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);
+    qwz_nativefmt=1;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==1);
+    qwz_nativefmt=2;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==2);
+    bulk[4]=3;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);
+    bulk[4]=2;assert(qwz_mon_tx_raw(bulk,1199)==0 && last_native_mode==0);
+    bulk[0]=0xd0;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);
+    bulk[0]=0x08;qwz_nativefmt=-1;assert(qwz_mon_tx_raw(bulk,sizeof(bulk))==0 && last_native_mode==0);
     mock_time+=100000000;
     qwz_mon_dwell_event(&sc,WMI_SCAN_EVENT_FOREIGN_CHAN_EXIT,5745,0);
     assert(!qwz_mon_native_tx_ready() && sc.mon_stats.dwell_lastms==100);

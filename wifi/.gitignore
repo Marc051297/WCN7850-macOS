@@ -19,3 +19,7 @@ firmware/dl/
 firmware/FwBinary.cpp
 *.pcap
 __pycache__/
+
+build-f2q/
+build-editor/
+compile_commands.json

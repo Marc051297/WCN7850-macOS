@@ -173,6 +173,9 @@ int	qwz_mon_tx_room(void);
 /* Native frames wait for the matching listener address and, during ROC,
  * the firmware's arrival on the requested channel. Does not consume packets. */
 int	qwz_mon_native_tx_ready(void);
+/* Native-only runtime comparisons. Rate formatting defaults off. */
+extern int qwz_nativepeerpause;
+extern int qwz_nativefmt;
 /* Timer-safe scheduler; firmware start/stop work runs on systq, never the timer. */
 void	qwz_mon_native_auto_enable(int enable);
 void	qwz_mon_native_auto_tick(void);

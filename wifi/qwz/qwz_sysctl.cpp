@@ -46,6 +46,8 @@ int qwz_scanraw = 0;		/* K1 (W2c): debug.qwz.scanraw, see qwz_life.h */
 int qwz_rssisigned = 0, qwz_beaconmeta = 0, qwz_scanprobe = 0, qwz_rssisrc = 0, qwz_scanrest = 0, qwz_rssilog = 0;	/* K3: debug.qwz.rssisigned, beaconmeta, scanprobe, rssisrc, scanrest, rssilog, see qwz_life.h */
 int qwz_monreap = 0, qwz_hintfix = 1;	/* K2c: debug.qwz.monreap (0 = off = K2b, the stale-slot reaper and the live-slot guard of the capture TX ring), debug.qwz.hintfix (1 = the scan-start hint-BSSID copy goes the right way, 0 = the old swapped copy); see qwz_life.h */
 int qwz_monfmt = 0;		/* K4 (M1): debug.qwz.monfmt, see qwz_life.h */
+int qwz_nativepeerpause = 1;
+int qwz_nativefmt = 0;
 /* K5 (L1-C1): debug.qwz.moncoex and its sub-switches, see qwz_mon.h; moncoex 0 = K4 exactly; scan and cred default to 1 and only act while a coex cell runs */
 int qwz_moncoexmcc = 0;
 int qwz_moncoexquota = 0;	/* F2-3: percent of radio time the firmware's scheduler gives the cell's channel while an mcc cell runs (0 = leave the firmware's adaptive scheduler alone); read at cell start */	/* F2-2: the coex cell on its own channel beside the station (the firmware's MCC scheduler); 0 = K5 rule (same channel only) */
@@ -763,6 +765,10 @@ SYSCTL_INT(_debug_qwz, OID_AUTO, hintfix, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_hintfix, 0, "K2c C5: 1 = the scan-start command copies each hint BSSID from the request into the message (default); 0 = the old copy with source and destination swapped; nothing sets a hint BSSID today");
 SYSCTL_INT(_debug_qwz, OID_AUTO, monfmt, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_monfmt, 0, "K4 M1: capture cell user frames with a per-frame tx_params block: 1 = frames under 150 bytes with retry limit 2 and OFDM 12 Mbit/s, 2 = also user DATA frames (retry limit 1 when the frame header says NO_ACK, else 4; rate from the header's rate byte, zero or unknown = OFDM 12); 0 = off (default, tx_params_valid 0); 3 and above act as 2");
+SYSCTL_INT(_debug_qwz, OID_AUTO, nativepeerpause, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_nativepeerpause, 0, "Native AWDL calibrated destination holds: 1 on (default), 0 bypass; does not discard frames or stop observations");
+SYSCTL_INT(_debug_qwz, OID_AUTO, nativefmt, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &qwz_nativefmt, 0, "Experimental native bulk unicast WMI parameters: 0 firmware default (default), 1 request legacy OFDM 12 Mbit/s, 2 request legacy OFDM 24 Mbit/s; applies only to DATA >=1200 bytes; other values disable; requested profile is not a measured PHY rate");
 SYSCTL_INT(_debug_qwz, OID_AUTO, rssisigned, CTLFLAG_RW | CTLFLAG_LOCKED,
     &qwz_rssisigned, 0, "K3 S1: 1 = the 5 GHz SCAN-state RSSI compare reads ni_rssi as a signed byte (strongest sample kept); 0 = today's compare (default)");
 SYSCTL_INT(_debug_qwz, OID_AUTO, beaconmeta, CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -942,6 +948,8 @@ qwz_sysctl_register(qwz_sysctl_start_fn start, void *arg)
 	sysctl_register_oid(&sysctl__debug_qwz_monreap);
 	sysctl_register_oid(&sysctl__debug_qwz_hintfix);
 	sysctl_register_oid(&sysctl__debug_qwz_monfmt);
+	sysctl_register_oid(&sysctl__debug_qwz_nativepeerpause);
+	sysctl_register_oid(&sysctl__debug_qwz_nativefmt);
 	sysctl_register_oid(&sysctl__debug_qwz_rssisigned);
 	sysctl_register_oid(&sysctl__debug_qwz_beaconmeta);
 	sysctl_register_oid(&sysctl__debug_qwz_scanprobe);
@@ -1013,6 +1021,8 @@ qwz_sysctl_unregister(void)
 	sysctl_unregister_oid(&sysctl__debug_qwz_monreap);
 	sysctl_unregister_oid(&sysctl__debug_qwz_hintfix);
 	sysctl_unregister_oid(&sysctl__debug_qwz_monfmt);
+	sysctl_unregister_oid(&sysctl__debug_qwz_nativepeerpause);
+	sysctl_unregister_oid(&sysctl__debug_qwz_nativefmt);
 	sysctl_unregister_oid(&sysctl__debug_qwz_rssisigned);
 	sysctl_unregister_oid(&sysctl__debug_qwz_beaconmeta);
 	sysctl_unregister_oid(&sysctl__debug_qwz_scanprobe);

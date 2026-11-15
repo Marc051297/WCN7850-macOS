@@ -65,7 +65,7 @@ enum
 };
 
 /* M0 (C15): the engine's request bits (engineRequest); kEngRecover restarts a chip that is down after failed recoveries (debug.qwz.recover=2, C34) */
-enum { kEngDead = 1, kEngRecover = 2 };
+enum { kEngDead = 1, kEngRecover = 2, kEngInterface = 4 };
 
 #define kWatchDogTimerPeriod 1000
 #ifdef AIRPORT_WCL
@@ -332,6 +332,9 @@ public:
     unsigned int engAbsorbed, engChipBusy, engClosed;	/* rate limiters of the single-flight logs (engClosed: the "recovered by" line, M2a WP0) */
     uint64_t engCooldownMs, engLastOkMs, engBeginMs;
     void engineRequest(uint32_t bits, uint32_t reason);
+    bool interfaceNeedsRecovery();
+    void requestInterfaceRecovery(int error);
+    uint32_t interfaceInitFailures = 0;
     void engineRun();
     void engineNoteFailure(const char *why);
     void engineGiveUp(const char *why);
@@ -409,7 +412,7 @@ public:
     IOReturn receiveAWDLActionFrame(mbuf_t, size_t, uint32_t, int32_t);
     void observeAWDLDataFrame(const uint8_t*, size_t);
     IOReturn buildAWDLSyncProbe(mbuf_t*, uint64_t);
-    IOReturn buildAWDLTransmit(mbuf_t*, const uint8_t *holdPayloadFor = nullptr, bool holdEverySize = false);
+    IOReturn buildAWDLTransmit(mbuf_t*, const uint8_t *holdPayloadFor = nullptr, bool holdEverySize = false, uint64_t nowUS = 0);
     bool serviceAWDLTransmit();
     unsigned queuedAWDLTransmit();
     unsigned heldShortAWDLTransmit();

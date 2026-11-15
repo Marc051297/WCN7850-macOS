@@ -2647,6 +2647,28 @@ void AirportItlwm::faultCb(void *arg, uint32_t reason)	/* sc_fault_cb: interrupt
     self->engineRequest(kEngDead, reason);
 }
 
+bool AirportItlwm::interfaceNeedsRecovery()
+{
+    auto *ic = fHalService ? fHalService->get80211Controller() : nullptr;
+    return ic && (ic->ic_if.if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP;
+}
+
+void AirportItlwm::requestInterfaceRecovery(int error)
+{
+    if (error <= 0) return;
+    ++interfaceInitFailures;
+    setProperty("QwzLastInterfaceInitError", uint64_t(uint32_t(error)), 32);
+    setProperty("QwzInterfaceInitFailures", uint64_t(interfaceInitFailures), 32);
+    // A wake/enable owner already handles its own failure. The previously
+    // unowned legacy init-task path needs a real, bounded firmware restart.
+    if (noWakeFix || !qwz_dead_armed() || !wakeAllowed() || chipBusy || engineBusy ||
+        engGivenUp || !interfaceNeedsRecovery())
+        return;
+    qwz_logc("qwz: engine: interface init failed (%d), firmware alive %d; scheduling bounded recovery\n",
+             error, fHalService->firmwareUp());
+    engineRequest(kEngInterface, QWZ_DEAD_INIT);
+}
+
 void AirportItlwm::engineRequest(uint32_t bits, uint32_t reason)
 {
     __atomic_fetch_or(&engineReq, bits, __ATOMIC_ACQ_REL);
@@ -2694,7 +2716,7 @@ void AirportItlwm::engineRun()
     uint32_t reason = 0, req;
     uint64_t now = pmNowMs(), done;
     uint32_t attempt = engFailCont + 1;
-    bool exempt, ok, pending, retrying, asked;
+    bool exempt, ok, pending, retrying, asked, interfaceFailed;
 
     /* Single flight (round-2 audit, conflict 1). deadCall comes from thread_call_allocate() without THREAD_CALL_OPTIONS_ONCE, so
      * thread_call_enter() on a call that is already RUNNING starts a second concurrent invocation, and faultCb requests the engine on
@@ -2711,12 +2733,15 @@ void AirportItlwm::engineRun()
     if (!qwz_dead_armed())
         return;				/* recover=0 or m0=0: legacy handling, nothing declares DEAD, nothing to restart */
     pending = fHalService->faultPending(&reason);
+    interfaceFailed = !pending && (req & kEngInterface) != 0 && interfaceNeedsRecovery();
     asked = !pending && (req & kEngRecover) != 0 && fHalService->wakeNeedsRecovery();	/* debug.qwz.recover=2 on a chip that is down after GIVEN_UP */
     retrying = !pending && !asked && engFailCont != 0 && fHalService->wakeNeedsRecovery();	/* the retry rule: a failed attempt left DEAD clear (qwz_init clears it before the bring-up) */
-    if (!pending && !asked && !retrying)
+    if (!pending && !asked && !retrying && !interfaceFailed)
         return;				/* cleared meanwhile (the legacy path or a toggle restarted the firmware) */
     if (pending)
         engReason = reason;		/* the reason of the first attempt is kept for the retries */
+    else if (interfaceFailed)
+        reason = engReason = QWZ_DEAD_INIT;
     else
         reason = asked ? (engReason = QWZ_DEAD_USER) : engReason;	/* a user request starts a USER episode; a retry keeps the first reason */
     if (engGivenUp) {
@@ -2730,6 +2755,8 @@ void AirportItlwm::engineRun()
     }
     engDeferred = false;
     if (now < engCooldownMs) {
+        if (interfaceFailed)
+            __atomic_fetch_or(&engineReq, kEngInterface, __ATOMIC_ACQ_REL);
         qwz_log("qwz: engine: cool-down, next attempt in %llu ms\n", engCooldownMs - now);
         scheduleEngine((uint32_t)(engCooldownMs - now));
         return;
@@ -2748,6 +2775,8 @@ void AirportItlwm::engineRun()
     }
     exempt = reason == QWZ_DEAD_INJECT || reason == QWZ_DEAD_USER;
     engineBusy = true;
+    if (interfaceFailed)
+        fHalService->get80211Controller()->ic_wcl_mac_reconfig = false;
     engBeginMs = now;
     engEpisodes++;
     qwz_logc("qwz: engine: ==== firmware restart: attempt %u of %u, reason %s ====\n", attempt, QWZ_FAIL_FINAL,
@@ -2756,6 +2785,8 @@ void AirportItlwm::engineRun()
     qwz_log_publish();
     QWZ_CRUMB("eng:teardown");
     if (!chipDown("firmware dead", "firmware restart", QWZ_CHIP_WAIT_MS, 0)) {
+        if (interfaceFailed)
+            __atomic_fetch_or(&engineReq, kEngInterface, __ATOMIC_ACQ_REL);
         engineBusy = false;
         engineNoteFailure("chip busy: another transition owns it");
         return;
@@ -5133,6 +5164,8 @@ int AirportItlwm::m0Sysctl(void *arg, int what, int val, char *buf, size_t len)
         self->engineRearm("sysctl");
         if (!self->fHalService->faultPending(&reason) && self->fHalService->wakeNeedsRecovery())
             self->engineRequest(kEngRecover, QWZ_DEAD_USER);
+        else if (!self->fHalService->faultPending(&reason) && self->interfaceNeedsRecovery())
+            self->engineRequest(kEngInterface, QWZ_DEAD_INIT);
         else if (self->fHalService->faultPending(&reason))
             self->engineRequest(kEngDead, reason);
         return 0;

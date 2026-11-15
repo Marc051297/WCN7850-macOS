@@ -16,6 +16,7 @@ extern IO80211WorkQueue *_fWorkloop;	/* AirportItlwmV2.cpp: the controller's IO8
 #include <AWDLManagementFrame.hpp>
 #include <AWDLLocalSchedule.hpp>
 #include <AWDLPeerProbe.hpp>
+#include "qwz_mon.h"
 #include <AWDLDataPayload.hpp>
 #include <AWDLDataFrame.hpp>
 #include <Airport/IOSkywalkPacketView.h>
@@ -290,7 +291,7 @@ bool itlAWDLServiceTransmit(IOEthernetController *owner)
     return controller && controller->serviceAWDLTransmit();
 }
 
-IOReturn AirportItlwm::buildAWDLTransmit(mbuf_t *packet, const uint8_t *holdPayloadFor, bool holdEverySize)
+IOReturn AirportItlwm::buildAWDLTransmit(mbuf_t *packet, const uint8_t *holdPayloadFor, bool holdEverySize, uint64_t nowUS)
 {
     if (!packet || *packet || !_fWorkloop || !_fWorkloop->inGate() || !awdlManagementInputEnabled || !fAWDLInterface)
         return kIOReturnNotReady;
@@ -301,7 +302,8 @@ IOReturn AirportItlwm::buildAWDLTransmit(mbuf_t *packet, const uint8_t *holdPayl
     auto *interface = static_cast<QwzAWDLInterface *>(fAWDLInterface);
     interface->retain();
     const bool ready = interface->popTransmit(static_cast<uint8_t *>(mbuf_data(result)), mbuf_maxlen(result), &length, holdPayloadFor,
-                                                 holdEverySize);
+        holdEverySize, nowUS && awdlNativePeerTimingEnabled && qwz_nativepeerpause ? &awdlNativePeerTiming : nullptr,
+        uint8_t(qwz_mon_status()), nowUS);
     interface->release();
     if (!ready) {
         mbuf_freem(result);

@@ -29,7 +29,7 @@
 #include "qwz_awdlx.h"
 
 /* indexed by enum qwz_dead_reason (qwz_life.h) */
-const char *const qwz_dead_names[] = { "none", "RDDM", "SYS_ERR", "LINK", "WMI_SILENT", "DEADLINE", "INJECT", "USER" };
+const char *const qwz_dead_names[] = { "none", "RDDM", "SYS_ERR", "LINK", "WMI_SILENT", "DEADLINE", "INJECT", "USER", "INTERFACE_INIT" };
 
 void
 qwz_declare_dead(struct qwz_softc *sc, uint32_t reason, const char *detail)

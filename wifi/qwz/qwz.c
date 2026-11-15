@@ -382,6 +382,13 @@ qwz_init(struct ifnet *ifp)
 	if (ic->ic_event_handler)
 		ic->ic_event_handler(ic, rv ? IEEE80211_EVT_DRIVER_STOPPED :
 		    IEEE80211_EVT_DRIVER_READY, NULL);
+	if (rv) {
+		qwz_logc("qwz: init: failed result %d flags 0x%x fw %d epoch %u state %d; interface recovery requested\n",
+		    rv, ifp->if_flags, sc->fw_initialized, sc->sc_fw_epoch, ic->ic_state);
+		QWZ_CRUMB("init:failed");
+		if (ic->ic_event_handler)
+			ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_INIT_FAILED, (void *)(uintptr_t)rv);
+	}
 	return rv;
 }
 

@@ -18,7 +18,7 @@
 #define QWZ_LIFE_MMIO_BLOCK	0x00000008u	/* BAR reads answer 0xffffffff, writes are dropped; cleared only right after a passed config-space link check (C08) */
 enum qwz_dead_reason {
 	QWZ_DEAD_NONE, QWZ_DEAD_RDDM, QWZ_DEAD_SYSERR, QWZ_DEAD_LINK, QWZ_DEAD_SILENT,
-	QWZ_DEAD_DEADLINE, QWZ_DEAD_INJECT, QWZ_DEAD_USER, QWZ_DEAD_MAX
+	QWZ_DEAD_DEADLINE, QWZ_DEAD_INJECT, QWZ_DEAD_USER, QWZ_DEAD_INIT, QWZ_DEAD_MAX
 };
 #define QWZ_INJ_WMI_STARVE	0x1u		/* C33: credits zeroed before the credit wait */
 #define QWZ_INJ_IGNORE_EV	0x2u		/* C33: the firmware-event counter stands still */

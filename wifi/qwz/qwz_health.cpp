@@ -152,11 +152,11 @@ qwz_health_log(struct qwz_softc *sc, unsigned int wdskip)
 	if (tasks < 0)
 		tasks = 0;
 
-	qwz_log("qwz: health: st=%s dead=%d ep=%u eps=%u gu=%d dups=%u fw=%d ee=%u mhi=0x%x cred=%d | ic=%s scan=%d peers=%d vdevs=%d/%d tasks=%d rwl=%d | "
+	qwz_log("qwz: health: st=%s dead=%d ep=%u eps=%u gu=%d dups=%u fw=%d ee=%u mhi=0x%x cred=%d | ic=%s ifflags=0x%x scan=%d peers=%d vdevs=%d/%d tasks=%d rwl=%d | "
 	    "fwev=%u silent=%u refused=%u mmioblk=%d mem=%u/%lluKB wdskip=%u\n",
 	    qwz_hl_state(life), (life & QWZ_LIFE_DEAD) != 0, sc->sc_fw_epoch, sc->sc_dead_episodes, (life & QWZ_LIFE_GIVEN_UP) != 0,
 	    sc->sc_dead_dups, sc->fw_initialized, ee, mhi, cred,
-	    ic_name, (int)sc->scan.state, sc->num_peers, sc->num_created_vdevs, sc->num_started_vdevs, tasks,
+	    ic_name, sc->sc_ic.ic_if.if_flags, (int)sc->scan.state, sc->num_peers, sc->num_created_vdevs, sc->num_started_vdevs, tasks,
 	    sc->ioctl_rwl.rwl_owner != NULL,
 	    __atomic_load_n(&sc->sc_fw_rx_events, __ATOMIC_RELAXED), sc->sc_silent_count, qwz_refused_count(),
 	    (life & QWZ_LIFE_MMIO_BLOCK) != 0,

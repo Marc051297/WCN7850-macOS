@@ -19,7 +19,7 @@ struct NativePeerTiming {
         PeerSchedule schedule;
         PeerPauseState pause;
     } peers[kPeers];
-    uint64_t actionObservations, dataObservations, holdChecks, forcedReleases, resets;
+    uint64_t actionObservations, dataObservations, holdChecks, forcedReleases, resets, bypasses;
 
     void reset() { memset(this, 0, sizeof(*this)); }
     void clearPeers() { memset(peers, 0, sizeof(peers)); ++resets; }

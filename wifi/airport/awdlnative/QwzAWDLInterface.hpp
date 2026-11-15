@@ -10,6 +10,7 @@
 #include <Airport/IOSkywalkQueueFactories.h>
 #include "AWDLRequestedValue.hpp"
 #include "AWDLInactiveProtocol.hpp"
+#include <AWDLNativePeerTiming.hpp>
 #include <IOKit/IOLocks.h>
 
 class QwzAWDLInterface : public IO80211AWDLProtocol {
@@ -33,7 +34,8 @@ public:
     bool copyMasterIndication(uint8_t *, size_t, size_t *);
     bool hasMasterIndication() const { return masterIndicationLength != 0; }
     // Under the shared gate. Converts the oldest queued frame into a caller-owned buffer.
-    bool popTransmit(uint8_t *, size_t, size_t *, const uint8_t *holdPayloadFor, bool holdEverySize = false);
+    bool popTransmit(uint8_t *, size_t, size_t *, const uint8_t *holdPayloadFor, bool holdEverySize = false,
+                     ItlAWDL::NativePeerTiming *timing = nullptr, uint8_t channel = 0, uint64_t nowUS = 0);
     // Frames macOS has queued that the driver hasn't taken yet.
     unsigned queuedTransmit() const { return transmitQueued; }
     unsigned heldShortTransmit() const { return transmitHeldShort; }

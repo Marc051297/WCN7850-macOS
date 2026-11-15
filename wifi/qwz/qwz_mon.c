@@ -676,11 +676,26 @@ qwz_mon_fmt_rate_idx(uint8_t rate)
 
 /* 1 and the two tx_params dwords when this user frame is sent with a tx_params block under debug.qwz.monfmt, else 0 */
 static int
-qwz_mon_fmt_pick(uint8_t kind, size_t len, uint32_t *d0, uint32_t *d1, unsigned *retry, unsigned *rate)
+qwz_mon_fmt_pick(uint8_t kind, size_t len, uint32_t *d0, uint32_t *d1, unsigned *retry, unsigned *rate,
+    int nativeMode = -1)
 {
 	int mode = qwz_monfmt > 2 ? 2 : qwz_monfmt;	/* 3 (offchan data command) is not implemented: acts as 2 */
 	uint32_t preset = QWZ_MON_TXP_MC0;
 	unsigned r = 2, idx = 2;
+	if (nativeMode >= 0) {
+		// Explicit native context never inherits a userspace injection header,
+		// including while another gated WMI sender is asleep on a credit.
+		if ((nativeMode != 1 && nativeMode != 2) || kind != 2 || len < 1200)
+			return 0;
+		idx = nativeMode == 1 ? 2 : 4;	/* request 12 / 24 Mbit/s */
+		r = QWZ_MON_TXP_UC0 >> 28;
+		*d0 = (QWZ_MON_TXP_UC0 & 0x000000ffu) | ((1u << (4 + idx)) << 8) |
+		    (QWZ_MON_TXP_UC0 & 0x0ff00000u) | (r << 28);
+		*d1 = QWZ_MON_TXP_DATA1;
+		*retry = r;
+		*rate = nativeMode == 1 ? 24 : 48;	/* 500 kbit/s units */
+		return 1;
+	}
 
 	if (mode <= 0 || !qwz_mon_fmt_user)
 		return 0;
@@ -703,7 +718,7 @@ qwz_mon_fmt_pick(uint8_t kind, size_t len, uint32_t *d0, uint32_t *d1, unsigned 
 
 /* Transmit `frame` (no FCS) on the capture vdev; the slot remembers the frame type. */
 static int
-qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t kind)
+qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t kind, int nativeMode = -1)
 {
 	struct qwz_vif *vif = &sc->sc_monvif;
 	struct mbuf *m;
@@ -778,7 +793,7 @@ qwz_mon_tx_bytes(struct qwz_softc *sc, const uint8_t *frame, size_t len, uint8_t
 		uint32_t fd0 = 0, fd1 = 0;
 		unsigned fretry = 0, frate = 0;
 
-		fmt_used = qwz_mon_fmt_pick(kind, len, &fd0, &fd1, &fretry, &frate);
+		fmt_used = qwz_mon_fmt_pick(kind, len, &fd0, &fd1, &fretry, &frate, nativeMode);
 		if (fmt_used) {
 			sc->mon_txp_d0 = fd0;
 			sc->mon_txp_d1 = fd1;
@@ -899,7 +914,9 @@ qwz_mon_tx_raw(const uint8_t *frame, size_t len)
 		return EADDRNOTAVAIL;
 	type = (frame[0] >> 2) & 3;
 	kind = type == 0 ? 1 : type == 2 ? 2 : 3;
-	ret = qwz_mon_tx_bytes(sc, frame, len, kind);
+	const int nativeMode = kind == 2 && len >= 1200 && !(frame[4] & 1) &&
+	    (qwz_nativefmt == 1 || qwz_nativefmt == 2) ? qwz_nativefmt : 0;
+	ret = qwz_mon_tx_bytes(sc, frame, len, kind, nativeMode);
 	if (ret == 0)
 		sc->mon_stats.ufr_sent++;
 	else if (ret == ENOSPC)

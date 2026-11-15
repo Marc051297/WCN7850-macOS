@@ -90,7 +90,7 @@ void AirportItlwm::awdlNativeRadioStart()
 	qwz_mon_native_auto_enable(!PE_parse_boot_argn("-qwzawdlmanual", &manual, sizeof(manual)));
 	awdlNativeTimer->setTimeoutMS(50);
 	setProperty("QwzAWDLRadio", "started");
-	setProperty("QwzAWDLRadioBuild", "f2p-peer-window-pacing");
+	setProperty("QwzAWDLRadioBuild", "f2q-peer-fifo-fairness");
 	setProperty("QwzAWDLPeerTimingEnabled", awdlNativePeerTimingEnabled);
 	qwz_log("airport: awdl0: native radio started (cell %d, rssi fallback %d)\n", qwz_mon_status(), awdlNativeRssiFallback);
 	qwz_log_publish();
@@ -242,12 +242,8 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 		// A send spends a WMI credit. Recheck before dequeuing each packet;
 		// the slot count alone can outlive the available transport credit.
 		while (budget > 0 && qwz_mon_native_tx_ready() && qwz_mon_tx_room() > 0) {
-			uint8_t destination[6];
-			if (self->awdlNativePeerTimingEnabled && self->copyAWDLTransmitDestination(destination) &&
-			    self->awdlNativePeerTiming.hold(destination, uint8_t(cell), nowUS()))
-				break;	/* keep FIFO ownership/order/sequence; completions below still run */
 			mbuf_t m = nullptr;
-			if (self->buildAWDLTransmit(&m) != kIOReturnSuccess || m == nullptr)
+			if (self->buildAWDLTransmit(&m, nullptr, false, nowUS()) != kIOReturnSuccess || m == nullptr)
 				break;
 			const int err = qwz_mon_tx_raw(static_cast<const uint8_t *>(mbuf_data(m)), mbuf_len(m));
 			st.dataLastTxError = uint32_t(err);
@@ -305,7 +301,11 @@ void AirportItlwm::awdlNativeTimerFired(OSObject *owner, IOTimerEventSource *)
 			put("peerHoldChecks", self->awdlNativePeerTiming.holdChecks);
 			put("peerForcedReleases", self->awdlNativePeerTiming.forcedReleases);
 			put("peerTimingResets", self->awdlNativePeerTiming.resets);
+			put("peerBypasses", self->awdlNativePeerTiming.bypasses);
+			put("peerTimingEnabled", self->awdlNativePeerTimingEnabled && qwz_nativepeerpause);
+			put("nativeFormat", qwz_nativefmt);
 			self->setProperty("QwzAWDLRadioStats", d);
+			self->setProperty("QwzAWDLPeerTimingEnabled", self->awdlNativePeerTimingEnabled && qwz_nativepeerpause);
 			self->setProperty("QwzAWDLRadioAuto", qwz_mon_native_auto_state());
 			d->release();
 		}

@@ -128,7 +128,7 @@ void AirportItlwmSkywalkInterface::free()
     IO80211InfraProtocol::free();
 }
 
-IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1, void *a2, void *)
+IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1, void *a2, void *a3)
 {
     auto self = static_cast<AirportItlwmSkywalkInterface *>(a0);
     if (self->wclStopping)
@@ -140,7 +140,7 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
             return self->fHalService->setScanHomeAwayTime(
                 AirportWCL::read32(static_cast<const uint8_t *>(a2)));
         case 12:
-            self->handleWCLEvent(int(uintptr_t(a2)), nullptr);
+            self->handleWCLEvent(int(uintptr_t(a2)), a3);
             return kIOReturnSuccess;
         case 11: self->clearWCLPMKSA(); return kIOReturnSuccess;
         case 8: return self->installWCLKey(static_cast<apple80211_key *>(a2));
@@ -1184,9 +1184,9 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
     // Firmware initialization runs on systq, outside the native PostOffice gate.
     // Serialize only lifecycle notifications; never run synchronous WCL ioctls here.
     if ((code == IEEE80211_EVT_DRIVER_RESET_BEGIN || code == IEEE80211_EVT_DRIVER_READY ||
-         code == IEEE80211_EVT_DRIVER_STOPPED) && !instance->getWorkQueue()->inGate()) {
+         code == IEEE80211_EVT_DRIVER_STOPPED || code == IEEE80211_EVT_DRIVER_INIT_FAILED) && !instance->getWorkQueue()->inGate()) {
         _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(12),
-                                reinterpret_cast<void *>(uintptr_t(code)));
+                                reinterpret_cast<void *>(uintptr_t(code)), data);
         return;
     }
     ieee80211com *ic = fHalService->get80211Controller();
@@ -1202,6 +1202,9 @@ void AirportItlwmSkywalkInterface::handleWCLEvent(int code, void *data)
                     ic->ic_wcl_mac_reconfig ? 1 : 0);
     }
     switch (code) {
+        case IEEE80211_EVT_DRIVER_INIT_FAILED:
+            instance->requestInterfaceRecovery(int(uintptr_t(data)));
+            break;
         case IEEE80211_EVT_COUNTRY_CODE_UPDATE:
             deferWCLCountryUpdate();
             break;
